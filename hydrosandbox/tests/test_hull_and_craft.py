@@ -471,3 +471,86 @@ def test_catamaran_limits_coincident_hulls_quadruple_and_distant_hulls_double():
     cat = CraftBuildup.solve_equilibrium(mass=2.0 * mass, demihull_spacing=2.0, **common)
     assert cat["sinkage"] == pytest.approx(mono["sinkage"], abs=1e-5)
     assert scalar(cat["buoyancy_hull"]) == pytest.approx(2.0 * scalar(mono["buoyancy_hull"]), rel=1e-6)
+
+
+def test_dynamic_force_does_not_depend_on_how_the_pose_is_described():
+    """
+    The same physical pose, described about a pivot at the waterline or about one
+    well above it, gives the same force and the same moment about the same point.
+    """
+    hull = _transom_hull()
+    u, rho, trim = 3.5, 1025.0, 1.5
+    high, low = (0.4, 0.35), (1.0, 0.0)
+    sinkage_high = 0.01
+    cos, sin = onp.cos(onp.radians(trim)), onp.sin(onp.radians(trim))
+    # Where the low pivot ends up, and how far it has sunk, in the pose about `high`.
+    sinkage_low = sinkage_high + (low[0] - high[0]) * sin + (low[1] - high[1]) * (1 - cos)
+    x_low_earth = high[0] + (low[0] - high[0]) * cos + (low[1] - high[1]) * sin
+
+    about_high = hull.dynamic_force(u, rho, G, sinkage_high, trim, high, x_ref=high[0])
+    about_low = hull.dynamic_force(
+        u, rho, G, sinkage_low, trim, low, x_ref=low[0] + (high[0] - x_low_earth)
+    )
+    for key in ("force_up", "moment_bow_up"):
+        assert scalar(about_low[key]) == pytest.approx(scalar(about_high[key]), rel=1e-9)
+
+    # And it is the pose that matters: a pivot above the waterline must not move
+    # the waterline the hull's breadths are read at.
+    level = hull.dynamic_force(u, rho, G, 0.0, 0.0, (0.0, 0.0))
+    level_high_pivot = hull.dynamic_force(u, rho, G, 0.0, 0.0, (0.0, 0.5))
+    assert scalar(level_high_pivot["force_up"]) == pytest.approx(scalar(level["force_up"]), rel=1e-9)
+
+
+def test_dynamic_force_table_reproduces_direct_evaluation():
+    import pickle
+
+    hull = _transom_hull()
+    u, rho = 3.5, 1025.0
+    table = hull.dynamic_force_table(
+        u, rho, sinkage_range=(-0.06, 0.06), trim_range=(-1.0, 3.0), n_sinkage=7, n_trim=9
+    )
+    table = pickle.loads(pickle.dumps(table))  # tables travel to worker processes
+    for sinkage, trim, pivot in [
+        (0.013, 1.7, (0.6, 0.2)),
+        (-0.022, 0.4, (-0.3, 0.0)),
+        (0.031, 2.6, (1.2, 0.35)),
+    ]:
+        direct = hull.dynamic_force(u, rho, G, sinkage, trim, pivot, x_ref=pivot[0])
+        tabled = table(sinkage, trim, pivot_xz=pivot, x_ref=pivot[0])
+        assert tabled["force_up"] == pytest.approx(scalar(direct["force_up"]), rel=2e-2)
+        assert tabled["moment_bow_up"] == pytest.approx(
+            scalar(direct["moment_bow_up"]), rel=2e-2, abs=5.0
+        )
+
+    # In the craft model the table stands in for the direct integral.
+    water = hsb.Water.seawater()
+    mass = 0.9 * scalar(hull.hydrostatics()["volume"]) * water.density()
+    common = dict(hull=hull, velocity=u, mass=mass, xyz_cg=[0.9, 0.0, 0.1], water=water,
+                  sinkage=0.01, trim=1.0, include_interference_breakdown=False)
+    table = hull.dynamic_force_table(
+        u, water.density(), sinkage_range=(-0.06, 0.06), trim_range=(-1.0, 3.0),
+        n_sinkage=7, n_trim=9,
+    )
+    direct = CraftBuildup(**common).run()
+    tabled = CraftBuildup(hull_dynamics=table, **common).run()
+    assert scalar(tabled["F_z_net"]) == pytest.approx(scalar(direct["F_z_net"]), abs=0.02 * mass * G)
+    assert scalar(tabled["D"]) == pytest.approx(scalar(direct["D"]), rel=1e-9)
+
+
+def test_foil_pitch_damping_grows_with_the_square_of_its_arm():
+    water, hull, mass = _small_craft()
+    common = dict(hull=hull, velocity=4.5, mass=mass, xyz_cg=[0.0, 0.0, 0.1], water=water,
+                  sinkage=0.0, trim=0.5, include_hull_dynamics=False,
+                  include_interference_breakdown=False)
+
+    def damping(x_foil):
+        return scalar(
+            CraftBuildup(assembly=_t_foil(x_foil), **common).run_with_stability()["c_pitch_foils"]
+        )
+
+    near, far_aft, far_forward = damping(0.5), damping(2.0), damping(-2.0)
+    assert near > 0.0
+    # Damping acts on either side of the centre of gravity, roughly as arm squared.
+    assert far_aft == pytest.approx(16.0 * near, rel=0.4)
+    assert far_forward == pytest.approx(far_aft, rel=0.4)
+    assert scalar(CraftBuildup(**common).run_with_stability()["c_pitch_foils"]) == 0.0
