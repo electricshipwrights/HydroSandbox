@@ -32,6 +32,12 @@ from hydrosandbox.library.free_surface import (
     smooth_surface_piercing_weight,
     spray_drag_strut,
 )
+from hydrosandbox.library.wave_resistance import (
+    fuselage_wave_sources,
+    kelvin_wave_resistance,
+    merge_wave_elements,
+    wing_thickness_wave_sources,
+)
 
 if TYPE_CHECKING:
     from aerosandbox.geometry import ControlSurface
@@ -68,6 +74,12 @@ class HydroBuildup(ExplicitAnalysis):
       (``mach = 0.0``), local hydrostatic cavitation number ``sigma``, cavitation
       margin, and smooth cavitation drag rise.
     - Hoerner surface-piercing spray drag and T-junction interference drag.
+    - Wave-making drag (``include_wave_drag``) by linear far-field (Michell / Kochin)
+      theory: the lift and side force of every foil and strut (as pressure dipoles)
+      and the thickness of every foil, strut and pod (as sources), with their mutual
+      interference. When active, induced drag is evaluated with a rigid-lid image
+      (``1 - sigma``) and ``D_wave`` carries the rest of the free-surface effect, so
+      that their sum tends to the high-Froude image result as ``Fr -> infinity``.
     - Foil/strut ventilation safety margins and Archimedes hydrostatic buoyancy.
     - Finite-difference stability derivatives including vertical heave stiffness
       (``CLh`` and ``L_h``).
@@ -89,8 +101,22 @@ class HydroBuildup(ExplicitAnalysis):
         n_junctions: int | None = None,
         include_cavitation_penalty: bool = True,
         include_buoyancy_in_totals: bool = False,
+        include_wave_drag: bool = True,
+        wave_length_scales: tuple[float, float, float] | None = None,
+        wave_reference_velocity: float | None = None,
         airplane: Airplane | HydrofoilAssembly | None = None,
     ):
+        """
+        Parameters beyond the obvious:
+
+        include_wave_drag : Add wave-making drag (needs ``op_point.surface_z`` and
+            ``free_surface_mode != "none"``).
+        wave_length_scales : ``(y_extent, x_extent, min_depth)`` [m] of the submerged
+            assembly, used only to size the wave-integral quadrature when the
+            geometry is symbolic (default ``(2, 2, 0.05)``; inferred when numeric).
+        wave_reference_velocity : Numeric speed [m/s] used to size that quadrature
+            when ``op_point.velocity`` is symbolic.
+        """
         super().__init__()
 
         if assembly is None:
@@ -113,6 +139,9 @@ class HydroBuildup(ExplicitAnalysis):
         self.n_junctions = n_junctions
         self.include_cavitation_penalty = include_cavitation_penalty
         self.include_buoyancy_in_totals = include_buoyancy_in_totals
+        self.include_wave_drag = include_wave_drag
+        self.wave_length_scales = wave_length_scales
+        self.wave_reference_velocity = wave_reference_velocity
 
     @property
     def airplane(self) -> HydrofoilAssembly | Airplane:
@@ -153,6 +182,7 @@ class HydroBuildup(ExplicitAnalysis):
         junction_chord: Vectorizable = 0.1
         junction_tc: Vectorizable = 0.12
         junction_xyz: list[Vectorizable] | None = None
+        wave_elements: dict[str, Any] | None = None
 
         @property
         def F_b(self) -> tuple[Vectorizable, Vectorizable, Vectorizable]:
@@ -222,6 +252,59 @@ class HydroBuildup(ExplicitAnalysis):
             p_local = fluid.pressure()
             p_vapor = 1705.0
         return depth, p_local, p_vapor
+
+    def _wave_drag_active(self) -> bool:
+        return (
+            self.include_wave_drag
+            and getattr(self.op_point, "surface_z", None) is not None
+            and self.free_surface_mode != "none"
+        )
+
+    def _wave_resistance(self, elements: dict[str, Any]) -> Vectorizable:
+        """
+        Evaluate the far-field wave resistance of merged wave elements, looping over
+        a numerically vectorized operating point if needed.
+        """
+        op_point = self.op_point
+        fluid = op_point.atmosphere
+        surface_z = op_point.surface_z
+        strength_keys = ("source_flux", "force_y", "force_z")
+
+        def size_of(value) -> int:
+            if np.is_casadi_type(value, recursive=False):
+                return 1
+            return int(np.size(value))
+
+        def pick(value, k: int):
+            if np.is_casadi_type(value, recursive=False):
+                return value
+            flat = np.reshape(np.asarray(value), -1)
+            return flat[0] if flat.size == 1 else flat[k]
+
+        sizes = [size_of(v) for key in strength_keys for v in elements[key]]
+        sizes += [size_of(op_point.velocity), size_of(surface_z)]
+        n_points = max(sizes) if sizes else 1
+
+        def evaluate(k: int):
+            velocity = pick(op_point.velocity, k)
+            return kelvin_wave_resistance(
+                xyz_a=elements["xyz_a"],
+                xyz_b=elements["xyz_b"],
+                source_flux=[pick(v, k) for v in elements["source_flux"]],
+                force_y=[pick(v, k) for v in elements["force_y"]],
+                force_z=[pick(v, k) for v in elements["force_z"]],
+                smear_length=elements["smear_length"],
+                velocity=velocity,
+                density=pick(fluid.density(), k),
+                surface_z=pick(surface_z, k),
+                gravity=getattr(fluid, "gravity", 9.80665),
+                length_scales=self.wave_length_scales,
+                reference_velocity=self.wave_reference_velocity,
+            )
+
+        if n_points == 1:
+            return evaluate(0)
+        return np.array([evaluate(k) for k in range(n_points)])
 
     def run(self) -> dict[str, Any]:
         """
@@ -334,6 +417,65 @@ class HydroBuildup(ExplicitAnalysis):
                             F_g_total[i] = F_g_total[i] + f_junc_g[i]
                             M_g_total[i] = M_g_total[i] + m_junc_g[i]
 
+        # Wave-making drag (lift/side-force dipoles + thickness sources, with interference)
+        D_wave = 0.0
+        if self._wave_drag_active():
+            surface_z_wave = self.op_point.surface_z
+            element_sets = [
+                comp.wave_elements
+                for comp in wing_components
+                if comp.wave_elements is not None
+            ]
+            lift_elements = merge_wave_elements(*element_sets)
+            for wing in self.assembly.wings:
+                element_sets.append(
+                    wing_thickness_wave_sources(
+                        wing, velocity=self.op_point.velocity, surface_z=surface_z_wave
+                    )
+                )
+            for fuse in self.assembly.fuselages:
+                element_sets.append(
+                    fuselage_wave_sources(
+                        fuse, velocity=self.op_point.velocity, surface_z=surface_z_wave
+                    )
+                )
+            elements = merge_wave_elements(*element_sets)
+            if len(elements["source_flux"]) > 0:
+                D_wave = self._wave_resistance(elements)
+
+                # Apply at the load-weighted centroid of the lifting elements.
+                n_lift = len(lift_elements["force_z"])
+                if n_lift > 0:
+                    weights = [
+                        np.sqrt(
+                            lift_elements["force_y"][j] ** 2
+                            + lift_elements["force_z"][j] ** 2
+                            + 1e-12
+                        )
+                        for j in range(n_lift)
+                    ]
+                    weight_sum = sum(weights)
+                    wave_arm = [
+                        sum(
+                            weights[j]
+                            * 0.5
+                            * (lift_elements["xyz_a"][k][j] + lift_elements["xyz_b"][k][j])
+                            for j in range(n_lift)
+                        )
+                        / weight_sum
+                        - self.xyz_ref[k]
+                        for k in range(3)
+                    ]
+                else:
+                    wave_arm = [0.0, 0.0, 0.0]
+                f_wave_g = self.op_point.convert_axes(
+                    -D_wave, 0.0, 0.0, from_axes="wind", to_axes="geometry"
+                )
+                m_wave_g = np.cross(wave_arm, f_wave_g, manual=True)
+                for i in range(3):
+                    F_g_total[i] = F_g_total[i] + f_wave_g[i]
+                    M_g_total[i] = M_g_total[i] + m_wave_g[i]
+
         # Hydrostatic buoyancy
         fluid = self.op_point.atmosphere
         surface_z = getattr(self.op_point, "surface_z", None)
@@ -408,6 +550,7 @@ class HydroBuildup(ExplicitAnalysis):
         output["D_spray"] = sum(comp.D_spray for comp in wing_components)
         output["D_junction"] = D_junction
         output["D_cavitation"] = sum(comp.D_cavitation for comp in wing_components)
+        output["D_wave"] = D_wave
 
         # Cavitation & ventilation summaries across submerged wing components
         if wing_components:
@@ -671,12 +814,17 @@ class HydroBuildup(ExplicitAnalysis):
                 froude_depth=fr_h_wing,
                 mode=self.free_surface_mode,
             )
+            # With wave drag active, the trailing-vortex (induced) drag is that of a
+            # rigid-lid image; the wave resistance supplies the rest (see
+            # `hydrosandbox.library.wave_resistance`).
+            wave_active = self._wave_drag_active()
             K_Di_fs = free_surface_induced_drag_factor(
                 h_over_b=h_mean / span_eff_safe,
                 froude_depth=fr_h_wing,
-                mode=self.free_surface_mode,
+                mode="rigid_lid" if wave_active else self.free_surface_mode,
             )
-            K_Di_strut = 0.75 + 0.25 * kappa_wing
+            kappa_drag = -1.0 if wave_active else kappa_wing
+            K_Di_strut = 0.75 + 0.25 * kappa_drag
             K_Di_eff = horiz_weight * K_Di_fs + (1.0 - horiz_weight) * K_Di_strut
 
             AR_3D_eff = AR_3D_factor * (
@@ -717,6 +865,7 @@ class HydroBuildup(ExplicitAnalysis):
         ]
         xsec_tcs = [xsec.airfoil.max_thickness() for xsec in wing.xsecs]
 
+        wave_lift_records: list[dict[str, Any]] = []
         cav_margins = []
         cpmins = []
         sigmas = []
@@ -905,6 +1054,32 @@ class HydroBuildup(ExplicitAnalysis):
             sect_F_base_g = [
                 sect_L * L_dir_g[k] + sect_D_profile * D_dir_g[k] for k in range(3)
             ]
+
+            # Record this section's lift vector and submerged quarter-chord segment
+            # for the wave-resistance integral.
+            y_sign = -1.0 if mirror_across_XZ else 1.0
+            t_lo = s_sub - 0.5 * f_sub
+            t_hi = s_sub + 0.5 * f_sub
+            wave_lift_records.append(
+                {
+                    "sect_id": sect_id,
+                    "mirror": mirror_across_XZ,
+                    "start": [
+                        ((1.0 - t_lo) * qc_a[k] + t_lo * qc_b[k])
+                        * (y_sign if k == 1 else 1.0)
+                        for k in range(3)
+                    ],
+                    "end": [
+                        ((1.0 - t_hi) * qc_a[k] + t_hi * qc_b[k])
+                        * (y_sign if k == 1 else 1.0)
+                        for k in range(3)
+                    ],
+                    "force_y": sect_L * L_dir_g[1],
+                    "force_z": sect_L * L_dir_g[2],
+                    "smear": 0.5 * mean_chord,
+                    "span": sectional_spans[sect_id] * f_sub,
+                }
+            )
             sect_F_cav_g = [sect_D_cav * D_dir_g[k] for k in range(3)]
 
             # Spray drag on surface-piercing section
@@ -1007,6 +1182,11 @@ class HydroBuildup(ExplicitAnalysis):
             softness=0.01,
         )
 
+        wave_elements = self._build_wave_lift_elements(
+            records=wave_lift_records,
+            elliptical=wing.symmetric and not is_strut,
+        )
+
         root_qc = (
             [xsec_quarter_chords[0][k] for k in range(3)]
             if len(xsec_quarter_chords) > 0
@@ -1035,7 +1215,79 @@ class HydroBuildup(ExplicitAnalysis):
             junction_chord=xsec_chords[0] if xsec_chords else 0.1,
             junction_tc=xsec_tcs[0] if xsec_tcs else 0.12,
             junction_xyz=root_qc,
+            wave_elements=wave_elements,
         )
+
+    @staticmethod
+    def _build_wave_lift_elements(
+        records: list[dict[str, Any]],
+        elliptical: bool,
+        n_sub: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Turn per-section lift records into line elements for the wave integral.
+
+        The buildup's strip loads carry no spanwise induction, so for a symmetric
+        lifting foil each side's total load is redistributed elliptically over its
+        submerged span (root at the centreline). Struts and one-sided foils keep
+        their per-section loads, uniform along each section.
+        """
+        elements: dict[str, Any] = {
+            "xyz_a": ([], [], []),
+            "xyz_b": ([], [], []),
+            "force_y": [],
+            "force_z": [],
+            "smear_length": [],
+        }
+
+        def add(start, end, force_y, force_z, smear):
+            for k in range(3):
+                elements["xyz_a"][k].append(start[k])
+                elements["xyz_b"][k].append(end[k])
+            elements["force_y"].append(force_y)
+            elements["force_z"].append(force_z)
+            elements["smear_length"].append(smear)
+
+        if not elliptical:
+            for rec in records:
+                add(rec["start"], rec["end"], rec["force_y"], rec["force_z"], rec["smear"])
+            return elements
+
+        for mirror in (False, True):
+            side = [rec for rec in records if rec["mirror"] == mirror]
+            if not side:
+                continue
+            total_fy = sum(rec["force_y"] for rec in side)
+            total_fz = sum(rec["force_z"] for rec in side)
+            total_span = sum(rec["span"] for rec in side) + 1e-12
+
+            pieces = []
+            span_before = 0.0
+            for rec in side:
+                for j in range(n_sub):
+                    eta = (span_before + (j + 0.5) / n_sub * rec["span"]) / total_span
+                    d_eta = rec["span"] / n_sub / total_span
+                    shape = d_eta * np.sqrt(np.fmax(1.0 - eta**2, 0.0) + 1e-12)
+                    t0, t1 = j / n_sub, (j + 1) / n_sub
+                    start = [
+                        (1.0 - t0) * rec["start"][k] + t0 * rec["end"][k] for k in range(3)
+                    ]
+                    end = [
+                        (1.0 - t1) * rec["start"][k] + t1 * rec["end"][k] for k in range(3)
+                    ]
+                    pieces.append((start, end, shape, rec["smear"]))
+                span_before = span_before + rec["span"]
+
+            shape_sum = sum(piece[2] for piece in pieces)
+            for start, end, shape, smear in pieces:
+                add(
+                    start,
+                    end,
+                    total_fy * shape / shape_sum,
+                    total_fz * shape / shape_sum,
+                    smear,
+                )
+        return elements
 
     def fuselage_hydrodynamics(
         self,

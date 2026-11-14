@@ -66,6 +66,7 @@ def test_hydro_buildup_drag_identity_and_buoyancy_option():
         + res_no_b["D_spray"]
         + res_no_b["D_junction"]
         + res_no_b["D_cavitation"]
+        + res_no_b["D_wave"]
     )
     assert np.isclose(res_no_b["D"], d_sum, rtol=1e-9, atol=1e-9)
     assert np.isclose(res_no_b["P_drag"], res_no_b["D"] * 12.0, rtol=1e-9)
@@ -196,6 +197,7 @@ def test_buildup_free_surface_induced_drag_matches_vlm():
             op_point=op,
             spanwise_resolution=8,
             chordwise_resolution=6,
+            include_wave_drag=False,  # isolate the image system's induced drag
         ).run()
         return res["CD"] / res["CL"] ** 2
 

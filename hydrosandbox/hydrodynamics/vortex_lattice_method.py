@@ -10,6 +10,7 @@ from hydrosandbox.geometry import HydrofoilAssembly
 from hydrosandbox.hydrodynamics.singularities import (
     calculate_induced_velocity_horseshoe_hydro,
 )
+from hydrosandbox.hydrodynamics.wave_drag import horseshoe_lattice_wave_drag
 from hydrosandbox.library.cavitation import (
     cavitation_inception_speed,
     cavitation_number,
@@ -38,6 +39,11 @@ class HydroVLM(ExplicitAnalysis):
       (``"high_froude"``, ``"froude_blended"``, ``"rigid_lid"``, or ``"none"``).
     - Panel-level pressure difference ``Delta_Cp``, suction peak ``Cpmin``, local
       cavitation number ``sigma``, and cavitation margin diagnostics.
+    - Wave-making drag (``include_wave_drag``) of the solved loading and of foil,
+      strut and pod thickness, by linear far-field (Michell / Kochin) theory. With
+      it, ``D_induced`` is the trailing-vortex drag with a rigid-lid image and
+      ``D_wave`` the wave resistance; their sum tends to the classical high-Froude
+      image-method induced drag as ``Fr -> infinity``.
     - Hydrostatic buoyancy reporting when given a ``HydrofoilAssembly`` and ``Water``.
     - Stability derivatives including vertical heave stiffness ``CLh`` and ``L_h``.
     """
@@ -63,6 +69,7 @@ class HydroVLM(ExplicitAnalysis):
             "high_froude", "froude_blended", "rigid_lid", "none"
         ] = "high_froude",
         clip_to_free_surface: bool = True,
+        include_wave_drag: bool = True,
         airplane: Airplane | HydrofoilAssembly | None = None,
     ):
         super().__init__()
@@ -89,6 +96,7 @@ class HydroVLM(ExplicitAnalysis):
         self.align_trailing_vortices_with_wind = align_trailing_vortices_with_wind
         self.free_surface_mode = free_surface_mode
         self.clip_to_free_surface = clip_to_free_surface
+        self.include_wave_drag = include_wave_drag
 
         if run_symmetric_if_possible:
             raise NotImplementedError(
@@ -213,6 +221,8 @@ class HydroVLM(ExplicitAnalysis):
                 "Cl": 0.0,
                 "Cm": 0.0,
                 "Cn": 0.0,
+                "D_induced": 0.0,
+                "D_wave": 0.0,
                 "cavitation_margin": np.inf,
                 "Cpmin_global": 0.0,
                 "sigma_min": np.inf,
@@ -331,6 +341,54 @@ class HydroVLM(ExplicitAnalysis):
         force_geometry = np.sum(forces_geometry, axis=0)
         moment_geometry = np.sum(moments_geometry, axis=0)
 
+        D_induced = -float(
+            self.op_point.convert_axes(
+                force_geometry[0], force_geometry[1], force_geometry[2],
+                from_axes="geometry", to_axes="wind",
+            )[0]
+        )
+
+        # Wave-making drag (replaces the image system's share of the induced drag)
+        D_wave = 0.0
+        if (
+            self.include_wave_drag
+            and surface_z is not None
+            and self.free_surface_mode != "none"
+        ):
+            panel_chords = np.linalg.norm(
+                0.5
+                * (
+                    (back_left_vertices - front_left_vertices)
+                    + (back_right_vertices - front_right_vertices)
+                ),
+                axis=1,
+            )
+            wave = horseshoe_lattice_wave_drag(
+                op_point=self.op_point,
+                surface_z=surface_z,
+                image_weight=self.image_weight,
+                left_vortex_vertices=left_vortex_vertices,
+                right_vortex_vertices=right_vortex_vertices,
+                vortex_strengths=self.vortex_strengths,
+                smear_lengths=0.5 * panel_chords,
+                trailing_vortex_direction=(
+                    steady_freestream_direction
+                    if self.align_trailing_vortices_with_wind
+                    else np.array([1.0, 0.0, 0.0])
+                ),
+                vortex_core_radius=self.vortex_core_radius,
+                submerged_assembly=active_assembly,
+            )
+            D_wave = wave["D_wave"]
+            D_induced = D_induced - (1.0 + self.image_weight) * wave["D_image_mutual"]
+            f_wave_g = wave["delta_D"] * steady_freestream_direction
+            m_wave_g = np.cross(
+                wave["xyz_application"] - np.asarray(self.xyz_ref, dtype=float),
+                f_wave_g,
+            )
+            force_geometry = force_geometry + f_wave_g
+            moment_geometry = moment_geometry + m_wave_g
+
         force_body = self.op_point.convert_axes(
             force_geometry[0],
             force_geometry[1],
@@ -422,6 +480,8 @@ class HydroVLM(ExplicitAnalysis):
             "L": L,
             "D": D,
             "P_drag": D * self.op_point.velocity,
+            "D_induced": D_induced,
+            "D_wave": D_wave,
             "Y": Y,
             "l_b": l_b,
             "m_b": m_b,

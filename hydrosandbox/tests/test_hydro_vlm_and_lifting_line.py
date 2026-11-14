@@ -114,6 +114,7 @@ def test_vertical_strut_rigid_lid_vs_double_span_mirror():
         spanwise_resolution=8,
         chordwise_resolution=4,
         free_surface_mode="rigid_lid",
+        include_wave_drag=False,  # pure image-method equivalence
         clip_to_free_surface=False,
     ).run()
     vlm_double = HydroVLM(
@@ -133,6 +134,7 @@ def test_vertical_strut_rigid_lid_vs_double_span_mirror():
         chordwise_resolution=4,
         spanwise_spacing_function=np.linspace,
         free_surface_mode="rigid_lid",
+        include_wave_drag=False,
         clip_to_free_surface=False,
     ).run()
     vlm_double_res = vlm_double.run()
@@ -148,6 +150,7 @@ def test_vertical_strut_rigid_lid_vs_double_span_mirror():
         spanwise_resolution=8,
         spanwise_spacing_function=np.linspace,
         free_surface_mode="rigid_lid",
+        include_wave_drag=False,
         clip_to_free_surface=False,
         include_spray_drag=False,
     ).run()
@@ -257,6 +260,7 @@ def test_hydro_lifting_line_decomposition_cavitation_and_draw():
         + res["D_spray"]
         + res["D_fuselage"]
         + res["D_cavitation"]
+        + res["D_wave"]
     )
     assert np.isclose(res["D"], d_sum, rtol=1e-9, atol=1e-9)
     assert res["D_spray"] > 0.0

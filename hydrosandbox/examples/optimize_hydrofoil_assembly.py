@@ -428,7 +428,8 @@ if __name__ == "__main__":
         f"Drag Breakdown   : D_profile={_scalar(b['D_profile']):.2f} N ({_scalar(b['D_profile']) * v:.1f} W), "
         f"D_induced={_scalar(b['D_induced']):.2f} N ({_scalar(b['D_induced']) * v:.1f} W), "
         f"D_spray={_scalar(b['D_spray']):.2f} N ({_scalar(b['D_spray']) * v:.1f} W), "
-        f"D_junction={_scalar(b['D_junction']):.2f} N ({_scalar(b['D_junction']) * v:.1f} W) | "
+        f"D_junction={_scalar(b['D_junction']):.2f} N ({_scalar(b['D_junction']) * v:.1f} W), "
+        f"D_wave={_scalar(b['D_wave']):.2f} N ({_scalar(b['D_wave']) * v:.1f} W) | "
         f"Total P_drag={_scalar(b['P_drag']):.1f} W"
     )
     print(
