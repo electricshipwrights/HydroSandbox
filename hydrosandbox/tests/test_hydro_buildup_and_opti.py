@@ -210,3 +210,19 @@ def test_buildup_free_surface_induced_drag_matches_vlm():
     assert float(free_surface_induced_drag_factor(h_over_b=5.0)) == pytest.approx(
         1.0, abs=1e-3
     )
+
+
+def test_hoerner_junction_drag_and_top_level_wave_exports():
+    """Verify Hoerner junction drag tc^2 scaling and top-level wave helper exports."""
+    import hydrosandbox as hsb
+
+    assert hasattr(hsb, "kelvin_wave_resistance")
+    assert hasattr(hsb, "prandtl_biplane_interference_factor")
+    assert hasattr(hsb, "horseshoe_lattice_wave_drag")
+
+    chord = 0.12
+    q = 18000.0
+    for tc in (0.12, 0.15):
+        got = float(hsb.junction_interference_drag(chord=chord, thickness_to_chord=tc, dynamic_pressure=q))
+        expected = q * (0.75 * tc - 0.0003 / tc**2) * (chord * tc) ** 2
+        assert got == pytest.approx(expected, rel=0.03)

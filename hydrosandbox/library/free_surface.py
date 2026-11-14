@@ -247,13 +247,14 @@ def junction_interference_drag(
 ) -> Vectorizable:
     """
     Compute T-junction / strut-foil interference drag [N] using Hoerner's
-    corner-interference correlation (Hoerner, Fluid-Dynamic Drag, Ch. 8).
+    corner-interference correlation (Hoerner, Fluid-Dynamic Drag, Ch. 8, Eq. 2:
+    ``C_D_t2 = 0.75 * (t/c) - 0.0003 / (t/c)^2``).
     """
     t = chord * thickness_to_chord
-    tc = np.maximum(thickness_to_chord, 0.01)
+    tc = np.softmax(thickness_to_chord, 0.04, softness=0.01)
     c_d_t2 = np.softmax(
-        0.75 * tc - 0.0003 / (tc + 0.02) ** 3,
-        0.02,
-        softness=0.01,
+        0.75 * tc - 0.0003 / tc**2,
+        0.005,
+        softness=0.005,
     )
     return n_junctions * dynamic_pressure * c_d_t2 * t**2
