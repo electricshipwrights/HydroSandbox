@@ -84,6 +84,7 @@ class CraftBuildup(ExplicitAnalysis):
         include_transom_drag: bool = False,
         include_hull_dynamics: bool = True,
         hull_dynamics: Any = None,
+        hull_wave_amplitude: Any = None,
         pitch_rate: Vectorizable = 0.0,
         include_interference_breakdown: bool = True,
         wave_length_scales: tuple[float, float, float] | None = None,
@@ -134,6 +135,10 @@ class CraftBuildup(ExplicitAnalysis):
             demihull spacing). The hull's dynamic force is then interpolated from it
             instead of being integrated afresh, which makes each evaluation, and
             above all each ``Opti`` solve, far cheaper in time and memory.
+        hull_wave_amplitude : A ``Hull.wave_amplitude_table(...)`` for this speed
+            and ``wave_length_scales`` (and demihull spacing). The hull's free-surface
+            source spectrum is then interpolated over ``(sinkage, trim)`` instead of
+            being rebuilt across thousands of wavenumbers per iteration.
         pitch_rate : Bow-up pitch rate about the centre of gravity [rad/s]. Seen by
             the foils (quasi-steadily, as a change in local inflow), not by the hull.
             Used by ``run_with_stability`` to find the foils' pitch damping.
@@ -175,6 +180,7 @@ class CraftBuildup(ExplicitAnalysis):
         self.include_transom_drag = include_transom_drag
         self.include_hull_dynamics = include_hull_dynamics
         self.hull_dynamics = hull_dynamics
+        self.hull_wave_amplitude = hull_wave_amplitude
         self.pitch_rate = pitch_rate
         self.include_interference_breakdown = include_interference_breakdown
         self.wave_length_scales = wave_length_scales
@@ -207,15 +213,12 @@ class CraftBuildup(ExplicitAnalysis):
 
         scales = self.wave_length_scales
         if scales is None:
-            level_spacing = float(_onp.min(_onp.diff(self.hull.levels)))
-            beam = 2.0 * float(_onp.max(self.hull.half_breadths)) + (
-                self.demihull_spacing or 0.0
-            )
-            scales = (
-                max(beam, 1.0),
-                1.5 * self.hull.length,
-                min(0.05, max(0.5 * level_spacing, 0.01)),
-            )
+            if self.hull_wave_amplitude is not None and hasattr(
+                self.hull_wave_amplitude, "length_scales"
+            ):
+                scales = self.hull_wave_amplitude.length_scales
+            else:
+                scales = self.hull.default_wave_length_scales(self.demihull_spacing)
         water = self.water
         if element_sets:
             element_kwargs = dict(
@@ -239,24 +242,13 @@ class CraftBuildup(ExplicitAnalysis):
             reference_velocity=self.wave_reference_velocity,
         )
 
-    def run(self) -> dict[str, Any]:
-        """
-        Compute the craft's resistance breakdown and its net vertical force and
-        pitching moment about the centre of gravity at the given attitude.
-        """
+    def _hull_state(self) -> dict[str, Any]:
+        """Compute hull hydrostatics, viscous/transom drag, dynamic force, and wave amplitude."""
         hull, water = self.hull, self.water
         rho, g = water.density(), water.gravity
         velocity, trim = self.velocity, self.trim
         x_cg, z_cg = self.xyz_cg[0], self.xyz_cg[2]
         pivot = (x_cg, z_cg)
-        cos, sin = np.cosd(trim), np.sind(trim)
-        _, z_cg_earth = self._earth(x_cg, z_cg)
-
-        def moment_about_cg(x_e, z_e, f_x, f_z):
-            """Bow-up moment of an earth-axes force (aft, up) applied at a point."""
-            return (z_e - z_cg_earth) * f_x - (x_e - x_cg) * f_z
-
-        ### Hull
         n_hulls = 1 if self.demihull_spacing is None else 2
         statics = dict(hull.hydrostatics(self.sinkage, trim, pivot))
         statics["volume"] = n_hulls * statics["volume"]
@@ -275,18 +267,17 @@ class CraftBuildup(ExplicitAnalysis):
             if self.include_transom_drag
             else 0.0
         )
-        hull_amplitude = hull.wave_amplitude(
-            velocity, g, self.sinkage, trim, pivot, demihull_spacing=self.demihull_spacing
-        )
-
-        F_z = -self.mass * g + buoyancy_hull
-        M_y = moment_about_cg(statics["x_cb"], statics["z_cb"], 0.0, buoyancy_hull)
-
+        if self.hull_wave_amplitude is not None:
+            hull_amplitude = self.hull_wave_amplitude(
+                self.sinkage, trim, pivot_xz=pivot
+            )
+        else:
+            hull_amplitude = hull.wave_amplitude(
+                velocity, g, self.sinkage, trim, pivot, demihull_spacing=self.demihull_spacing
+            )
         dynamic = None
         if self.include_hull_dynamics and self.hull_dynamics is not None:
             dynamic = self.hull_dynamics(self.sinkage, trim, pivot_xz=pivot, x_ref=x_cg)
-            F_z = F_z + dynamic["force_up"]
-            M_y = M_y + dynamic["moment_bow_up"]
         elif self.include_hull_dynamics:
             dynamic = hull.dynamic_force(
                 velocity,
@@ -300,6 +291,45 @@ class CraftBuildup(ExplicitAnalysis):
                 level=self.squat_level,
                 demihull_spacing=self.demihull_spacing,
             )
+        return {
+            "statics": statics,
+            "buoyancy_hull": buoyancy_hull,
+            "D_hull_viscous": D_hull_viscous,
+            "transom": transom,
+            "D_transom": D_transom,
+            "hull_amplitude": hull_amplitude,
+            "dynamic": dynamic,
+        }
+
+    def run(self, _hull_state: dict[str, Any] | None = None) -> dict[str, Any]:
+        """
+        Compute the craft's resistance breakdown and its net vertical force and
+        pitching moment about the centre of gravity at the given attitude.
+        """
+        hull, water = self.hull, self.water
+        rho, g = water.density(), water.gravity
+        velocity, trim = self.velocity, self.trim
+        x_cg, z_cg = self.xyz_cg[0], self.xyz_cg[2]
+        cos, sin = np.cosd(trim), np.sind(trim)
+        _, z_cg_earth = self._earth(x_cg, z_cg)
+
+        def moment_about_cg(x_e, z_e, f_x, f_z):
+            """Bow-up moment of an earth-axes force (aft, up) applied at a point."""
+            return (z_e - z_cg_earth) * f_x - (x_e - x_cg) * f_z
+
+        ### Hull
+        hull_state = self._hull_state() if _hull_state is None else _hull_state
+        statics = hull_state["statics"]
+        buoyancy_hull = hull_state["buoyancy_hull"]
+        D_hull_viscous = hull_state["D_hull_viscous"]
+        transom = hull_state["transom"]
+        D_transom = hull_state["D_transom"]
+        hull_amplitude = hull_state["hull_amplitude"]
+        dynamic = hull_state["dynamic"]
+
+        F_z = -self.mass * g + buoyancy_hull
+        M_y = moment_about_cg(statics["x_cb"], statics["z_cb"], 0.0, buoyancy_hull)
+        if dynamic is not None:
             F_z = F_z + dynamic["force_up"]
             M_y = M_y + dynamic["moment_bow_up"]
 
@@ -426,11 +456,15 @@ class CraftBuildup(ExplicitAnalysis):
         d_sinkage: float = 1e-3,
         d_trim: float = 0.05,
         d_pitch_rate: float = 0.01,
+        include_pitch_damping: bool = True,
     ) -> dict[str, Any]:
         """
         ``run()``, plus the craft's static heave and pitch stiffness at this attitude
         and speed. Uses exact CasADi algorithmic differentiation when symbolic
         (``asb.Opti``) and central finite differences when numeric.
+
+        Pass ``include_pitch_damping=False`` to skip the finite-difference evaluation
+        for ``c_pitch_foils`` (which will then be reported as ``None``).
 
         Meaningful at an equilibrium attitude. Works symbolically, so the stiffnesses
         can be constrained or optimized in ``asb.Opti``. Added to the results:
@@ -456,7 +490,8 @@ class CraftBuildup(ExplicitAnalysis):
         """
         import copy
 
-        base = self.run()
+        hull_state = self._hull_state()
+        base = self.run(_hull_state=hull_state)
         is_symbolic = np.is_casadi_type(
             base["F_z_net"], recursive=False
         ) or np.is_casadi_type(base["M_y_net"], recursive=False)
@@ -464,26 +499,59 @@ class CraftBuildup(ExplicitAnalysis):
         if is_symbolic:
             import casadi as ca
 
-            s_var = ca.MX.sym("_stab_sinkage")
-            t_var = ca.MX.sym("_stab_trim")
-            probe = copy.copy(self)
-            probe.sinkage = s_var
-            probe.trim = t_var
-            probe.include_interference_breakdown = False
-            probed = probe.run()
-
-            vars_st = ca.vertcat(s_var, t_var)
-            vals_st = ca.vertcat(self.sinkage, self.trim)
-            jac = ca.jacobian(
-                ca.vertcat(probed["F_z_net"], probed["M_y_net"]),
-                vars_st,
-            )
-            jac_at = ca.substitute(jac, vars_st, vals_st)
             rad_per_deg = _onp.pi / 180.0
-            f_s = jac_at[0, 0]
-            f_t = jac_at[0, 1] / rad_per_deg
-            m_s = jac_at[1, 0]
-            m_t = jac_at[1, 1] / rad_per_deg
+            direct_attitude = (
+                isinstance(self.sinkage, ca.MX)
+                and self.sinkage.is_symbolic()
+                and self.sinkage.numel() == 1
+                and isinstance(self.trim, ca.MX)
+                and self.trim.is_symbolic()
+                and self.trim.numel() == 1
+                and not ca.is_equal(self.sinkage, self.trim)
+            )
+            if direct_attitude:
+                vars_self = ca.vertcat(self.sinkage, self.trim)
+                externals = [
+                    self.velocity,
+                    self.mass,
+                    self.xyz_cg[0],
+                    self.xyz_cg[1],
+                    self.xyz_cg[2],
+                    self.shaft_angle,
+                    self.pitch_rate,
+                    self.thrust_deduction,
+                ]
+                if self.xyz_thrust is not None:
+                    externals.extend(self.xyz_thrust)
+                if any(
+                    isinstance(x, ca.MX) and ca.depends_on(x, vars_self)
+                    for x in externals
+                ):
+                    direct_attitude = False
+
+            if direct_attitude:
+                vec = ca.vertcat(base["F_z_net"], base["M_y_net"])
+                df_ds = ca.jtimes(vec, self.sinkage, 1.0)
+                df_dt = ca.jtimes(vec, self.trim, 1.0)
+                f_s, m_s = df_ds[0], df_ds[1]
+                f_t, m_t = df_dt[0] / rad_per_deg, df_dt[1] / rad_per_deg
+            else:
+                s_var = ca.MX.sym("_stab_sinkage")
+                t_var = ca.MX.sym("_stab_trim")
+                probe = copy.copy(self)
+                probe.sinkage = s_var
+                probe.trim = t_var
+                probe.include_interference_breakdown = False
+                probed = probe.run()
+
+                vars_st = ca.vertcat(s_var, t_var)
+                vals_st = ca.vertcat(self.sinkage, self.trim)
+                vec = ca.vertcat(probed["F_z_net"], probed["M_y_net"])
+                df_ds = ca.jtimes(vec, s_var, 1.0)
+                df_dt = ca.jtimes(vec, t_var, 1.0)
+                derivs = ca.substitute(ca.vertcat(df_ds, df_dt), vars_st, vals_st)
+                f_s, m_s = derivs[0], derivs[1]
+                f_t, m_t = derivs[2] / rad_per_deg, derivs[3] / rad_per_deg
         else:
             def nudged(ds: float, dt: float) -> dict[str, Any]:
                 other = copy.copy(self)
@@ -504,12 +572,17 @@ class CraftBuildup(ExplicitAnalysis):
             m_t = (pitch_p["M_y_net"] - pitch_m["M_y_net"]) / (2.0 * d_trim_rad)
 
         # The foils' pitch damping, from one further evaluation at a small pitch rate
-        # (the response is linear in it), numeric or symbolic alike.
-        if self.assembly is not None:
+        # (the response is linear in it), numeric or symbolic alike. Pitch rate only
+        # enters HydroBuildup, so the hull's state and wave spectrum are reused.
+        if not include_pitch_damping:
+            c_pitch = None
+        elif self.assembly is not None:
             pitching = copy.copy(self)
             pitching.pitch_rate = self.pitch_rate + d_pitch_rate
             pitching.include_interference_breakdown = False
-            c_pitch = -(pitching.run()["M_y_net"] - base["M_y_net"]) / d_pitch_rate
+            c_pitch = -(
+                pitching.run(_hull_state=hull_state)["M_y_net"] - base["M_y_net"]
+            ) / d_pitch_rate
         else:
             c_pitch = 0.0
 

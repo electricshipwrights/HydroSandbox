@@ -724,7 +724,9 @@ class Hull(AeroSandboxObject):
         if np.is_casadi_type(column, recursive=False) or np.is_casadi_type(
             matrix, recursive=False
         ):
-            return (column @ _onp.ones((1, matrix.shape[1]))) * matrix
+            import casadi as cas
+
+            return cas.diag(column) @ matrix
         return column * matrix
 
     def _strips(self, velocity, gravity, sinkage, trim, pivot_xz, n_hollow: int = 12):
@@ -801,11 +803,81 @@ class Hull(AeroSandboxObject):
         return out
 
     @staticmethod
+    def _has_casadi(*values) -> bool:
+        for v in values:
+            if v is None:
+                continue
+            if isinstance(v, _onp.ndarray) and v.dtype != object:
+                continue
+            if np.is_casadi_type(v, recursive=True):
+                return True
+        return False
+
+    def _contract_groups(self, weights, z_lo, z_hi, k_row, n_groups: int):
+        """
+        Compute ``_sum_groups(_scale_rows(weights, _depth_average(z_lo, z_hi, k_row)), n_groups)``.
+        Uses a wet-only chunked NumPy fast path when numeric to avoid allocating
+        the full dry+wet cell-by-wavenumber exponential matrix.
+        """
+        if self._has_casadi(weights, z_lo, z_hi, k_row):
+            return self._sum_groups(
+                self._scale_rows(weights, self._depth_average(z_lo, z_hi, k_row)),
+                n_groups,
+            )
+        w = _onp.asarray(weights, dtype=float).ravel()
+        zlo = _onp.minimum(_onp.asarray(z_lo, dtype=float).ravel(), 0.0)
+        zhi = _onp.minimum(_onp.asarray(z_hi, dtype=float).ravel(), 0.0)
+        k = _onp.asarray(k_row, dtype=float).reshape(1, -1)
+        m = k.shape[1]
+        n_per = len(w) // n_groups
+        nz = _onp.flatnonzero(w != 0.0)
+        if len(nz) == 0:
+            return _onp.zeros((n_groups, m), dtype=float)
+        g_mat = _onp.zeros((n_groups, len(nz)), dtype=float)
+        g_mat[nz // n_per, _onp.arange(len(nz))] = w[nz]
+        zlo_nz = zlo[nz, None]
+        zhi_nz = zhi[nz, None]
+        out = _onp.empty((n_groups, m), dtype=float)
+        for s0 in range(0, m, 512):
+            kc = k[:, s0 : s0 + 512]
+            a = zlo_nz * kc
+            b = zhi_nz * kc
+            d = b - a
+            sm = _onp.abs(d) < 1e-6
+            d_safe = _onp.where(sm, 1.0, d)
+            avg = _onp.where(
+                sm,
+                _onp.exp(0.5 * (a + b)),
+                (_onp.exp(b) - _onp.exp(a)) / d_safe,
+            )
+            out[:, s0 : s0 + 512] = g_mat @ avg
+        return out
+
+    @staticmethod
     def _strip_transform(weights, x_strip, dx_strip, kx_row, sign: float):
         """
         ``sum_s weights[s, m] * sinc(kx dx_s / 2) * exp(sign * i kx x_s)`` over strips,
         as (real, imag) rows.
         """
+        if not Hull._has_casadi(weights, x_strip, dx_strip, kx_row):
+            w_arr = _onp.asarray(weights, dtype=float)
+            x_col = _onp.asarray(x_strip, dtype=float).reshape(-1, 1)
+            kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
+            phase = x_col @ kx_arr
+            if _onp.ndim(dx_strip) == 0:
+                half = (0.5 * float(dx_strip)) * kx_arr
+            else:
+                half = (
+                    0.5 * _onp.asarray(dx_strip, dtype=float).reshape(-1, 1) @ kx_arr
+                )
+            half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
+            smear = _onp.where(
+                _onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
+            )
+            weighted = w_arr * smear
+            re = _onp.sum(weighted * _onp.cos(phase), axis=0, keepdims=True)
+            im = sign * _onp.sum(weighted * _onp.sin(phase), axis=0, keepdims=True)
+            return re, im
         x_col = np.reshape(x_strip, (-1, 1))
         phase = x_col @ kx_row
         if np.is_casadi_type(dx_strip, recursive=False) or _onp.ndim(dx_strip) == 0:
@@ -844,54 +916,72 @@ class Hull(AeroSandboxObject):
         station instead of a full line-segment transform per cell.
         """
         strips = self._strips(velocity, gravity, sinkage, trim, pivot_xz)
+        base_symbolic = self._has_casadi(
+            velocity, sinkage, trim, pivot_xz[0], pivot_xz[1]
+        )
+
+        def _eval_chunk(kx_c, kappa_c, ky_c=None):
+            g_hull = self._contract_groups(
+                strips["slope_hull"],
+                strips["z_lo_hull"],
+                strips["z_hi_hull"],
+                kappa_c,
+                strips["n_hull"],
+            )
+            re, im = self._strip_transform(
+                g_hull, strips["x_hull"], strips["dx_hull"], kx_c, sign=-1.0
+            )
+            if strips["n_bow"] > 0:
+                g_bow = self._contract_groups(
+                    strips["slope_bow"],
+                    strips["z_lo_bow"],
+                    strips["z_hi_bow"],
+                    kappa_c,
+                    strips["n_bow"],
+                )
+                re_b, im_b = self._strip_transform(
+                    g_bow, strips["x_bow"], strips["dx_bow"], kx_c, sign=-1.0
+                )
+                re, im = re + re_b, im + im_b
+            if strips["n_hollow"] > 0:
+                g_hollow = self._contract_groups(
+                    strips["slope_hollow"],
+                    strips["z_lo_hollow"],
+                    strips["z_hi_hollow"],
+                    kappa_c,
+                    strips["n_hollow"],
+                )
+                re_h, im_h = self._strip_transform(
+                    g_hollow, strips["x_hollow"], strips["dx_hollow"], kx_c, sign=-1.0
+                )
+                re, im = re + re_h, im + im_h
+            if demihull_spacing is not None:
+                if ky_c is None:
+                    raise ValueError("A demihull pair's amplitude needs `ky`.")
+                pair = 2.0 * np.cos(0.5 * demihull_spacing * ky_c)
+                re, im = pair * re, pair * im
+            return 2.0 * velocity * re, 2.0 * velocity * im
 
         def amplitude(kx_row, kappa_row, ky_row=None):
             kx_row = np.reshape(kx_row, (1, -1))
             kappa_row = np.reshape(kappa_row, (1, -1))
-            g_hull = self._sum_groups(
-                self._scale_rows(
-                    strips["slope_hull"],
-                    self._depth_average(strips["z_lo_hull"], strips["z_hi_hull"], kappa_row),
-                ),
-                strips["n_hull"],
-            )
-            re, im = self._strip_transform(
-                g_hull, strips["x_hull"], strips["dx_hull"], kx_row, sign=-1.0
-            )
-            if strips["n_bow"] > 0:
-                g_bow = self._sum_groups(
-                    self._scale_rows(
-                        strips["slope_bow"],
-                        self._depth_average(
-                            strips["z_lo_bow"], strips["z_hi_bow"], kappa_row
-                        ),
-                    ),
-                    strips["n_bow"],
-                )
-                re_b, im_b = self._strip_transform(
-                    g_bow, strips["x_bow"], strips["dx_bow"], kx_row, sign=-1.0
-                )
-                re, im = re + re_b, im + im_b
-            if strips["n_hollow"] > 0:
-                g_hollow = self._sum_groups(
-                    self._scale_rows(
-                        strips["slope_hollow"],
-                        self._depth_average(
-                            strips["z_lo_hollow"], strips["z_hi_hollow"], kappa_row
-                        ),
-                    ),
-                    strips["n_hollow"],
-                )
-                re_h, im_h = self._strip_transform(
-                    g_hollow, strips["x_hollow"], strips["dx_hollow"], kx_row, sign=-1.0
-                )
-                re, im = re + re_h, im + im_h
-            if demihull_spacing is not None:
-                if ky_row is None:
-                    raise ValueError("A demihull pair's amplitude needs `ky`.")
-                pair = 2.0 * np.cos(0.5 * demihull_spacing * np.reshape(ky_row, (1, -1)))
-                re, im = pair * re, pair * im
-            return 2.0 * velocity * re, 2.0 * velocity * im
+            ky_reshaped = None if ky_row is None else np.reshape(ky_row, (1, -1))
+            m = kx_row.shape[1]
+            is_sym = base_symbolic or self._has_casadi(kx_row, kappa_row, ky_reshaped)
+            chunk = 256
+            if is_sym and m > chunk:
+                re_parts, im_parts = [], []
+                for s0 in range(0, m, chunk):
+                    s1 = min(s0 + chunk, m)
+                    re_c, im_c = _eval_chunk(
+                        kx_row[:, s0:s1],
+                        kappa_row[:, s0:s1],
+                        None if ky_reshaped is None else ky_reshaped[:, s0:s1],
+                    )
+                    re_parts.append(re_c)
+                    im_parts.append(im_c)
+                return np.concatenate(re_parts, axis=1), np.concatenate(im_parts, axis=1)
+            return _eval_chunk(kx_row, kappa_row, ky_reshaped)
 
         return amplitude
 
@@ -961,8 +1051,9 @@ class Hull(AeroSandboxObject):
         Returns
         -------
         Dict with ``force_up`` [N] (negative: suction, the hull sinks),
-        ``moment_bow_up`` [N m] about ``x_ref``, and its ``moment_local`` and
-        ``moment_wave`` parts.
+        ``moment_bow_up`` [N m] about ``x_ref``, its ``moment_local`` and
+        ``moment_wave`` parts, and ``moment_slope`` [N m / m]
+        (``d(moment_bow_up)/dx_ref``).
         """
         v_ref = reference_velocity
         if v_ref is None:
@@ -996,10 +1087,6 @@ class Hull(AeroSandboxObject):
         bow_f_sub = strips["bow"]["f_sub"]
         transom_dz = self._transom_z_hi - self._transom_z_lo
 
-        def cols(matrix_or_col, m):
-            """Broadcast an (n, 1) column across m wavenumber columns."""
-            return np.reshape(matrix_or_col, (-1, 1)) @ _onp.ones((1, m))
-
         def tile(matrix, repeats: int):
             if repeats == 1:
                 return matrix
@@ -1016,70 +1103,116 @@ class Hull(AeroSandboxObject):
             shared by every direction theta.
             """
             k_row = np.reshape(k_row, (1, -1))
-            depth_hull = self._depth_average(strips["z_lo_hull"], strips["z_hi_hull"], k_row)
             out = {
                 # Weights of the real hull: -slope is d f / dX.
-                "g_q": -self._sum_groups(
-                    self._scale_rows(strips["slope_hull"], depth_hull), n_hull
+                "g_q": -self._contract_groups(
+                    strips["slope_hull"],
+                    strips["z_lo_hull"],
+                    strips["z_hi_hull"],
+                    k_row,
+                    n_hull,
                 ),
-                "g_p": self._sum_groups(
-                    self._scale_rows(strips["half_volume"], depth_hull), n_hull
+                "g_p": self._contract_groups(
+                    strips["half_volume"],
+                    strips["z_lo_hull"],
+                    strips["z_hi_hull"],
+                    k_row,
+                    n_hull,
                 ),
             }
             if strips["n_hollow"] > 0:
-                depth_hollow = self._depth_average(
-                    strips["z_lo_hollow"], strips["z_hi_hollow"], k_row
-                )
-                out["g_h"] = -self._sum_groups(
-                    self._scale_rows(strips["slope_hollow"], depth_hollow),
+                out["g_h"] = -self._contract_groups(
+                    strips["slope_hollow"],
+                    strips["z_lo_hollow"],
+                    strips["z_hi_hollow"],
+                    k_row,
                     strips["n_hollow"],
                 )
-            depth_t = self._depth_average(
-                strips["transom"]["z_lo"], strips["transom"]["z_hi"], k_row
+            out["z_t"] = self._contract_groups(
+                cos * transom_f_sub * self._transom_f * transom_dz,
+                strips["transom"]["z_lo"],
+                strips["transom"]["z_hi"],
+                k_row,
+                1,
             )
-            out["z_t"] = np.reshape(
-                np.sum(
-                    self._scale_rows(cos * transom_f_sub * self._transom_f * transom_dz, depth_t),
-                    axis=0,
-                ),
-                (1, -1),
-            )
-            depth_b = self._depth_average(
-                strips["bow"]["z_lo"], strips["bow"]["z_hi"], k_row
-            )
-            out["z_b"] = np.reshape(
-                np.sum(
-                    self._scale_rows(cos * bow_f_sub * self._bow_f * transom_dz, depth_b),
-                    axis=0,
-                ),
-                (1, -1),
+            out["z_b"] = self._contract_groups(
+                cos * bow_f_sub * self._bow_f * transom_dz,
+                strips["bow"]["z_lo"],
+                strips["bow"]["z_hi"],
+                k_row,
+                1,
             )
             return out
 
-        def forms(kx_row, k_row, contraction=None, repeats: int = 1):
+        def forms(
+            kx_row, k_row, contraction=None, repeats: int = 1, include_q_im: bool = False
+        ):
             """
             The bilinear forms q*q, w*q, r*q, r_wl*q at paired (kx, k) rows. With
             ``contraction`` (of the distinct k) and ``repeats``, the k-row is that
             contraction's k repeated ``repeats`` times.
             """
             kx_row = np.reshape(kx_row, (1, -1))
-            m = kx_row.shape[1]
             if contraction is None:
                 contraction = contract(k_row)
             g_q = tile(contraction["g_q"], repeats)
             g_p = tile(contraction["g_p"], repeats)
 
-            def transform(weights):
-                return self._strip_transform(
-                    weights, -big_x_hull, strips["dx_hull"], kx_row, sign=1.0
-                )  # exp(-i kx X) = exp(+i kx x_earth)
+            if not self._has_casadi(
+                big_x_hull, arm_hull, d_f_wl, f_wl_mid, g_q, g_p, kx_row
+            ):
+                x_col = _onp.asarray(-big_x_hull, dtype=float).reshape(-1, 1)
+                kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
+                phase_h = x_col @ kx_arr
+                half_h = (
+                    0.5 * _onp.asarray(strips["dx_hull"], dtype=float).reshape(-1, 1) @ kx_arr
+                )
+                half_safe = _onp.where(_onp.fabs(half_h) < 1e-6, 1.0, half_h)
+                smear_h = _onp.where(
+                    _onp.fabs(half_h) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
+                )
+                ker_re = smear_h * _onp.cos(phase_h)
+                ker_im = smear_h * _onp.sin(phase_h)
+                g_q_arr = _onp.asarray(g_q, dtype=float)
+                g_p_arr = _onp.asarray(g_p, dtype=float)
+                arm_col = _onp.asarray(arm_hull, dtype=float).reshape(-1, 1)
+                g_q1_arr = arm_col * g_q_arr
+                df_row = _onp.asarray(d_f_wl, dtype=float).reshape(1, -1)
+                fwm_row = _onp.asarray(f_wl_mid, dtype=float).reshape(1, -1)
+                adf_row = (arm_col.ravel() * df_row.ravel()).reshape(1, -1)
+                q_re = _onp.sum(g_q_arr * ker_re, axis=0, keepdims=True)
+                q_im = _onp.sum(g_q_arr * ker_im, axis=0, keepdims=True)
+                p_re = _onp.sum(g_p_arr * ker_re, axis=0, keepdims=True)
+                p_im = _onp.sum(g_p_arr * ker_im, axis=0, keepdims=True)
+                q1_re = _onp.sum(g_q1_arr * ker_re, axis=0, keepdims=True)
+                q1_im = _onp.sum(g_q1_arr * ker_im, axis=0, keepdims=True)
+                w_re, w_im = df_row @ ker_re, df_row @ ker_im
+                pw_re, pw_im = fwm_row @ ker_re, fwm_row @ ker_im
+                q1w_re, q1w_im = adf_row @ ker_re, adf_row @ ker_im
+            else:
+                phase_h = np.reshape(-big_x_hull, (-1, 1)) @ kx_row
+                half_h = 0.5 * _onp.reshape(strips["dx_hull"], (-1, 1)) @ kx_row
+                half_safe = np.where(np.fabs(half_h) < 1e-6, 1.0, half_h)
+                smear_h = np.where(np.fabs(half_h) < 1e-6, 1.0, np.sin(half_safe) / half_safe)
+                ker_re = smear_h * np.cos(phase_h)
+                ker_im = smear_h * np.sin(phase_h)
 
-            q_re, q_im = transform(g_q)
-            p_re, p_im = transform(g_p)
-            q1_re, q1_im = transform(cols(arm_hull, m) * g_q)
-            w_re, w_im = transform(cols(d_f_wl, m))
-            pw_re, pw_im = transform(cols(f_wl_mid, m))
-            q1w_re, q1w_im = transform(cols(arm_hull * d_f_wl, m))
+                def _t_mat(weights_mat):
+                    return (
+                        np.reshape(np.sum(weights_mat * ker_re, axis=0), (1, -1)),
+                        np.reshape(np.sum(weights_mat * ker_im, axis=0), (1, -1)),
+                    )
+
+                def _t_row(weight_vec):
+                    w_r = np.reshape(weight_vec, (1, -1))
+                    return w_r @ ker_re, w_r @ ker_im
+
+                q_re, q_im = _t_mat(g_q)
+                p_re, p_im = _t_mat(g_p)
+                q1_re, q1_im = _t_mat(self._scale_rows(arm_hull, g_q))
+                w_re, w_im = _t_row(d_f_wl)
+                pw_re, pw_im = _t_row(f_wl_mid)
+                q1w_re, q1w_im = _t_row(arm_hull * d_f_wl)
 
             # Sources: the hull's, the bow step (-z_b), plus the closing hollow.
             src_re, src_im = q_re, q_im
@@ -1114,8 +1247,8 @@ class Hull(AeroSandboxObject):
             def conj_times_source(a_re, a_im):
                 return a_re * src_re + a_im * src_im, a_re * src_im - a_im * src_re
 
-            qq, _ = conj_times_source(q_re, q_im)
-            wq, _ = conj_times_source(w_re, w_im)
+            qq, qq_im = conj_times_source(q_re, q_im)
+            wq, wq_im = conj_times_source(w_re, w_im)
             rq_re, rq_im = conj_times_source(r_re, r_im)
             rwq_re, rwq_im = conj_times_source(rw_re, rw_im)
             if demihull_spacing is not None:
@@ -1124,9 +1257,12 @@ class Hull(AeroSandboxObject):
                     k_all = tile(k_all, repeats)
                 ky = np.sqrt(np.fmax(k_all**2 - kx_row**2, 0.0))
                 pair = 2.0 * (1.0 + np.cos(demihull_spacing * ky))
-                qq, wq, rq_re, rq_im, rwq_re, rwq_im = (
-                    pair * v for v in (qq, wq, rq_re, rq_im, rwq_re, rwq_im)
+                qq, qq_im, wq, wq_im, rq_re, rq_im, rwq_re, rwq_im = (
+                    pair * v
+                    for v in (qq, qq_im, wq, wq_im, rq_re, rq_im, rwq_re, rwq_im)
                 )
+            if include_q_im:
+                return qq, wq, rq_re, rq_im, rwq_re, rwq_im, qq_im, wq_im
             return qq, wq, rq_re, rq_im, rwq_re, rwq_im
 
         ### Local (principal-value) part: boatmath `Fleet::local_integral`.
@@ -1165,7 +1301,6 @@ class Hull(AeroSandboxObject):
 
         n_k, n_t = len(k_nodes), len(theta_nodes)
         kx_grid = (cos_t[:, None] * k_nodes[None, :]).reshape(1, -1)  # theta-major
-        k_grid = _onp.tile(k_nodes, n_t).reshape(1, -1)
         qq, wq, rq_re, _, rwq_re, _ = forms(
             kx_grid, k_nodes, contraction=contract(k_nodes), repeats=n_t
         )
@@ -1249,15 +1384,21 @@ class Hull(AeroSandboxObject):
         wave_nodes, wave_weights = panels(_onp.linspace(0.0, theta_max, max(int(round(48 * level)), 2) + 1))
         lam = 1.0 / _onp.cos(wave_nodes)
         k_wave = np.reshape(nu * lam**2, (1, -1))
-        _, _, _, rq_im, _, rwq_im = forms(np.reshape(nu * lam, (1, -1)), k_wave)
-        wave_integral = np.sum((k_wave * rq_im - rwq_im) * (wave_weights * lam**2).reshape(1, -1))
+        _, _, _, rq_im, _, rwq_im, qq_im, wq_im = forms(
+            np.reshape(nu * lam, (1, -1)), k_wave, include_q_im=True
+        )
+        wave_wt_row = (wave_weights * lam**2).reshape(1, -1)
+        wave_integral = np.sum((k_wave * rq_im - rwq_im) * wave_wt_row)
+        wave_slope_integral = np.sum((k_wave * qq_im - wq_im) * wave_wt_row)
         moment_wave = -(4.0 * density * velocity**2 * nu / _onp.pi) * wave_integral
+        moment_wave_slope = -(4.0 * density * velocity**2 * nu / _onp.pi) * wave_slope_integral
 
         return {
             "force_up": force_up,
             "moment_bow_up": moment_local + moment_wave,
             "moment_local": moment_local,
             "moment_wave": moment_wave,
+            "moment_slope": force_up + moment_wave_slope,
         }
 
     def dynamic_force_table(
@@ -1316,23 +1457,118 @@ class Hull(AeroSandboxObject):
             velocity=float(velocity),
         )
 
+    def default_wave_length_scales(
+        self, demihull_spacing: float | None = None
+    ) -> tuple[float, float, float]:
+        """Default ``(y_extent, x_extent, min_depth)`` [m] for wave quadrature."""
+        level_spacing = float(_onp.min(_onp.diff(self.levels)))
+        beam = 2.0 * float(_onp.max(self.half_breadths)) + (demihull_spacing or 0.0)
+        return (
+            max(beam, 1.0),
+            1.5 * self.length,
+            min(0.05, max(0.5 * level_spacing, 0.01)),
+        )
+
+    def wave_amplitude_table(
+        self,
+        velocity: float,
+        gravity: float = 9.80665,
+        length_scales: tuple[float, float, float] | None = None,
+        sinkage_range: tuple[float, float] = (-0.15, 0.05),
+        trim_range: tuple[float, float] = (-2.0, 4.0),
+        n_sinkage: int = 9,
+        n_trim: int = 13,
+        pivot_xz: Sequence[float] | None = None,
+        demihull_spacing: float | None = None,
+        phase_per_panel: float = 2.0,
+        nodes_per_panel: int = 6,
+        jobs: int | None = 1,
+    ) -> "WaveAmplitudeTable":
+        """
+        Tabulate ``wave_amplitude`` over a grid of attitudes at one speed and
+        quadrature layout, for reuse in ``CraftBuildup(hull_wave_amplitude=...)``.
+        """
+        from hydrosandbox.library.wave_resistance import wave_quadrature_nodes
+        from hydrosandbox.parallel import parallel_map
+
+        if length_scales is None:
+            length_scales = self.default_wave_length_scales(demihull_spacing)
+        min_d = max(float(length_scales[2]), 1e-3)
+        y_ext = max(float(length_scales[0]), min_d)
+        x_ext = max(float(length_scales[1]), min_d)
+        vel = float(velocity)
+        nu = gravity / vel**2
+        sigma, _ = wave_quadrature_nodes(
+            nu=nu,
+            y_extent=y_ext,
+            x_extent=x_ext,
+            min_depth=min_d,
+            phase_per_panel=phase_per_panel,
+            nodes_per_panel=nodes_per_panel,
+        )
+        kappa = (nu + sigma**2).reshape(1, -1)
+        kx = _onp.sqrt(nu * kappa)
+        ky = sigma.reshape(1, -1) * _onp.sqrt(kappa)
+
+        if pivot_xz is None:
+            pivot_xz = (0.5 * float(self.stations[0] + self.stations[-1]), 0.0)
+        pivot_tuple = (float(pivot_xz[0]), float(pivot_xz[1]))
+        sinkages = _onp.linspace(sinkage_range[0], sinkage_range[1], n_sinkage)
+        trims = _onp.linspace(trim_range[0], trim_range[1], n_trim)
+        tasks = [
+            (self, vel, gravity, float(s), trims, pivot_tuple, demihull_spacing, kx, kappa, ky)
+            for s in sinkages
+        ]
+        rows = parallel_map(_wave_amplitude_row, tasks, jobs=jobs)
+        re_grid = _onp.array([r[0] for r in rows], dtype=float)
+        im_grid = _onp.array([r[1] for r in rows], dtype=float)
+        return WaveAmplitudeTable(
+            sinkages=sinkages,
+            trims=trims,
+            re=re_grid,
+            im=im_grid,
+            kx=kx.ravel(),
+            kappa=kappa.ravel(),
+            pivot_xz=pivot_tuple,
+            velocity=vel,
+            length_scales=tuple(float(v) for v in length_scales),
+        )
+
+
+def _wave_amplitude_row(hull, velocity, gravity, sinkage, trims, pivot_xz, spacing, kx, kappa, ky):
+    """Evaluate one sinkage row across all trims for ``Hull.wave_amplitude_table``."""
+    re_row = _onp.empty((len(trims), kx.size), dtype=float)
+    im_row = _onp.empty((len(trims), kx.size), dtype=float)
+    for j, trim in enumerate(trims):
+        amp = hull.wave_amplitude(
+            velocity, gravity, sinkage, float(trim), pivot_xz, demihull_spacing=spacing
+        )
+        re_v, im_v = amp(kx, kappa, ky)
+        re_row[j, :] = _onp.asarray(re_v, dtype=float).ravel()
+        im_row[j, :] = _onp.asarray(im_v, dtype=float).ravel()
+    return re_row, im_row
+
 
 def _dynamic_force_point(hull, velocity, density, gravity, sinkage, trim, pivot_xz, level, spacing):
     """
     One table entry: (force_up, moment_bow_up about the pivot, and the moment's
     change per metre the reference is moved aft).
     """
-    def at(x_ref):
-        return hull.dynamic_force(
-            velocity, density, gravity, sinkage, trim, pivot_xz, x_ref=x_ref,
-            level=level, demihull_spacing=spacing,
-        )
-
-    here, aft = at(pivot_xz[0]), at(pivot_xz[0] + 1.0)
+    here = hull.dynamic_force(
+        velocity,
+        density,
+        gravity,
+        sinkage,
+        trim,
+        pivot_xz,
+        x_ref=pivot_xz[0],
+        level=level,
+        demihull_spacing=spacing,
+    )
     return (
         float(here["force_up"]),
         float(here["moment_bow_up"]),
-        float(aft["moment_bow_up"]) - float(here["moment_bow_up"]),
+        float(here["moment_slope"]),
     )
 
 
@@ -1407,3 +1643,136 @@ class DynamicForceTable:
             "force_up": force,
             "moment_bow_up": moment + slope * (x_ref - x_table),
         }
+
+
+class WaveAmplitudeTable:
+    """
+    A hull's free-surface source-flux transform ``(re, im)`` at one speed and
+    quadrature layout, tabulated over attitude using separable cubic B-splines
+    (see ``Hull.wave_amplitude_table``).
+    """
+
+    def __init__(
+        self,
+        sinkages,
+        trims,
+        re,
+        im,
+        kx,
+        kappa,
+        pivot_xz,
+        velocity,
+        length_scales,
+    ):
+        import casadi as cas
+
+        self.sinkages = _onp.asarray(sinkages, dtype=float)
+        self.trims = _onp.asarray(trims, dtype=float)
+        self.re = _onp.asarray(re, dtype=float)
+        self.im = _onp.asarray(im, dtype=float)
+        self.kx = _onp.asarray(kx, dtype=float).ravel()
+        self.kappa = _onp.asarray(kappa, dtype=float).ravel()
+        self.pivot_xz = tuple(float(v) for v in pivot_xz)
+        self.velocity = float(velocity)
+        self.length_scales = tuple(float(v) for v in length_scales)
+
+        n_s, n_t, m = self.re.shape
+        if self.im.shape != (n_s, n_t, m) or n_s != len(self.sinkages) or n_t != len(self.trims):
+            raise ValueError("WaveAmplitudeTable grid shapes do not match.")
+        if self.kx.size != m or self.kappa.size != m:
+            raise ValueError("WaveAmplitudeTable wavenumber vector length mismatch.")
+
+        self._basis_s = cas.interpolant(
+            "hull_wave_basis_s",
+            "bspline",
+            [self.sinkages.tolist()],
+            _onp.eye(n_s).ravel().tolist(),
+        )
+        self._basis_t = cas.interpolant(
+            "hull_wave_basis_t",
+            "bspline",
+            [self.trims.tolist()],
+            _onp.eye(n_t).ravel().tolist(),
+        )
+        packed = _onp.concatenate(
+            [
+                self.re.reshape(n_s * n_t, m, order="C"),
+                self.im.reshape(n_s * n_t, m, order="C"),
+            ],
+            axis=1,
+        )
+        self._packed_np = packed
+        self._packed_dm = cas.DM(packed)
+
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+    def __setstate__(self, state):
+        self.__init__(**state)
+
+    def __call__(
+        self,
+        sinkage: Vectorizable,
+        trim: Vectorizable,
+        pivot_xz: Sequence[Vectorizable] | None = None,
+    ):
+        """
+        Return a callable ``(kx, kappa, ky) -> (re, im)`` for ``extra_source_amplitude``
+        of ``kelvin_wave_resistance`` at this attitude and pivot.
+        """
+        import casadi as cas
+
+        x0, z0 = self.pivot_xz
+        if pivot_xz is None:
+            pivot_xz = self.pivot_xz
+        cos, sin = np.cosd(trim), np.sind(trim)
+        sinkage_table = (
+            sinkage + (x0 - pivot_xz[0]) * sin + (z0 - pivot_xz[1]) * (1.0 - cos)
+        )
+        x_table = pivot_xz[0] + (x0 - pivot_xz[0]) * cos + (z0 - pivot_xz[1]) * sin
+        dx_shift = x_table - x0
+        s_clamped = np.clip(sinkage_table, self.sinkages[0], self.sinkages[-1])
+        t_clamped = np.clip(trim, self.trims[0], self.trims[-1])
+        symbolic = np.is_casadi_type(s_clamped, recursive=False) or np.is_casadi_type(
+            t_clamped, recursive=False
+        )
+        n_s, n_t, m = self.re.shape
+        if symbolic:
+            ws = self._basis_s(s_clamped)
+            wt = self._basis_t(t_clamped)
+            w2d = cas.reshape(wt @ ws.T, 1, n_s * n_t)
+            both = w2d @ self._packed_dm
+            re_0, im_0 = both[:, :m], both[:, m:]
+        else:
+            ws = _onp.asarray(self._basis_s(float(s_clamped)), dtype=float).reshape(-1, 1)
+            wt = _onp.asarray(self._basis_t(float(t_clamped)), dtype=float).reshape(-1, 1)
+            w2d = (wt @ ws.T).ravel(order="F").reshape(1, -1)
+            both = w2d @ self._packed_np
+            re_0, im_0 = both[:, :m], both[:, m:]
+
+        def amplitude(kx_row, kappa_row, ky_row=None):
+            kx_r = np.reshape(kx_row, (1, -1))
+            kappa_r = np.reshape(kappa_row, (1, -1))
+            if kx_r.shape[1] != m:
+                raise ValueError(
+                    f"WaveAmplitudeTable expects {m} wavenumbers, got {kx_r.shape[1]} "
+                    "(check velocity and wave_length_scales)."
+                )
+            if not np.is_casadi_type(kx_r, recursive=False) and not np.is_casadi_type(
+                kappa_r, recursive=False
+            ):
+                if not (
+                    _onp.allclose(_onp.asarray(kx_r, dtype=float).ravel(), self.kx, rtol=1e-5, atol=1e-8)
+                    and _onp.allclose(_onp.asarray(kappa_r, dtype=float).ravel(), self.kappa, rtol=1e-5, atol=1e-8)
+                ):
+                    raise ValueError(
+                        "WaveAmplitudeTable wavenumber grid mismatch "
+                        "(check velocity and wave_length_scales)."
+                    )
+            if not np.is_casadi_type(dx_shift, recursive=False) and abs(float(dx_shift)) == 0.0:
+                return re_0, im_0
+            phi = dx_shift * kx_r
+            c_p, s_p = np.cos(phi), np.sin(phi)
+            return re_0 * c_p + im_0 * s_p, im_0 * c_p - re_0 * s_p
+
+        return amplitude

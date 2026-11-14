@@ -1,6 +1,12 @@
 """HydroSandbox: a Python package for design optimization of lifting hydrofoil assemblies."""
 
+import os as _os
 from pathlib import Path
+
+# CasADi/IPOPT's bundled OpenBLAS otherwise reserves ~80 MB per CPU core on first
+# solve (~2 GB on a 24-core machine), even though each Opti solve is single-threaded.
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import aerosandbox.numpy as numpy
 from aerosandbox import (
     Airfoil,

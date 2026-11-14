@@ -270,6 +270,7 @@ def optimize(
     objective: str = "drag",
     drag_cap: float | None = None,
     damping_floor: float | None = None,
+    use_hull_tables: bool = True,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -287,7 +288,9 @@ def optimize(
     ``objective`` is what to optimize: ``"drag"`` (minimize it), ``"pitch_stiffness"``
     (maximize the heave-free pitch stiffness, as ``GM_L``) or ``"pitch_damping"``
     (maximize the foils' pitch damping). ``drag_cap`` [N], ``gml_floor`` [m] and
-    ``damping_floor`` [N m s/rad] constrain the others.
+    ``damping_floor`` [N m s/rad] constrain the others. Pass ``use_hull_tables=False``
+    to disable automatic attitude tabulation of the hull's dynamic force and wave
+    amplitude.
     """
     with_foils = start is not None
     x_stern = float(hull.stations[-1])
@@ -304,6 +307,37 @@ def optimize(
         include_interference_breakdown=False,
     )
     common.update(craft_options or {})
+    exact_common = {
+        k: v
+        for k, v in common.items()
+        if k not in ("hull_dynamics", "hull_wave_amplitude")
+    }
+    if use_hull_tables:
+        table_trim = (min(float(trim_bounds[0]), -2.0), max(float(trim_bounds[1]), 4.0))
+        if common.get("include_hull_dynamics", True) and "hull_dynamics" not in common:
+            common["hull_dynamics"] = hull.dynamic_force_table(
+                velocity,
+                water.density(),
+                water.gravity,
+                sinkage_range=(-0.4, 0.2),
+                trim_range=table_trim,
+                n_sinkage=11,
+                n_trim=11,
+                demihull_spacing=common.get("demihull_spacing"),
+                jobs=1,
+            )
+        if "hull_wave_amplitude" not in common:
+            common["hull_wave_amplitude"] = hull.wave_amplitude_table(
+                velocity,
+                water.gravity,
+                length_scales=common["wave_length_scales"],
+                sinkage_range=(-0.4, 0.2),
+                trim_range=table_trim,
+                n_sinkage=11,
+                n_trim=11,
+                demihull_spacing=common.get("demihull_spacing"),
+                jobs=1,
+            )
     layout_options = dict(
         layout=layout, hull=hull, demihull_spacing=common.get("demihull_spacing")
     )
@@ -367,10 +401,13 @@ def optimize(
     craft = CraftBuildup(
         assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading), **common
     )
-    needs_stability = (
-        objective != "drag" or gml_floor is not None or damping_floor is not None
+    needs_damping = objective == "pitch_damping" or damping_floor is not None
+    needs_stability = objective != "drag" or gml_floor is not None or needs_damping
+    res = (
+        craft.run_with_stability(include_pitch_damping=needs_damping)
+        if needs_stability
+        else craft.run()
     )
-    res = craft.run_with_stability() if needs_stability else craft.run()
     weight = mass * water.gravity
     q = 0.5 * water.density() * velocity**2
 
@@ -436,13 +473,14 @@ def optimize(
 
     solved = {name: float(sol(var)) for name, var in design.items()}
     solved_loading = {name: value(v) for name, v in loading.items()}
-    # Re-evaluate numerically at the solution, with the interference breakdown.
+    # Re-evaluate numerically at the solution, with the exact direct integrals and
+    # interference breakdown.
     final = CraftBuildup(
         assembly=build_assembly(solved, stabilizer, **layout_options) if with_foils else None,
         sinkage=float(sol(sinkage)),
         trim=float(sol(trim)),
         **craft_inputs(solved_loading),
-        **dict(common, include_interference_breakdown=with_foils),
+        **dict(exact_common, include_interference_breakdown=with_foils),
     ).run_with_stability()
     # Keep the returned results plain (numbers only), so they can cross processes.
     final = {
@@ -560,12 +598,29 @@ if __name__ == "__main__":
     def pair(text):
         return None if text is None else tuple(float(v) for v in text.split(","))
 
+    wave_scales = (1.0, 1.5 * hull.length, 0.01)
+    shared_options = dict(
+        hull_dynamics=hull.dynamic_force_table(
+            args.velocity, water.density(), water.gravity,
+            sinkage_range=(-0.4, 0.2), trim_range=(-2.0, 4.0),
+            n_sinkage=11, n_trim=11, jobs=args.jobs,
+        ),
+        hull_wave_amplitude=hull.wave_amplitude_table(
+            args.velocity, water.gravity, length_scales=wave_scales,
+            sinkage_range=(-0.4, 0.2), trim_range=(-2.0, 4.0),
+            n_sinkage=11, n_trim=11, jobs=args.jobs,
+        ),
+    )
+
     freedoms = dict(
         cg_range=pair(args.cg_range),
         mass_range=pair(args.mass_range),
         thrust_height_range=pair(args.thrust_height_range),
+        craft_options=shared_options,
     )
-    any_freedom = any(v is not None for v in freedoms.values())
+    any_freedom = any(
+        v is not None for k, v in freedoms.items() if k != "craft_options"
+    )
 
     floors: list[float | None] = [None] + [
         float(f) * gml_bare for f in args.gml_fractions.split(",") if f
