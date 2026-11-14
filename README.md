@@ -27,7 +27,10 @@ HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO
 
 ### 3. Hull in the Loop & Coupled Craft Balance
 - **Thin-Ship Hull Model** (`hydrosandbox.hull.hull`):
-  - Constructible from offset tables (`Hull(...)`), analytical Wigley hulls (`Hull.wigley`), or triangle meshes (`Hull.from_mesh`), supporting both monohulls and symmetric catamarans (`demihull_spacing`).
+  - Constructible from offset tables (`Hull(...)`), analytical Wigley hulls (`Hull.wigley`), triangle meshes (`Hull.from_mesh`), or [camber](https://github.com/electricshipwrights/camber) documents (`Hull.from_camber`), supporting both monohulls and symmetric catamarans (`demihull_spacing`).
+- **camber Hulls & Hull Families** (`hydrosandbox.hull.camber`):
+  - A Python port of camber's document format (versions 1 and 2), its constant-camber sweep and trims, and its family promotion and blending, matching camber's own output to round-off (`tests/camber`).
+  - `HullFamily` makes a family's blend weights design variables: exact blends at the nodes of a simplex lattice, each swept and cut into offsets, interpolated by Lagrange polynomials in the weights. `HullFamily.at(weights)` is a `Hull` stand-in (weights may be CasADi variables); `HullFamily.exact(weights)` the blend itself.
   - Evaluates panel Archimedes hydrostatics, ITTC-57 wetted-area skin friction, Froude-tapered dry-transom hollow closure, and linearized thin-ship dynamic sinkage force & trim moment (`Hull.dynamic_force`).
 - **Two-Way Hull–Foil Coupling & Attitude Tables** (`Hull`, `CraftBuildup`):
   - Models thin-ship hull thickness velocity at foil control points (`Hull.induced_velocity`), image-corrected foil horseshoe suction on hull bottom panels (`Hull.pressure_load`), and the hull's free-surface wave elevation and orbital velocity at downstream foils (`Hull.wave_field`).
@@ -159,6 +162,10 @@ For full closed-loop vehicle sizing (coupled mass/CG/trim/thrust/battery iterati
   ```bash
   python hydrosandbox/examples/optimize_foils_on_hull.py --velocity 4.5 --gml-fractions 0.6,0.8,1.0 --stabilizer
   ```
+- **Choosing a Hull from a camber Family** ([`hydrosandbox/examples/optimize_camber_blend.py`](hydrosandbox/examples/optimize_camber_blend.py)): Passes a `HullFamily` to `optimize()`, so the blend weights are solved for with the attitude, loading and (with `--foils`) a main T-foil; the result is re-evaluated on the exact blend and written back as a camber document:
+  ```bash
+  python hydrosandbox/examples/optimize_camber_blend.py a.json b.json --velocity 2.0 --cg-range=-0.3,0.3 --out best.json
+  ```
 
 ---
 
@@ -169,6 +176,7 @@ hydrosandbox/
 ├── fluid/          # Seawater/freshwater thermodynamic & transport properties (Water)
 ├── geometry/       # Foil, Strut, HydroFuselage, HydrofoilAssembly, clipping, STEP & VTK export
 ├── hull/           # Hull (thin-ship, hydrostatics, wave field, B-spline tables) & CraftBuildup
+│   └── camber/     # camber documents, sweep, family blending & HullFamily (blend weights as variables)
 ├── hydrodynamics/  # HydroBuildup, HydroVLM, HydroLiftingLine, 2D polars & cavitation buckets
 ├── library/        # Free-surface image factors, cavitation/ventilation, Kelvin wave resistance
 ├── performance/    # HydroOperatingPoint (depth Froude, Weber, cavitation numbers)

@@ -255,17 +255,12 @@ class HullFamily:
         return BlendedHull(self, weights)
 
     def exact(self, weights: Sequence[float], **kwargs):
-        """The blend swept and cut on the family's grid: the hull the interpolant stands in for."""
+        """The blend swept and cut as the nodes are: the hull the interpolant stands in for."""
         from hydrosandbox.hull.hull import Hull
 
         return Hull.from_camber(
             self.document(weights), **{"name": f"{self.name} blend", **self._hull_kwargs, **kwargs}
         )
-
-    @staticmethod
-    def weights_from_slider(t):
-        """Two-hull weights ``(1 - t, t)``."""
-        return [1 - t, t]
 
 
 def _as_document(h) -> CamberHull:

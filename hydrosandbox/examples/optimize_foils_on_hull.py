@@ -32,8 +32,10 @@ confused with what moving the centre of gravity buys on its own).
 
 By default the hull is a slender Wigley demihull. ``--hull-record FILE`` reads the
 first ``hull`` record of a boatmath JSON-lines stream instead
-(``boatmath hull my.igs > hull.jsonl``), with ``--mass`` and ``--lcg`` (metres aft of
-the bow) describing its load.
+(``boatmath hull my.igs > hull.jsonl``), and ``--camber FILE`` a camber document
+(see ``hydrosandbox.hull.camber``), with ``--mass`` and ``--lcg`` (metres aft of the
+bow) describing its load. To optimize over a family of camber hulls, blending them,
+see ``optimize_camber_blend.py``.
 """
 
 import argparse
@@ -1046,6 +1048,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--velocity", type=float, default=4.5, help="speed [m/s]")
     parser.add_argument("--hull-record", type=str, default=None, help="boatmath hull JSONL")
+    parser.add_argument("--camber", type=str, default=None, help="camber hull document (JSON)")
     parser.add_argument("--mass", type=float, default=None, help="all-up mass [kg]")
     parser.add_argument("--lcg", type=float, default=None, help="CG, metres aft of the bow")
     parser.add_argument("--vcg", type=float, default=0.0, help="CG height above the waterline [m]")
@@ -1074,7 +1077,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     water = hsb.Water.seawater()
-    if args.hull_record:
+    if args.camber:
+        hull = Hull.from_camber(args.camber, n_stations=61, n_levels=41)
+    elif args.hull_record:
         with open(args.hull_record) as f:
             record = next(r for r in map(json.loads, f) if r.get("type") == "hull")
         hull = Hull.from_boatmath_geometry(
