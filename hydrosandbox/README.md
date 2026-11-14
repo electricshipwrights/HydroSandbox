@@ -48,6 +48,8 @@ res["trim"], res["sinkage"], res["D"], res["D_wave_interference"]
 
 `solve_equilibrium` is a Newton solve for a fixed design. For design optimization, make `sinkage` and `trim` `Opti` variables, constrain `F_z_net` and `M_y_net` to zero, start them from a `solve_equilibrium` result, and pass `options={"ipopt.hessian_approximation": "limited-memory"}` to `opti.solve`.
 
+`CraftBuildup.run_with_stability()` adds the craft's static heave and pitch stiffness at an attitude, in particular the **heave-free pitch stiffness** `k_pitch` and the effective longitudinal metacentric height `GM_L = k_pitch / (m g)`. They are differentiable, so they can be constrained in a design problem: [`examples/optimize_foils_on_hull.py`](examples/optimize_foils_on_hull.py) minimizes drag over foil position, depth, span, chords and incidence (main foil plus optional stabilizer), with the attitude in equilibrium and `GM_L` above a floor. This is static stability only; damping and porpoising need unsteady forces that are not modelled.
+
 Validation against boatmath's own Rust output:
 
 | Case | Quantity | Agreement |

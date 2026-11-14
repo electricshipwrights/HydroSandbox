@@ -323,3 +323,50 @@ def test_symbolic_attitude_reproduces_numeric_and_solves_in_opti():
     sol = opti.solve(verbose=False, options={"ipopt.hessian_approximation": "limited-memory"})
     assert sol(sinkage) == pytest.approx(newton["sinkage"], abs=2e-4)
     assert sol(trim) == pytest.approx(newton["trim"], abs=2e-2)
+
+
+def test_static_stability_at_rest_is_the_hydrostatic_metacentric_height():
+    """
+    At rest, heave stiffness is rho g A_wp and the heave-free pitch stiffness is
+    m g GM_L with GM_L = I_L / V + z_cb - z_cg (closed forms for the Wigley hull).
+    """
+    water = hsb.Water.seawater()
+    l, b, t, z_cg = 5.0, 0.8, 0.25, 0.1
+    hull = Hull.wigley(l, b, t, freeboard=0.3, n_stations=41, n_levels=33)
+    mass = scalar(hull.hydrostatics()["volume"]) * water.density()
+    res = CraftBuildup(
+        hull=hull, velocity=0.05, mass=mass, xyz_cg=[0.0, 0.0, z_cg], water=water,
+        include_hull_dynamics=False,
+    ).run_with_stability()
+
+    waterplane = 2.0 / 3.0 * l * b
+    second_moment = b * 4.0 * (l / 2.0) ** 3 / 15.0
+    gm_l = second_moment / (4.0 / 9.0 * l * b * t) - 3.0 / 8.0 * t - z_cg
+    assert scalar(res["k_heave"]) == pytest.approx(
+        water.density() * G * waterplane, rel=2e-2
+    )
+    assert scalar(res["GM_L"]) == pytest.approx(gm_l, rel=3e-2)
+    assert scalar(res["k_pitch"]) == pytest.approx(mass * G * gm_l, rel=3e-2)
+
+
+def test_lifting_the_hull_costs_pitch_stiffness_and_an_aft_foil_gives_some_back():
+    water, hull, mass = _small_craft()
+    common = dict(
+        hull=hull, velocity=4.5, mass=mass, xyz_cg=[0.2, 0.0, 0.1], water=water,
+        include_interference_breakdown=False,
+    )
+
+    def stiffness(assembly):
+        attitude = CraftBuildup.solve_equilibrium(assembly=assembly, **common)
+        return scalar(
+            CraftBuildup(
+                assembly=assembly, sinkage=attitude["sinkage"], trim=attitude["trim"], **common
+            ).run_with_stability()["k_pitch"]
+        )
+
+    bare, amidships, aft = stiffness(None), stiffness(_t_foil(0.0)), stiffness(_t_foil(1.5))
+    assert bare > 0.0
+    # A lifting foil under the centre of gravity unloads the waterplane and adds no
+    # pitch stiffness of its own; the same foil well aft adds its own back.
+    assert amidships < bare
+    assert aft > amidships
