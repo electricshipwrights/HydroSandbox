@@ -266,7 +266,9 @@ class Hull(AeroSandboxObject):
             ),
             0.0,
         )
-        return cls(stations, levels, half_breadths, **kwargs)
+        hull = cls(stations, levels, half_breadths, **kwargs)
+        hull.source_centerplane_y = float(centerplane_y)
+        return hull
 
     @classmethod
     def from_boatmath_geometry(
@@ -317,10 +319,64 @@ class Hull(AeroSandboxObject):
             triangles = _onp.concatenate(triangle_blocks)
         else:
             raise ValueError(f"Unknown boatmath geometry kind {geometry['kind']!r}.")
-        return cls.from_mesh(
+        result = cls.from_mesh(
             vertices, triangles, n_stations=n_stations, n_levels=n_levels,
             x_forward=True, centerplane_y=centerplane_y, **kwargs,
         )
+        if geometry["kind"] == "nurbs":
+            # Keep the designer's surfaces (for CAD export), in this class's axes:
+            # x aft, and y measured from the hull's own centreplane. Bounded patches
+            # (a transom plane cut to the hull's outline) are left out: the record
+            # carries their parameter box, not the curve that trims them.
+            result.source_patches = [
+                {
+                    "degree": tuple(patch["degree"]),
+                    "knots_u": [float(k) for k in patch["knots_u"]],
+                    "knots_v": [float(k) for k in patch["knots_v"]],
+                    "ctrl": (
+                        _onp.asarray(patch["ctrl"], dtype=float).reshape(
+                            patch["n_ctrl"][0], patch["n_ctrl"][1], 3
+                        )
+                        * _onp.array([-1.0, 1.0, 1.0])
+                        - _onp.array([0.0, result.source_centerplane_y, 0.0])
+                    ),
+                }
+                for patch in hull["patches"]
+                if not patch.get("trim_uv")
+            ]
+        return result
+
+    def surface_patches(self) -> list[dict[str, Any]]:
+        """
+        The hull's surfaces as B-spline patches in its own axes (x aft, y from the
+        centreplane, z up), each a dict of ``degree``, ``knots_u``, ``knots_v`` and
+        an ``(n_u, n_v, 3)`` control net ``ctrl``.
+
+        A hull read from B-spline geometry returns the designer's own surfaces. Any
+        other hull returns its offsets table as two bilinear patches, one per side.
+        """
+        if getattr(self, "source_patches", None):
+            return self.source_patches
+        n_x, n_z = self.half_breadths.shape
+        patches = []
+        for side in (1.0, -1.0):
+            ctrl = _onp.stack(
+                [
+                    self.stations[:, None] * _onp.ones((1, n_z)),
+                    side * self.half_breadths,
+                    _onp.ones((n_x, 1)) * self.levels[None, :],
+                ],
+                axis=-1,
+            )
+            patches.append(
+                {
+                    "degree": (1, 1),
+                    "knots_u": [0.0] + list(_onp.linspace(0.0, 1.0, n_x)) + [1.0],
+                    "knots_v": [0.0] + list(_onp.linspace(0.0, 1.0, n_z)) + [1.0],
+                    "ctrl": ctrl,
+                }
+            )
+        return patches
 
     # ------------------------------------------------------------------
     # Attitude

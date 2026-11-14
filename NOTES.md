@@ -82,6 +82,24 @@ Done:
 - `local/` (git-excluded) holds the NACRA case: boatmath records and reference
   results, `nacra_check.py`, `nacra_baseline.py`, `nacra_cg_sweep.py`.
 
+- Merged `audit-fixes` (true trimmed waterplane for foils, blunt-bow sources,
+  thrust deduction, AD stability derivatives, numerical guards).
+- Pitch stability as the design goal (Avi, 2026-11-14: not drag alone; stiffness,
+  ideally with damping). `run_with_stability` adds `c_pitch_foils` (foils' pitch
+  damping; the hull's own damping and added inertia are NOT modelled).
+  `optimize()` in the example takes `objective` = drag / pitch_stiffness /
+  pitch_damping, `drag_cap`, `damping_floor`. `Hull.dynamic_force_table` +
+  `CraftBuildup(hull_dynamics=...)` make solves lighter (still ~5 GB, 5-16 min
+  each with stability; keep to ~5 parallel workers on this 31 GB box).
+- NACRA cat result (6 m/s, drag <= bare 392 N): stiffness and damping objectives
+  give the same design (foil 1.8 m aft of CG, full span, CG at aft limit);
+  GM_L 14.6 -> 23.6 m. Foil position, span and CG all sit on bounds I chose.
+- `hsb.export_craft_step`: hull surfaces (designer's B-spline patches, or the
+  offsets as bilinear patches) + foil solids in one STEP file.
+- boatmath observation: with an immersed transom, `squat`'s trim moment does not
+  shift with its reference by force x distance (the hollow adds sources but no
+  weights). Ported faithfully; flagged to Avi.
+
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
   fixed-loading case on the hummingbird hull; the full study (GM_L floors, CG and

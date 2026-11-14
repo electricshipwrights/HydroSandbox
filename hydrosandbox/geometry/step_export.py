@@ -343,8 +343,87 @@ class _StepWriter:
         solid_id = self.add(f"MANIFOLD_SOLID_BREP('{safe_name}',#{shell_id})")
         return solid_id, signed_vol
 
-    def build_step_text(self, solid_ids: list[int]) -> str:
-        """Assemble the full ISO 10303-21 AP214 STEP file string."""
+    def emit_surface_shell(self, name: str, patches: list[dict[str, Any]]) -> int:
+        """
+        Emit B-spline patches (metres; dicts of ``degree``, ``knots_u``, ``knots_v``
+        and an ``(n_u, n_v, 3)`` control net ``ctrl``) as one open shell of faces,
+        each bounded by its own four edges (fewer where a side collapses to a
+        point), and return the ``SHELL_BASED_SURFACE_MODEL`` id.
+        """
+        def distinct(knots):
+            values, counts = [float(knots[0])], [1]
+            for k in knots[1:]:
+                if abs(float(k) - values[-1]) <= 1e-12:
+                    counts[-1] += 1
+                else:
+                    values.append(float(k))
+                    counts.append(1)
+            return values, counts
+
+        vertices: dict[tuple[int, int, int], int] = {}
+
+        def vertex(xyz_mm) -> int:
+            key = tuple(int(round(float(c) * 1e4)) for c in xyz_mm)  # 0.1 micron
+            if key not in vertices:
+                vertices[key] = self.add(f"VERTEX_POINT('',#{self.cartesian_point(xyz_mm)})")
+            return vertices[key]
+
+        def curve(point_ids, degree, knots, mults) -> int:
+            refs = ",".join(f"#{i}" for i in point_ids)
+            return self.add(
+                f"B_SPLINE_CURVE_WITH_KNOTS('',{degree},({refs}),.UNSPECIFIED.,.F.,.F.,"
+                f"({','.join(str(m) for m in mults)}),"
+                f"({','.join(_fmt_real(k) for k in knots)}),.UNSPECIFIED.)"
+            )
+
+        face_ids = []
+        for patch in patches:
+            ctrl = 1000.0 * np.asarray(patch["ctrl"], dtype=float)
+            n_u, n_v, _ = ctrl.shape
+            deg_u, deg_v = patch["degree"]
+            u_knots, u_mults = distinct(patch["knots_u"])
+            v_knots, v_mults = distinct(patch["knots_v"])
+            ids = [[self.cartesian_point(ctrl[i, j]) for j in range(n_v)] for i in range(n_u)]
+
+            # Boundary, counter-clockwise in (u, v): v=0 (+u), u=1 (+v), v=1 (-u), u=0 (-v).
+            sides = [
+                ([ids[i][0] for i in range(n_u)], ctrl[:, 0], deg_u, u_knots, u_mults, True),
+                ([ids[-1][j] for j in range(n_v)], ctrl[-1, :], deg_v, v_knots, v_mults, True),
+                ([ids[i][-1] for i in range(n_u)], ctrl[:, -1], deg_u, u_knots, u_mults, False),
+                ([ids[0][j] for j in range(n_v)], ctrl[0, :], deg_v, v_knots, v_mults, False),
+            ]
+            oriented = []
+            for point_ids, points, degree, knots, mults, forward in sides:
+                if float(np.max(np.linalg.norm(points - points[0], axis=1))) < 1e-4:
+                    continue  # this side of the patch has collapsed to a point
+                edge = self.add(
+                    f"EDGE_CURVE('',#{vertex(points[0])},#{vertex(points[-1])},"
+                    f"#{curve(point_ids, degree, knots, mults)},.T.)"
+                )
+                oriented.append(
+                    self.add(f"ORIENTED_EDGE('',*,*,#{edge},{'.T.' if forward else '.F.'})")
+                )
+            loop = self.add(f"EDGE_LOOP('',({','.join(f'#{i}' for i in oriented)}))")
+            bound = self.add(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+            rows = ",".join("(" + ",".join(f"#{i}" for i in row) + ")" for row in ids)
+            surface = self.add(
+                f"B_SPLINE_SURFACE_WITH_KNOTS('',{deg_u},{deg_v},({rows}),.UNSPECIFIED.,"
+                f".F.,.F.,.F.,({','.join(str(m) for m in u_mults)}),"
+                f"({','.join(str(m) for m in v_mults)}),"
+                f"({','.join(_fmt_real(k) for k in u_knots)}),"
+                f"({','.join(_fmt_real(k) for k in v_knots)}),.UNSPECIFIED.)"
+            )
+            face_ids.append(self.add(f"ADVANCED_FACE('',(#{bound}),#{surface},.T.)"))
+
+        shell = self.add(f"OPEN_SHELL('',({','.join(f'#{i}' for i in face_ids)}))")
+        safe_name = name.replace("'", "")
+        return self.add(f"SHELL_BASED_SURFACE_MODEL('{safe_name}',(#{shell}))")
+
+    def build_step_text(self, solid_ids: list[int], surface_ids: list[int] | None = None) -> str:
+        """
+        Assemble the full ISO 10303-21 AP214 STEP file string: the solids as one
+        product, and any surface models (open shells) as a second.
+        """
         safe_prod = self.product_name.replace("'", "")
         origin_id = self.cartesian_point((0.0, 0.0, 0.0))
         ax_id = self.axis2_placement_3d(origin_id, (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
@@ -363,25 +442,40 @@ class _StepWriter:
             f"REPRESENTATION_CONTEXT('Context #1','3D Context with UNIT and UNCERTAINTY') )"
         )
 
-        items_str = ",".join([f"#{sid}" for sid in solid_ids] + [f"#{ax_id}"])
-        shape_rep_id = self.add(
-            f"ADVANCED_BREP_SHAPE_REPRESENTATION('{safe_prod}',({items_str}),#{geom_ctx_id})"
-        )
-
         app_ctx_id = self.add(
             "APPLICATION_CONTEXT('configuration controlled 3d designs of mechanical parts and assemblies')"
         )
         self.add(
             f"APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#{app_ctx_id})"
         )
-        prod_ctx_id = self.add(f"PRODUCT_CONTEXT('',# {app_ctx_id},'mechanical')".replace("# ", "#"))
-        prod_id = self.add(f"PRODUCT('{safe_prod}','{safe_prod}','',(#{prod_ctx_id}))")
-        self.add(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part',$,(#{prod_id}))")
-        pdf_id = self.add(f"PRODUCT_DEFINITION_FORMATION('','',#{prod_id})")
+        prod_ctx_id = self.add(f"PRODUCT_CONTEXT('',#{app_ctx_id},'mechanical')")
         pdc_id = self.add(f"PRODUCT_DEFINITION_CONTEXT('part definition',#{app_ctx_id},'design')")
-        pd_id = self.add(f"PRODUCT_DEFINITION('design','',#{pdf_id},#{pdc_id})")
-        pds_id = self.add(f"PRODUCT_DEFINITION_SHAPE('','',#{pd_id})")
-        self.add(f"SHAPE_DEFINITION_REPRESENTATION(#{pds_id},#{shape_rep_id})")
+
+        def product(name: str, representation_id: int) -> None:
+            prod_id = self.add(f"PRODUCT('{name}','{name}','',(#{prod_ctx_id}))")
+            self.add(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part',$,(#{prod_id}))")
+            pdf_id = self.add(f"PRODUCT_DEFINITION_FORMATION('','',#{prod_id})")
+            pd_id = self.add(f"PRODUCT_DEFINITION('design','',#{pdf_id},#{pdc_id})")
+            pds_id = self.add(f"PRODUCT_DEFINITION_SHAPE('','',#{pd_id})")
+            self.add(f"SHAPE_DEFINITION_REPRESENTATION(#{pds_id},#{representation_id})")
+
+        if solid_ids:
+            items_str = ",".join([f"#{sid}" for sid in solid_ids] + [f"#{ax_id}"])
+            product(
+                safe_prod,
+                self.add(
+                    f"ADVANCED_BREP_SHAPE_REPRESENTATION('{safe_prod}',({items_str}),#{geom_ctx_id})"
+                ),
+            )
+        if surface_ids:
+            items_str = ",".join([f"#{sid}" for sid in surface_ids] + [f"#{ax_id}"])
+            surfaces_name = f"{safe_prod} hull surfaces" if solid_ids else safe_prod
+            product(
+                surfaces_name,
+                self.add(
+                    f"MANIFOLD_SURFACE_SHAPE_REPRESENTATION('{surfaces_name}',({items_str}),#{geom_ctx_id})"
+                ),
+            )
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         header = (
@@ -900,6 +994,8 @@ def export_assembly_step(
     fuselage_tol: float = 1e-4,
     n_chordwise: int = 41,
     merge_symmetric_wings: bool = True,
+    surface_shells: list[tuple[str, list[dict[str, Any]]]] | None = None,
+    product_name: str | None = None,
 ) -> Path:
     """
     Export a ``HydrofoilAssembly`` (or ``Airplane``) to a watertight ISO 10303-21
@@ -922,6 +1018,10 @@ def export_assembly_step(
             skin curve.
         merge_symmetric_wings: Merge centerline-rooted symmetric wings into a
             single continuous full-span ``MANIFOLD_SOLID_BREP`` solid.
+        surface_shells: Further ``(name, patches)`` open shells of B-spline surfaces
+            to write alongside (see ``export_craft_step``); ``assembly`` may then be
+            None.
+        product_name: Name of the STEP product (default: the assembly's name).
 
     Returns:
         Resolved ``Path`` of the written STEP file.
@@ -929,7 +1029,7 @@ def export_assembly_step(
     out_path = Path(filename)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    prod_name = getattr(assembly, "name", None) or "HydrofoilAssembly"
+    prod_name = product_name or getattr(assembly, "name", None) or "HydrofoilAssembly"
     writer = _StepWriter(product_name=prod_name)
     solid_ids: list[int] = []
     used_names: set[str] = set()
@@ -945,7 +1045,7 @@ def export_assembly_step(
         used_names.add(out)
         return out
 
-    for wing in assembly.wings:
+    for wing in (assembly.wings if assembly is not None else []):
         if len(wing.xsecs) < 2:
             continue
         base_name = wing.name if getattr(wing, "name", None) and wing.name != "Untitled" else "Wing"
@@ -988,7 +1088,7 @@ def export_assembly_step(
                 )
                 solid_ids.append(sid_m)
 
-    for fuse in assembly.fuselages:
+    for fuse in (assembly.fuselages if assembly is not None else []):
         if len(fuse.xsecs) < 2:
             continue
         base_name = fuse.name if getattr(fuse, "name", None) and fuse.name != "Untitled" else "Fuselage"
@@ -1000,9 +1100,60 @@ def export_assembly_step(
         )
         solid_ids.append(sid_f)
 
-    if not solid_ids:
+    surface_ids = [
+        writer.emit_surface_shell(shell_name, patches)
+        for shell_name, patches in (surface_shells or [])
+    ]
+    if not solid_ids and not surface_ids:
         raise ValueError("Cannot export empty assembly to STEP (no wings or fuselages with >=2 xsecs).")
 
-    step_text = writer.build_step_text(solid_ids)
+    step_text = writer.build_step_text(solid_ids, surface_ids)
     out_path.write_text(step_text, encoding="utf-8")
     return out_path
+
+
+def export_craft_step(
+    filename: Path | str,
+    hull: Any,
+    assembly: Any = None,
+    demihull_spacing: float | None = None,
+    name: str | None = None,
+    **assembly_options,
+) -> Path:
+    """
+    Export a hull (or a catamaran's pair of demihulls) together with a foil assembly
+    to one STEP AP214 file, in millimetres, in the craft's geometry axes (``+x`` aft,
+    ``+y`` starboard, ``+z`` up, design waterline at ``z = 0``, design attitude).
+
+    Foils, struts and pods are closed solids, as from ``export_assembly_step``
+    (whose options ``assembly_options`` are passed on). The hull is written as
+    surfaces, an open shell per demihull: the designer's own B-spline patches when
+    the ``Hull`` was read from B-spline geometry, otherwise its offsets table as
+    bilinear patches. With ``demihull_spacing`` the hull is placed twice, centred
+    ``spacing / 2`` either side of ``y = 0``, the second mirrored.
+    """
+    patches = hull.surface_patches()
+
+    def placed(y_centre: float, mirror: bool) -> list[dict[str, Any]]:
+        scale = np.array([1.0, -1.0 if mirror else 1.0, 1.0])
+        shift = np.array([0.0, y_centre, 0.0])
+        return [
+            dict(patch, ctrl=np.asarray(patch["ctrl"], dtype=float) * scale + shift)
+            for patch in patches
+        ]
+
+    hull_name = getattr(hull, "name", None) or "Hull"
+    if demihull_spacing is None:
+        shells = [(hull_name, placed(0.0, False))]
+    else:
+        shells = [
+            (f"{hull_name} port", placed(-0.5 * demihull_spacing, False)),
+            (f"{hull_name} starboard", placed(0.5 * demihull_spacing, True)),
+        ]
+    return export_assembly_step(
+        assembly=assembly,
+        filename=filename,
+        surface_shells=shells,
+        product_name=name or getattr(assembly, "name", None) or hull_name,
+        **assembly_options,
+    )
