@@ -8,6 +8,7 @@ from hydrosandbox.geometry.components import (
 )
 from hydrosandbox.geometry.assembly import HydrofoilAssembly
 from hydrosandbox.geometry.step_export import export_assembly_step, export_craft_step
+from hydrosandbox.geometry.vtk_export import export_craft_vtk, section_boundary_layer
 
 __all__ = [
     "Foil",
@@ -19,4 +20,6 @@ __all__ = [
     "fuselage_submerged_volume_and_centroid",
     "export_assembly_step",
     "export_craft_step",
+    "export_craft_vtk",
+    "section_boundary_layer",
 ]

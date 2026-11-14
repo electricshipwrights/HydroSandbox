@@ -30,6 +30,7 @@ from hydrosandbox.geometry import (
     clip_wing_to_free_surface,
     export_assembly_step,
     export_craft_step,
+    export_craft_vtk,
     fuselage_submerged_volume_and_centroid,
     wing_submerged_volume_and_centroid,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "clip_wing_to_free_surface",
     "export_assembly_step",
     "export_craft_step",
+    "export_craft_vtk",
     "wing_submerged_volume_and_centroid",
     "fuselage_submerged_volume_and_centroid",
     "HydroVLM",
