@@ -46,7 +46,14 @@ Cal 20 / NP-ish study (2026-11-14, `local/camber_blend_study.py`, results in
 - Interpolant check on the test family: optimizer from t=0.1 found 0.067 (exact
   optimum ~0.2, 2% worse); from t=0.8 a spurious minimum at 0.735. For 1-D blends
   a scan of exact blends is the reliable answer.
-- Next candidate: a DSYHS (Delft yacht series) regression on swept hydrostatics.
+- Avi isn't interested in the Delft series; testing with narrow multihulls instead.
+
+Narrow catamaran study (`local/camber_cat_study.py` / `.json`): both shapes at
+LOA 6.11 m squeezed (`scaled(beam_factor=)`) to underwater L/B 12, spacing 2.5 m,
+total mass 664 kg (two narrow Cal 20s), CG level at rest, Fn 0.30/0.45/0.60.
+Magnitudes sensible (R/W ~1.3% / 4.5% / 6.5%). Optimum blend: t~0.05 at Fn 0.3
+(Cal-ish), t~0.40 at Fn 0.45 and 0.6 (14% / 10% below the Cal 20 shape, both
+parents worse). t=0.80 fails to find equilibrium at the two higher speeds.
 
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
