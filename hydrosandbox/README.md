@@ -73,7 +73,9 @@ Validation against boatmath's own Rust output:
 | Wigley hull, Fn 0.2-0.5 | dynamic force, trim moment | 0.3%, 0.5% |
 | A real catamaran demihull (IGES, transom), free to sink and trim, Fn 0.3-0.9 | sinkage, trim, total resistance | 0.2 mm, 0.06 deg, 1.5% |
 
-Not modelled: the hull's planing lift (boatmath's 2D+t `lift`), the hull's near-field flow at the foil, the foil's pressure on the hull, and the foil's waves in the hull's dynamic force.
+Hull and foils also interact through the local flow (`include_hull_foil_interaction`, on by default): the flow the hull's thickness induces at each foil section changes its inflow (`Hull.induced_velocity`), and the foils' pressure field loads the hull bottom above them (`Hull.pressure_load`; a long vortex under a wide flat hull reproduces the closed-form suction of half its lift). On slender hulls both are small; they grow as a foil is brought close under a wide hull.
+
+Not modelled: the hull's planing lift (boatmath's 2D+t `lift`), the hull's *wave* field at the foil, reflection of the foil's field in the hull, and the foil's waves in the hull's dynamic force.
 
 ## Coordinate & Sign Conventions
 

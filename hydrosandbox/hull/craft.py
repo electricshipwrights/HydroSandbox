@@ -84,6 +84,7 @@ class CraftBuildup(ExplicitAnalysis):
         include_transom_drag: bool = False,
         include_hull_dynamics: bool = True,
         hull_dynamics: Any = None,
+        include_hull_foil_interaction: bool = True,
         pitch_rate: Vectorizable = 0.0,
         include_interference_breakdown: bool = True,
         wave_length_scales: tuple[float, float, float] | None = None,
@@ -134,6 +135,12 @@ class CraftBuildup(ExplicitAnalysis):
             demihull spacing). The hull's dynamic force is then interpolated from it
             instead of being integrated afresh, which makes each evaluation, and
             above all each ``Opti`` solve, far cheaper in time and memory.
+        include_hull_foil_interaction : Model the local flow between hull and
+            foils, both ways: the flow the hull's thickness induces at each foil
+            section changes its inflow (``Hull.induced_velocity``), and the foils'
+            pressure field loads the hull bottom above them
+            (``Hull.pressure_load``), reported as ``F_z_foil_on_hull``,
+            ``D_foil_on_hull`` and ``M_y_foil_on_hull``. Local (non-wave) flow only.
         pitch_rate : Bow-up pitch rate about the centre of gravity [rad/s]. Seen by
             the foils (quasi-steadily, as a change in local inflow), not by the hull.
             Used by ``run_with_stability`` to find the foils' pitch damping.
@@ -175,6 +182,7 @@ class CraftBuildup(ExplicitAnalysis):
         self.include_transom_drag = include_transom_drag
         self.include_hull_dynamics = include_hull_dynamics
         self.hull_dynamics = hull_dynamics
+        self.include_hull_foil_interaction = include_hull_foil_interaction
         self.pitch_rate = pitch_rate
         self.include_interference_breakdown = include_interference_breakdown
         self.wave_length_scales = wave_length_scales
@@ -307,6 +315,28 @@ class CraftBuildup(ExplicitAnalysis):
         foil: dict[str, Any] | None = None
         foil_sources: dict[str, Any] | None = None
         D_foil = 0.0
+        foil_on_hull = {"force_up": 0.0, "force_aft": 0.0, "moment_bow_up": 0.0}
+        interacting = self.assembly is not None and self.include_hull_foil_interaction
+        surface_images = {
+            "high_froude": ("zero_potential", 1.0),
+            "froude_blended": ("zero_potential", 1.0),
+            "rigid_lid": ("rigid_lid", -1.0),
+        }[self.free_surface_mode]
+        if interacting:
+            sections = hull.sections(velocity, g, self.sinkage, trim, pivot)
+
+            def hull_inflow(x_g, y_g, z_g):
+                """The hull's induced flow at a geometry-axes point, in geometry axes."""
+                x_e, z_e = self._earth(x_g, z_g)
+                u, v, w = hull.induced_velocity(
+                    x_e, y_g, z_e, velocity,
+                    demihull_spacing=self.demihull_spacing,
+                    free_surface=surface_images[0],
+                    sections=sections,
+                )
+                u, v, w = u[0, 0], v[0, 0], w[0, 0]
+                return [u * cos - w * sin, v, u * sin + w * cos]
+
         if self.assembly is not None:
             # Map geometry (x, z) to height above the undisturbed waterplane
             # (-z_earth is local depth), so swept, aft, and trimmed surfaces
@@ -324,6 +354,8 @@ class CraftBuildup(ExplicitAnalysis):
                 wave_length_scales=self.wave_length_scales,
                 wave_reference_velocity=self.wave_reference_velocity,
             )
+            if interacting:
+                options["inflow_perturbation"] = hull_inflow
             options.update(self.buildup_options)
             foil = HydroBuildup(
                 assembly=self.assembly,
@@ -353,6 +385,59 @@ class CraftBuildup(ExplicitAnalysis):
                     "smear_length": _stack([elements["smear_length"]]),
                 }
 
+            # The foils' pressure field on the hull bottom above them.
+            if interacting and elements is not None and len(elements["force_z"]) > 0:
+                from hydrosandbox.hydrodynamics.singularities import (
+                    calculate_induced_velocity_horseshoe_hydro,
+                )
+
+                ya, yb = foil_sources["xyz_a"][1], foil_sources["xyz_b"][1]
+                dy = yb - ya
+                # Bound circulation of each lifting element (Kutta-Joukowski); zero
+                # for the vertical ones, which carry no vertical force.
+                gamma = foil_sources["force_z"] * dy / (rho * velocity * (dy**2 + 1e-9))
+
+                def foil_u(x, y, z):
+                    n_points, n_vortices = x.shape[0], gamma.shape[0]
+                    ones_p, ones_v = _onp.ones((n_points, 1)), _onp.ones((1, n_vortices))
+
+                    def field(c):
+                        return np.reshape(c, (-1, 1)) @ ones_v
+
+                    def vortex(c):
+                        return ones_p @ np.reshape(c, (1, -1))
+
+                    u, _, _ = calculate_induced_velocity_horseshoe_hydro(
+                        x_field=field(x), y_field=field(y), z_field=field(z),
+                        x_left=vortex(foil_sources["xyz_a"][0]), y_left=vortex(ya),
+                        z_left=vortex(foil_sources["xyz_a"][2]),
+                        x_right=vortex(foil_sources["xyz_b"][0]), y_right=vortex(yb),
+                        z_right=vortex(foil_sources["xyz_b"][2]),
+                        gamma=vortex(gamma),
+                        trailing_vortex_direction=_onp.array([1.0, 0.0, 0.0]),
+                        vortex_core_radius=0.02,
+                        surface_z=0.0,
+                        image_weight=surface_images[1],
+                    )
+                    return np.reshape(np.sum(u, axis=1), (-1, 1))
+
+                y_hulls = [0.0] if self.demihull_spacing is None else [
+                    -0.5 * self.demihull_spacing, 0.5 * self.demihull_spacing
+                ]
+                loads = [
+                    hull.pressure_load(
+                        foil_u, velocity, rho, g, self.sinkage, trim, pivot,
+                        x_ref=x_cg, z_ref=z_cg_earth, y_hull=y_hull, sections=sections,
+                    )
+                    for y_hull in y_hulls
+                ]
+                foil_on_hull = {
+                    key: sum(load[key] for load in loads)
+                    for key in ("force_up", "force_aft", "moment_bow_up")
+                }
+                F_z = F_z + foil_on_hull["force_up"]
+                M_y = M_y + foil_on_hull["moment_bow_up"]
+
         ### Waves: one spectrum for everything
         sets = [foil_sources] if foil_sources is not None else []
         D_wave = self._wave_resistance(sets, hull_amplitude)
@@ -367,7 +452,7 @@ class CraftBuildup(ExplicitAnalysis):
 
         ### Drag, thrust, and their part in the balance
         D_hull = D_hull_viscous + D_transom
-        D = D_hull + D_foil + D_wave
+        D = D_hull + D_foil + D_wave + foil_on_hull["force_aft"]
         # Hull friction and all wave drag are taken to act at the centre of buoyancy;
         # the foil's own drag is already in its moment.
         M_y = M_y + moment_about_cg(
@@ -408,6 +493,9 @@ class CraftBuildup(ExplicitAnalysis):
             "D_wave_foil_alone": D_wave_foil,
             "D_wave_interference": D_wave_interference,
             "L_foil": foil["L"] if foil is not None else 0.0,
+            "F_z_foil_on_hull": foil_on_hull["force_up"],
+            "D_foil_on_hull": foil_on_hull["force_aft"],
+            "M_y_foil_on_hull": foil_on_hull["moment_bow_up"],
             "F_z_hull_dynamic": dynamic["force_up"] if dynamic is not None else 0.0,
             "M_y_hull_dynamic": dynamic["moment_bow_up"] if dynamic is not None else 0.0,
             "buoyancy_hull": buoyancy_hull,
