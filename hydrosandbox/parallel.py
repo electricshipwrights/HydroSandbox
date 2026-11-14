@@ -9,8 +9,10 @@ trade-off study. ``parallel_map`` runs such tasks in separate processes.
 
 import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Callable, Iterable
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Callable, Iterable, Sequence
 
 _THREAD_VARIABLES = (
     "OMP_NUM_THREADS",
@@ -42,6 +44,8 @@ def parallel_map(
     function: Callable[..., Any],
     tasks: Iterable[Any],
     jobs: int | None = None,
+    progress: bool | Callable[[int, int, int, Any, float], None] = False,
+    labels: Sequence[str] | None = None,
 ) -> list[Any]:
     """
     Apply ``function`` to every task, in separate processes, and return the results
@@ -61,20 +65,56 @@ def parallel_map(
     all of them. With ``jobs=1`` (or a single task) everything runs in this process.
 
     An exception in any task is re-raised here.
+
+    Progress: with ``progress=True``, one line is written to standard error as each
+    task finishes (``[3/20] done: <label> (41 s elapsed)``; ``labels`` names the
+    tasks, else their index is used), so a long study shows it is alive and how far
+    along it is. Tasks finish in any order; results are still returned in task
+    order. Pass a callable instead to receive
+    ``(n_done, n_total, task_index, result, seconds_elapsed)`` yourself, e.g. to
+    print a result as soon as it exists.
     """
     tasks = list(tasks)
+    n_total = len(tasks)
     if jobs is None:
         jobs = default_jobs()
-    jobs = max(1, min(int(jobs), len(tasks)))
+    jobs = max(1, min(int(jobs), n_total))
+    started = time.time()
+
+    def report(n_done: int, index: int, result: Any) -> None:
+        elapsed = time.time() - started
+        if callable(progress):
+            progress(n_done, n_total, index, result, elapsed)
+        elif progress:
+            label = labels[index] if labels is not None else f"task {index}"
+            print(
+                f"[{n_done}/{n_total}] done: {label} ({elapsed:.0f} s elapsed)",
+                file=sys.stderr,
+                flush=True,
+            )
+
     if jobs == 1:
-        return [_call((function, task)) for task in tasks]
+        results = []
+        for index, task in enumerate(tasks):
+            results.append(_call((function, task)))
+            report(index + 1, index, results[-1])
+        return results
 
     saved = {name: os.environ.get(name) for name in _THREAD_VARIABLES}
     os.environ.update({name: "1" for name in _THREAD_VARIABLES})
     try:
         context = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
-            return list(pool.map(_call, [(function, task) for task in tasks]))
+            futures = {
+                pool.submit(_call, (function, task)): index
+                for index, task in enumerate(tasks)
+            }
+            results: list[Any] = [None] * n_total
+            for n_done, future in enumerate(as_completed(futures), start=1):
+                index = futures[future]
+                results[index] = future.result()
+                report(n_done, index, results[index])
+            return results
     finally:
         for name, value in saved.items():
             if value is None:
