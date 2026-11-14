@@ -370,3 +370,67 @@ def test_lifting_the_hull_costs_pitch_stiffness_and_an_aft_foil_gives_some_back(
     # pitch stiffness of its own; the same foil well aft adds its own back.
     assert amidships < bare
     assert aft > amidships
+
+
+def test_point_masses_and_shaft_angle_enter_the_balance():
+    water, hull, mass = _small_craft()
+    base = dict(hull=hull, velocity=4.0, water=water, sinkage=0.01, trim=1.0,
+                include_interference_breakdown=False)
+
+    # Point masses are equivalent to their combined mass and centre of gravity.
+    split = CraftBuildup(
+        mass=0.7 * mass, xyz_cg=[0.0, 0.0, 0.1],
+        point_masses=[(0.2 * mass, [1.5, 0.0, 0.0]), (0.1 * mass, [-1.0, 0.0, 0.3])],
+        **base,
+    )
+    assert split.mass == pytest.approx(mass)
+    assert split.xyz_cg[0] == pytest.approx(0.2 * 1.5 - 0.1 * 1.0)
+    lumped = CraftBuildup(mass=mass, xyz_cg=list(split.xyz_cg), **base).run()
+    split_res = split.run()
+    for key in ("F_z_net", "M_y_net", "D"):
+        assert scalar(split_res[key]) == pytest.approx(scalar(lumped[key]), rel=1e-9, abs=1e-9)
+
+    # An inclined shaft: thrust grows so its horizontal part still equals the drag,
+    # and its vertical part lifts the craft.
+    level = CraftBuildup(mass=mass, xyz_cg=[0.0, 0.0, 0.1], xyz_thrust=[2.0, 0.0, -0.3], **base).run()
+    inclined = CraftBuildup(
+        mass=mass, xyz_cg=[0.0, 0.0, 0.1], xyz_thrust=[2.0, 0.0, -0.3], shaft_angle=10.0, **base
+    ).run()
+    drag = scalar(inclined["D"])
+    assert scalar(inclined["thrust"]) == pytest.approx(drag / onp.cos(onp.radians(11.0)), rel=1e-9)
+    assert scalar(inclined["F_z_net"]) - scalar(level["F_z_net"]) == pytest.approx(
+        drag * (onp.tan(onp.radians(11.0)) - onp.tan(onp.radians(1.0))), rel=1e-6
+    )
+
+
+def test_powered_craft_closes_attitude_thrust_and_drive_masses():
+    water, hull, mass = _small_craft()
+    common = dict(
+        hull=hull, velocity=3.0, mass=0.85 * mass, xyz_cg=[0.0, 0.0, 0.1], water=water,
+        xyz_propeller=[2.3, 0.0, -0.35], xyz_motor=[1.8, 0.0, 0.0],
+        propulsion_options=dict(
+            propeller_diameter=0.30, propeller_pitch_ratio=1.0, propeller_ear=0.5,
+            motor_model="loss", motor_kv=60.0, endurance_hours=2.0,
+        ),
+    )
+    amidships = hsb.PoweredCraftBuildup.solve(xyz_battery=[0.0, 0.0, 0.0], **common)
+    aft = hsb.PoweredCraftBuildup.solve(xyz_battery=[2.0, 0.0, 0.0], **common)
+
+    for res in (amidships, aft):
+        weight = scalar(res["mass"]) * G
+        assert abs(scalar(res["F_z_net"])) < 1e-4 * weight
+        assert abs(scalar(res["M_y_net"])) < 1e-4 * weight * hull.length
+        assert abs(scalar(res["thrust_residual"])) < 1e-3 * scalar(res["thrust"])
+        assert abs(scalar(res["mass_drivetrain_residual"])) < 0.05
+        assert abs(scalar(res["mass_battery_residual"])) < 0.05
+        # The drive is on board: total mass is the bare craft plus what was sized.
+        assert scalar(res["mass"]) == pytest.approx(
+            0.85 * mass + scalar(res["mass_drivetrain_sized"]) + scalar(res["mass_battery_sized"]),
+            abs=0.1,
+        )
+        assert scalar(res["mass_battery_sized"]) > 1.0
+        assert 0.3 < scalar(res["propulsion"]["eta_prop"]) < 0.85
+
+    # Moving the battery aft moves the centre of gravity aft and trims bow-up.
+    assert scalar(aft["xyz_cg"][0]) > scalar(amidships["xyz_cg"][0]) + 0.01
+    assert aft["trim"] > amidships["trim"]

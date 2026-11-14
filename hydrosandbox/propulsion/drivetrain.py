@@ -382,6 +382,7 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
         disc_xyz: Sequence[float] | Vectorizable | None = None,
         sinkage: Vectorizable = 0.0,
         trim: Vectorizable = 0.0,
+        pivot_xz: tuple[Vectorizable, Vectorizable] | None = None,
         gearbox_ratio: Vectorizable = 1.0,
         gearbox_efficiency: float = GEAR_ETA_DEFAULT,
         motor: CatalogMotor | None = None,
@@ -431,6 +432,7 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
         self.disc_xyz = disc_xyz
         self.sinkage = sinkage
         self.trim = trim
+        self.pivot_xz = pivot_xz
         self.gearbox_ratio = gearbox_ratio
         self.gearbox_efficiency = gearbox_efficiency
         self.motor = motor
@@ -478,6 +480,7 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
                 velocity=v_ship,
                 sinkage=self.sinkage,
                 trim=self.trim,
+                pivot_xz=self.pivot_xz,
                 thrust_per_shaft=t_seed,
                 n_shafts=self.n_shafts,
                 water=self.water,
