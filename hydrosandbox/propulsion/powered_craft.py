@@ -73,6 +73,7 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
         water: Water | None = None,
         propulsion_options: dict[str, Any] | None = None,
         craft_options: dict[str, Any] | None = None,
+        thrust_deduction: Vectorizable | None = None,
     ):
         """
         Parameters
@@ -85,6 +86,10 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
         mass_drivetrain, mass_battery : The masses used in the balance [kg].
         shaft_angle : Shaft inclination to the hull's x-axis [deg], positive for a
             shaft running down and aft.
+        thrust_deduction : Hull thrust-deduction fraction ``t`` in [0, 1).
+            If None (default), taken from ``ElectricPropulsionBuildup``'s hull
+            interaction model and fed back into both the shaft thrust sizing and
+            aft hull suction drag at the centre of buoyancy.
         propulsion_options : Keyword arguments for ``ElectricPropulsionBuildup``
             (propeller geometry and RPM, gearbox, motor, ``endurance_hours``, ...).
         craft_options : Further keyword arguments for ``CraftBuildup``.
@@ -106,9 +111,12 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
         self.water = Water.seawater() if water is None else water
         self.propulsion_options = dict(propulsion_options or {})
         self.craft_options = dict(craft_options or {})
+        self.thrust_deduction = thrust_deduction
 
-    def _craft_inputs(self) -> dict[str, Any]:
+    def _craft_inputs(self, thrust_deduction: Vectorizable = 0.0) -> dict[str, Any]:
         """The ``CraftBuildup`` arguments this design implies, attitude excluded."""
+        opts = dict(self.craft_options)
+        opts.setdefault("thrust_deduction", thrust_deduction)
         return dict(
             hull=self.hull,
             velocity=self.velocity,
@@ -122,20 +130,27 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
                 (self.mass_drivetrain, self.xyz_motor),
                 (self.mass_battery, self.xyz_battery),
             ],
-            **self.craft_options,
+            **opts,
         )
 
-    def _craft(self) -> CraftBuildup:
-        return CraftBuildup(sinkage=self.sinkage, trim=self.trim, **self._craft_inputs())
+    def _craft(self, thrust_deduction: Vectorizable = 0.0) -> CraftBuildup:
+        return CraftBuildup(
+            sinkage=self.sinkage,
+            trim=self.trim,
+            **self._craft_inputs(thrust_deduction=thrust_deduction),
+        )
 
-    def _propulsion(self, craft: CraftBuildup, thrust: Vectorizable) -> dict[str, Any]:
-        """The drive delivering ``thrust`` on this craft at its attitude."""
+    def _propulsion(self, craft: CraftBuildup, drag_bare: Vectorizable) -> dict[str, Any]:
+        """The drive overcoming bare horizontal drag ``drag_bare`` at this attitude."""
         # The propeller where the trimmed, sunk hull actually carries it.
         x_disc, z_disc = craft._earth(self.xyz_propeller[0], self.xyz_propeller[2])
+        prop_opts = dict(self.propulsion_options)
+        if self.thrust_deduction is not None:
+            prop_opts.setdefault("thrust_deduction", self.thrust_deduction)
         return ElectricPropulsionBuildup(
             op_point=HydroOperatingPoint(water=self.water, velocity=self.velocity),
             water=self.water,
-            drag_bare_N=thrust,  # net of thrust deduction, which it adds
+            drag_bare_N=drag_bare,
             hull=self.hull,
             disc_xyz=[x_disc, self.xyz_propeller[1], z_disc],
             sinkage=self.sinkage,
@@ -143,13 +158,52 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
             pivot_xz=(craft.xyz_cg[0], craft.xyz_cg[2]),
             shaft_depth=-z_disc,
             shaft_angle_deg=self.trim + self.shaft_angle,
-            **self.propulsion_options,
+            **prop_opts,
         ).run()
 
     def run(self, with_stability: bool = False) -> dict[str, Any]:
-        craft = self._craft()
-        res = craft.run_with_stability() if with_stability else craft.run()
-        propulsion = self._propulsion(craft, res["thrust"])
+        explicit_t = (
+            self.thrust_deduction
+            if self.thrust_deduction is not None
+            else self.propulsion_options.get(
+                "thrust_deduction",
+                self.craft_options.get("thrust_deduction", None),
+            )
+        )
+        if explicit_t is not None:
+            craft = self._craft(thrust_deduction=explicit_t)
+            res = craft.run_with_stability() if with_stability else craft.run()
+            propulsion = self._propulsion(craft, res["D"])
+        else:
+            probe_craft = self._craft(thrust_deduction=0.0)
+            base = probe_craft.run()
+            propulsion = self._propulsion(probe_craft, base["D"])
+            t_ded = propulsion["thrust_deduction"]
+            if with_stability:
+                craft = self._craft(thrust_deduction=t_ded)
+                res = craft.run_with_stability()
+            else:
+                res = base
+                cos_shaft = np.cosd(self.trim + self.shaft_angle)
+                sin_shaft = np.sind(self.trim + self.shaft_angle)
+                thrust_new = res["D"] / np.fmax((1.0 - t_ded) * cos_shaft, 1e-6)
+                delta_t = thrust_new - res["thrust"]
+                suction_drag = t_ded * thrust_new * cos_shaft
+                x_cg, z_cg = probe_craft.xyz_cg[0], probe_craft.xyz_cg[2]
+                _, z_cg_earth = probe_craft._earth(x_cg, z_cg)
+                x_t, z_t = probe_craft._earth(
+                    self.xyz_propeller[0], self.xyz_propeller[2]
+                )
+                res["thrust"] = thrust_new
+                res["F_z_net"] = res["F_z_net"] + delta_t * sin_shaft
+                res["M_y_net"] = (
+                    res["M_y_net"]
+                    + (
+                        (z_t - z_cg_earth) * (-delta_t * cos_shaft)
+                        - (x_t - x_cg) * (delta_t * sin_shaft)
+                    )
+                    + (res["z_cb_hull"] - z_cg_earth) * suction_drag
+                )
 
         sized_drivetrain = (
             propulsion["mass_motor_kg"]
@@ -199,17 +253,28 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
         trim = float(kwargs.pop("trim", 0.0))
         propulsion_options = dict(kwargs.pop("propulsion_options", None) or {})
         uses_bseries = propulsion_options.get("propeller_model", "bseries") == "bseries"
+        explicit_t = kwargs.get(
+            "thrust_deduction",
+            propulsion_options.get(
+                "thrust_deduction",
+                (kwargs.get("craft_options") or {}).get("thrust_deduction", None),
+            ),
+        )
+        t_ded_iter = float(explicit_t) if explicit_t is not None else 0.0
 
         def build(**state) -> "PoweredCraftBuildup":
             return cls(*args, propulsion_options=propulsion_options, **kwargs, **state)
 
         for iteration in range(max_iterations):
             masses = dict(mass_drivetrain=mass_drivetrain, mass_battery=mass_battery)
-            # 1. Attitude, with the current masses on board.
+            # 1. Attitude, with the current masses and thrust deduction on board.
             attitude = CraftBuildup.solve_equilibrium(
                 sinkage_guess=sinkage,
                 trim_guess=trim,
-                **dict(build(**masses)._craft_inputs(), include_interference_breakdown=False),
+                **dict(
+                    build(**masses)._craft_inputs(thrust_deduction=t_ded_iter),
+                    include_interference_breakdown=False,
+                ),
             )
             sinkage, trim = attitude["sinkage"], attitude["trim"]
             state = dict(masses, sinkage=sinkage, trim=trim)
@@ -218,12 +283,12 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
             #    does not change with RPM, so only the drive is re-evaluated.
             if uses_bseries:
                 design = build(**state)
-                craft = design._craft()
-                thrust = _scalar(craft.run()["thrust"])
+                craft = design._craft(thrust_deduction=t_ded_iter)
+                drag_bare = _scalar(craft.run()["D"])
 
                 def thrust_gap(rpm: float) -> float:
                     design.propulsion_options["propeller_rpm"] = rpm
-                    return _scalar(design._propulsion(craft, thrust)["thrust_residual_N"])
+                    return _scalar(design._propulsion(craft, drag_bare)["thrust_residual_N"])
 
                 lo, hi = rpm_bounds
                 if thrust_gap(lo) > 0.0 or thrust_gap(hi) < 0.0:
@@ -233,18 +298,21 @@ class PoweredCraftBuildup(asb.ExplicitAnalysis):
                     )
                 propulsion_options["propeller_rpm"] = brentq(thrust_gap, lo, hi, xtol=1e-3)
 
-            # 3. Masses the propulsion model sizes at this state.
+            # 3. Masses (and thrust deduction) the propulsion model sizes at this state.
             res = build(**state).run()
             new_drivetrain = _scalar(res["mass_drivetrain_sized"])
             new_battery = _scalar(res["mass_battery_sized"])
+            new_t_ded = _scalar(res["propulsion"]["thrust_deduction"])
             change = max(abs(new_drivetrain - mass_drivetrain), abs(new_battery - mass_battery))
+            t_change = abs(new_t_ded - t_ded_iter)
             if verbose:
                 print(
                     f"  iter {iteration}: trim {trim:+.3f} deg, sinkage {1000 * sinkage:+.1f} mm, "
                     f"drivetrain {new_drivetrain:.2f} kg, battery {new_battery:.2f} kg"
                 )
             mass_drivetrain, mass_battery = new_drivetrain, new_battery
-            if change < mass_tolerance:
+            t_ded_iter = new_t_ded
+            if change < mass_tolerance and t_change < 1e-4:
                 break
         else:
             raise RuntimeError("Drive masses did not converge.")
