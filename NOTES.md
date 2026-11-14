@@ -42,7 +42,19 @@ Done:
     (not pitch with trim); transom depth uses the widest *immersed* breadth;
     CasADi reshape is column-major.
 
+- Static pitch stability: `CraftBuildup.run_with_stability()` gives heave-free
+  pitch stiffness and effective `GM_L`. `examples/optimize_foils_on_hull.py`
+  minimizes drag over foil layout, CG shift, mass and thrust-line height with
+  attitude equilibrium and a `GM_L` floor (multi-start; ~1.5 min per solve
+  without the floor, several minutes with it).
+- Context from Avi (2026-11-14): the target is power boats, so thrust-line
+  position is a design freedom; CG and mass are design variables within a
+  range. The hummingbird runs use placeholder loading (91 kg, CG over the
+  centre of buoyancy, one demihull), not the real boat's.
+
 Left (hull port):
+- Stability is static only: no pitch inertia, added mass or damping, so no
+  porpoising or motion-in-waves prediction.
 - boatmath's 2D+t planing `lift` and `nearfield` (hull flow at the foil) not ported.
 - The foil's waves do not enter the hull's dynamic force, nor the hull's the foil's inflow.
 - Default 61x41 offsets give ~2-5% on a shallow real hull; finer grids converge

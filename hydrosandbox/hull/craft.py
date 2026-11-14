@@ -345,6 +345,61 @@ class CraftBuildup(ExplicitAnalysis):
             "foil": foil,
         }
 
+    def run_with_stability(
+        self,
+        d_sinkage: float = 2e-3,
+        d_trim: float = 0.1,
+    ) -> dict[str, Any]:
+        """
+        ``run()``, plus the craft's static heave and pitch stiffness at this attitude
+        and speed, from two further evaluations (sinkage and trim each nudged).
+
+        Meaningful at an equilibrium attitude. Works symbolically, so the stiffnesses
+        can be constrained or optimized in ``asb.Opti``. Added to the results:
+
+        - ``k_heave`` [N/m]: ``dF_z/d(sinkage)``. Positive restores.
+        - ``k_pitch_fixed_heave`` [N m/rad]: ``-dM_y/d(trim)`` with heave held.
+        - ``k_pitch`` [N m/rad]: the pitch stiffness with **heave free** (the
+          vertical force kept in balance as the craft pitches),
+          ``-(M_t - M_s F_t / F_s)``. This is the one that decides static pitch
+          stability: positive is stable.
+        - ``GM_L`` [m]: ``k_pitch / (m g)``, the effective longitudinal metacentric
+          height at speed (at rest, the hydrostatic ``GM_L``).
+
+        This is *static* stability: whether a pitch disturbance is opposed. It says
+        nothing about damping or porpoising, which need the unsteady forces.
+        """
+        import copy
+
+        base = self.run()
+
+        def nudged(ds: float, dt: float) -> dict[str, Any]:
+            other = copy.copy(self)
+            other.sinkage = self.sinkage + ds
+            other.trim = self.trim + dt
+            other.include_interference_breakdown = False
+            return other.run()
+
+        sunk = nudged(d_sinkage, 0.0)
+        pitched = nudged(0.0, d_trim)
+        d_trim_rad = d_trim * _onp.pi / 180.0
+
+        f_s = (sunk["F_z_net"] - base["F_z_net"]) / d_sinkage
+        m_s = (sunk["M_y_net"] - base["M_y_net"]) / d_sinkage
+        f_t = (pitched["F_z_net"] - base["F_z_net"]) / d_trim_rad
+        m_t = (pitched["M_y_net"] - base["M_y_net"]) / d_trim_rad
+
+        k_pitch = -(m_t - m_s * f_t / f_s)
+        base.update(
+            k_heave=f_s,
+            k_pitch_fixed_heave=-m_t,
+            k_pitch=k_pitch,
+            GM_L=k_pitch / (self.mass * self.water.gravity),
+            dFz_dtrim=f_t,
+            dMy_dsinkage=m_s,
+        )
+        return base
+
     @classmethod
     def solve_equilibrium(
         cls,
