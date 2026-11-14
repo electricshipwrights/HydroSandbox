@@ -244,6 +244,17 @@ class SweptHull:
         z_w = x * math.sin(th) + z * math.cos(th)
         return self.hull.unit_m * _onp.stack([-x_h, y, z_w + self.hull.waterline], axis=-1)
 
+    def transom_waterline_x(self) -> float:
+        """``x`` (``Hull`` axes, metres) where the transom plane crosses the design waterline."""
+        (xa, za), (xb, zb) = self.hull.transom
+        th = self.hull.deck_trim
+        # Height above the waterline along the transom line, at s = 0 and s = 1.
+        ha = xa * math.sin(th) + za * math.cos(th) + self.hull.waterline
+        hb = xb * math.sin(th) + zb * math.cos(th) + self.hull.waterline
+        s = ha / (ha - hb) if ha != hb else 0.0
+        point = _onp.array([xa + s * (xb - xa), 0.0, za + s * (zb - za)])
+        return float(self.to_hull_axes(point)[0])
+
     def hull_mesh(self, n_columns: int = 121, R: int = 8) -> tuple[_onp.ndarray, _onp.ndarray]:
         """The trimmed starboard surface as a triangle mesh in ``Hull``'s axes (vertices, triangles)."""
         grid = self.to_hull_axes(self.surface_grid(n_columns, R))

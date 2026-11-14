@@ -186,3 +186,23 @@ def test_family_blend_is_differentiable(family):
     opti.minimize((volume / target - 1.0) ** 2)
     sol = opti.solve(verbose=False)
     assert sol(t) == pytest.approx(0.4, abs=0.02)
+
+
+def test_curve_promotion_keeps_the_shape():
+    """Adding section points on the curve leaves the hull nearly unchanged."""
+    skiff, dory = load("skiff"), load("dory")  # 5 and 4 points per section
+    promoted = promote_family([dory, skiff], section_points="curve")[0]
+    assert promoted.topology[2] == 5
+    before = float(Hull.from_camber(dory).hydrostatics()["volume"])
+    after = float(Hull.from_camber(promoted).hydrostatics()["volume"])
+    assert after == pytest.approx(before, rel=0.005)
+
+
+def test_scaled_and_family_length():
+    skiff = load("skiff")
+    half = skiff.scaled(0.5)
+    assert half.loa == pytest.approx(0.5 * skiff.loa)
+    assert half.waterline == pytest.approx(0.5 * skiff.waterline)
+    v_full = float(Hull.from_camber(skiff).hydrostatics()["volume"])
+    v_half = float(Hull.from_camber(half).hydrostatics()["volume"])
+    assert v_half == pytest.approx(v_full / 8, rel=0.01)

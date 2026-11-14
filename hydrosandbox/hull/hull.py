@@ -310,7 +310,8 @@ class Hull(AeroSandboxObject):
         to it, or the decoded dict. The document's sweep is evaluated (see
         ``hydrosandbox.hull.camber``), floated at its deck trim with its design
         waterline at ``z = 0``, turned bow-first (``x`` aft) and cut into an offset
-        table over the hull's own extent (or on given ``stations`` and ``levels``),
+        table over the hull's own extent, from the bow to where the transom plane
+        crosses the design waterline (or on given ``stations`` and ``levels``),
         each level averaged over its band (``level_oversampling``; see
         ``from_mesh``) so the table moves smoothly with the authored numbers.
 
@@ -323,9 +324,16 @@ class Hull(AeroSandboxObject):
             document = CamberHull.from_dict(document)
         elif not isinstance(document, CamberHull):
             document = CamberHull.from_json(document)
-        vertices, triangles = SweptHull(document).hull_mesh(
-            n_columns=n_columns, R=rows_per_segment
-        )
+        swept = SweptHull(document)
+        vertices, triangles = swept.hull_mesh(n_columns=n_columns, R=rows_per_segment)
+        if stations is None:
+            # Bow to the transom plane's crossing of the design waterline, so the
+            # transom is the last station (where this class looks for it) however
+            # it is raked; only above-water overhang aft of that point is left out.
+            x_bow = float(vertices[:, 0].min())
+            x_end = min(float(vertices[:, 0].max()), swept.transom_waterline_x())
+            s = 0.5 * (1.0 - _onp.cos(_onp.pi * _onp.linspace(0.0, 1.0, n_stations)))
+            stations = x_bow + (x_end - x_bow) * (1e-6 + (1.0 - 2e-6) * s)
         kwargs.setdefault("name", document.name or "camber hull")
         result = cls.from_mesh(
             vertices, triangles, n_stations=n_stations, n_levels=n_levels,

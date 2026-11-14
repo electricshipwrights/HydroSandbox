@@ -193,8 +193,11 @@ class HullFamily:
     n_stations, n_levels : Each node's offset grid (over its own extent).
     n_columns, rows_per_segment, level_oversampling : Sampling of each sweep and of
         its offset table (``Hull.from_camber``).
-    correspondence : Station correspondence for ``promote_family`` (default: camber's
-        automatic matching).
+    length : If given [m], every member is first scaled uniformly (waterline depth
+        included) to this overall length, so that the blend compares shapes rather
+        than sizes.
+    correspondence, section_points : For ``promote_family`` (default: camber's
+        automatic station matching, and camber's rule for added section points).
     hull_kwargs : Further ``Hull`` arguments (``form_factor``, ...).
     """
 
@@ -207,16 +210,20 @@ class HullFamily:
         n_columns: int = 121,
         rows_per_segment: int = 8,
         level_oversampling: int = 8,
+        length: float | None = None,
         correspondence=None,
+        section_points: str = "camber",
         name: str | None = None,
         **hull_kwargs,
     ):
         from hydrosandbox.hull.hull import Hull
 
         docs = [_as_document(h) for h in hulls]
+        if length is not None:
+            docs = [d.scaled(length / (d.loa * d.unit_m)) for d in docs]
         if len(docs) < 2:
             raise ValueError("a family needs at least two hulls")
-        self.members = promote_family(docs, correspondence)
+        self.members = promote_family(docs, correspondence, section_points)
         self.member_names = [d.name for d in docs]
         self.name = name or " / ".join(n or f"hull {i}" for i, n in enumerate(self.member_names))
         K = len(self.members)

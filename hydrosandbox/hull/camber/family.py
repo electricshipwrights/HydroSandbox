@@ -241,6 +241,27 @@ def _promote_trim(h: CamberHull, T: int) -> None:
     h.sheer_trim = pts
 
 
+def _promote_section_on_curve(h: CamberHull, S: int) -> None:
+    """
+    Insert section points ON each station's own section curve, at the middle (in
+    the curve's parameter) of the segment with station 0's longest chord, with no
+    knuckle: the section passes through its old points and a point it already
+    passed through, so its shape barely changes.
+    """
+    from hydrosandbox.hull.camber.sweep import Section
+
+    while len(h.stations[0].points) < S:
+        ref = h.stations[0].points
+        bi = max(
+            range(len(ref) - 1),
+            key=lambda i: math.hypot(ref[i + 1].n - ref[i].n, ref[i + 1].z - ref[i].z),
+        )
+        for st in h.stations:
+            sec = Section(_onp.array([[p.n, p.z] for p in st.points]), [p.k for p in st.points], st.keel_k)
+            n, z = sec.at(bi + 0.5)
+            st.points.insert(bi + 1, StationPoint(float(n), float(z), 0.0))
+
+
 def _promote_section(h: CamberHull, S: int) -> None:
     """Insert section points at the midpoint of station 0's longest segment (camber's ``addStationPoint``)."""
     while len(h.stations[0].points) < S:
@@ -399,11 +420,20 @@ def _promote_stations(hulls: Sequence[CamberHull], corr) -> None:
 
 
 def promote_family(
-    hulls: Sequence[CamberHull], correspondence: list[list[float | None]] | None = None
+    hulls: Sequence[CamberHull],
+    correspondence: list[list[float | None]] | None = None,
+    section_points: str = "camber",
 ) -> list[CamberHull]:
     """
     camber's ``promoteFamily``: copies of ``hulls`` lifted to one topology and the
     first hull's unit, so that they blend.
+
+    ``section_points`` chooses how points are added to sections with fewer than the
+    family's most. ``"camber"`` is camber's rule: on the chord between two points,
+    with knuckles interpolated from them (so next to an end point, a crease of 0.5
+    or more). That changes the section's shape, noticeably where it is curved: it
+    took 13% of the displacement off a Cal 20 being promoted from 4 to 8 points.
+    ``"curve"`` puts them on each section's own curve instead, uncreased.
     """
     out = [h.converted(hulls[0].unit) for h in hulls]
     if len(out) < 2:
@@ -414,7 +444,12 @@ def promote_family(
     for h in out:
         _promote_plan(h, N)
         _promote_trim(h, T)
-        _promote_section(h, S)
+        if section_points == "curve":
+            _promote_section_on_curve(h, S)
+        elif section_points == "camber":
+            _promote_section(h, S)
+        else:
+            raise ValueError(f"section_points must be 'camber' or 'curve', not {section_points!r}")
     corr = correspondence if correspondence is not None else auto_correspondence(out)
     _promote_stations(out, corr)
     return out

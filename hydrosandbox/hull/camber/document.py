@@ -75,6 +75,17 @@ class CamberHull:
     def copy(self) -> "CamberHull":
         return copy.deepcopy(self)
 
+    def scaled(self, factor: float) -> "CamberHull":
+        """The same shape scaled uniformly by ``factor`` (lengths and waterline depth)."""
+        out = self.converted(self.unit)
+        out.sheer_plan = [(x * factor, y * factor) for x, y in out.sheer_plan]
+        out.sheer_trim = [(x * factor, z * factor, k) for x, z, k in out.sheer_trim]
+        out.transom = [(x * factor, z * factor) for x, z in out.transom]
+        for st in out.stations:
+            st.points = [StationPoint(p.n * factor, p.z * factor, p.k) for p in st.points]
+        out.waterline *= factor
+        return out
+
     def converted(self, unit: str) -> "CamberHull":
         """The same hull with its lengths expressed in ``unit``."""
         out = self.copy()
