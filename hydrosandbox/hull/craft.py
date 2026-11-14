@@ -85,6 +85,8 @@ class CraftBuildup(ExplicitAnalysis):
         include_hull_dynamics: bool = True,
         hull_dynamics: Any = None,
         include_hull_foil_interaction: bool = True,
+        include_hull_wave_field: bool = True,
+        hull_wave_level: int = 1,
         pitch_rate: Vectorizable = 0.0,
         include_interference_breakdown: bool = True,
         wave_length_scales: tuple[float, float, float] | None = None,
@@ -141,6 +143,13 @@ class CraftBuildup(ExplicitAnalysis):
             pressure field loads the hull bottom above them
             (``Hull.pressure_load``), reported as ``F_z_foil_on_hull``,
             ``D_foil_on_hull`` and ``M_y_foil_on_hull``. Local (non-wave) flow only.
+        include_hull_wave_field : With the interaction, also include the hull's
+            *wave* field at the foils (``Hull.wave_field``): the wave elevation over
+            the main foil sets its true submergence, and the wave-induced flow
+            changes each section's angle of attack and speed. (The drag this implies
+            between hull and foil is already in the shared far-field wave integral,
+            so the wave flow is not allowed to tilt the foils' forces as well.)
+            Needs a numeric ``velocity``. ``hull_wave_level`` refines its quadrature.
         pitch_rate : Bow-up pitch rate about the centre of gravity [rad/s]. Seen by
             the foils (quasi-steadily, as a change in local inflow), not by the hull.
             Used by ``run_with_stability`` to find the foils' pitch damping.
@@ -183,6 +192,8 @@ class CraftBuildup(ExplicitAnalysis):
         self.include_hull_dynamics = include_hull_dynamics
         self.hull_dynamics = hull_dynamics
         self.include_hull_foil_interaction = include_hull_foil_interaction
+        self.include_hull_wave_field = include_hull_wave_field
+        self.hull_wave_level = hull_wave_level
         self.pitch_rate = pitch_rate
         self.include_interference_breakdown = include_interference_breakdown
         self.wave_length_scales = wave_length_scales
@@ -322,20 +333,44 @@ class CraftBuildup(ExplicitAnalysis):
             "froude_blended": ("zero_potential", 1.0),
             "rigid_lid": ("rigid_lid", -1.0),
         }[self.free_surface_mode]
+        waves = None
+        wave_elevation = 0.0
         if interacting:
             sections = hull.sections(velocity, g, self.sinkage, trim, pivot)
+            if self.include_hull_wave_field and not np.is_casadi_type(velocity, recursive=False):
+                waves = hull.wave_field(
+                    velocity, g, self.sinkage, trim, pivot,
+                    demihull_spacing=self.demihull_spacing, level=self.hull_wave_level,
+                )
+                # The hull's wave elevation over the main foil: its true submergence.
+                main = (self.assembly.foils or self.assembly.wings)[0]
+                root = main.xsecs[0 if main.symmetric else len(main.xsecs) // 2].xyz_le
+                x_root, _ = self._earth(root[0], root[2])
+                wave_elevation = waves.elevation(x_root, root[1])[0, 0]
+
+            def to_geometry(u, v, w):
+                u, v, w = u[0, 0], v[0, 0], w[0, 0]
+                return [u * cos - w * sin, v, u * sin + w * cos]
 
             def hull_inflow(x_g, y_g, z_g):
                 """The hull's induced flow at a geometry-axes point, in geometry axes."""
                 x_e, z_e = self._earth(x_g, z_g)
-                u, v, w = hull.induced_velocity(
-                    x_e, y_g, z_e, velocity,
-                    demihull_spacing=self.demihull_spacing,
-                    free_surface=surface_images[0],
-                    sections=sections,
+                # With the wave field, the local part is the Rankine source minus its
+                # negative image, whatever image the foils themselves use.
+                local = to_geometry(
+                    *hull.induced_velocity(
+                        x_e, y_g, z_e, velocity,
+                        demihull_spacing=self.demihull_spacing,
+                        free_surface="zero_potential" if waves is not None else surface_images[0],
+                        sections=sections,
+                    )
                 )
-                u, v, w = u[0, 0], v[0, 0], w[0, 0]
-                return [u * cos - w * sin, v, u * sin + w * cos]
+                if waves is None:
+                    return local
+                return {
+                    "flow": local,
+                    "incidence_only": to_geometry(*waves.induced_velocity(x_e, y_g, z_e)),
+                }
 
         if self.assembly is not None:
             # Map geometry (x, z) to height above the undisturbed waterplane
@@ -346,7 +381,7 @@ class CraftBuildup(ExplicitAnalysis):
                 velocity=velocity,
                 alpha=trim,
                 q=self.pitch_rate,
-                surface_z=lambda x_g, z_g: self._earth(x_g, z_g)[1],
+                surface_z=lambda x_g, z_g: self._earth(x_g, z_g)[1] - wave_elevation,
             )
             options = dict(
                 model_size=self.model_size,
@@ -493,6 +528,7 @@ class CraftBuildup(ExplicitAnalysis):
             "D_wave_foil_alone": D_wave_foil,
             "D_wave_interference": D_wave_interference,
             "L_foil": foil["L"] if foil is not None else 0.0,
+            "hull_wave_elevation_at_foil": wave_elevation,
             "F_z_foil_on_hull": foil_on_hull["force_up"],
             "D_foil_on_hull": foil_on_hull["force_aft"],
             "M_y_foil_on_hull": foil_on_hull["moment_bow_up"],

@@ -75,7 +75,9 @@ Validation against boatmath's own Rust output:
 
 Hull and foils also interact through the local flow (`include_hull_foil_interaction`, on by default): the flow the hull's thickness induces at each foil section changes its inflow (`Hull.induced_velocity`), and the foils' pressure field loads the hull bottom above them (`Hull.pressure_load`; a long vortex under a wide flat hull reproduces the closed-form suction of half its lift). On slender hulls both are small; they grow as a foil is brought close under a wide hull.
 
-Not modelled: the hull's planing lift (boatmath's 2D+t `lift`), the hull's *wave* field at the foil, reflection of the foil's field in the hull, and the foil's waves in the hull's dynamic force.
+The hull's **wave field** reaches the foils too (`include_hull_wave_field`, on by default; `Hull.wave_field`, a port of the wave part of boatmath's `thinship::nearfield`): the wave elevation over the main foil sets its true submergence, and the wave-induced flow changes each section's angle of attack. At speed this is the larger part of the interaction: on a 5.5 m catamaran at 6 m/s it is about a degree of inflow angle and tens of millimetres of elevation near the stern, against a fifth of a degree from the local flow. Its wave elevation matches boatmath's own free-surface grids to a few millimetres.
+
+Not modelled: the hull's planing lift (boatmath's 2D+t `lift`), reflection of the foil's field in the hull, and the foil's waves in the hull's dynamic force.
 
 ## Coordinate & Sign Conventions
 
