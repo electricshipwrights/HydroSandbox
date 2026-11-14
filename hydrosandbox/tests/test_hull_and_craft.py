@@ -354,6 +354,9 @@ def test_lifting_the_hull_costs_pitch_stiffness_and_an_aft_foil_gives_some_back(
     common = dict(
         hull=hull, velocity=4.5, mass=mass, xyz_cg=[0.2, 0.0, 0.1], water=water,
         include_interference_breakdown=False,
+        # The lever-arm argument alone, without the foil's suction on the hull
+        # (which on this small craft is about as large as the margin tested).
+        include_hull_foil_interaction=False,
     )
 
     def stiffness(assembly):
@@ -739,8 +742,9 @@ def test_trimmed_waterplane_sets_true_aft_foil_and_strut_submergence():
     r_trim = craft_trimmed.run()
     elem = r_trim["foil"]["wave_elements"]
     fz_elem = sum(scalar(v) for v in elem["force_z"])
-    # Lift component L in wind axes points vertically up in earth axes.
-    assert fz_elem == pytest.approx(scalar(r_trim["L_foil"]), rel=1e-6)
+    # Lift component L in wind axes points vertically up in earth axes. (To 1e-4:
+    # the hull's induced flow tilts each section's own lift by a fraction of a degree.)
+    assert fz_elem == pytest.approx(scalar(r_trim["L_foil"]), rel=1e-4)
 
 
 def test_flat_bottom_emerged_stations_drop_waterline_breadth_to_zero():
@@ -995,3 +999,105 @@ def test_keel_height_and_under_hull_foil_layouts():
         if not getattr(w, "is_strut", False)
     ]
     assert lifts[0] > 0.0 and lifts[0] == pytest.approx(lifts[1], rel=1e-6)
+
+
+def test_vortex_under_a_wide_flat_hull_pulls_it_down_by_half_its_lift():
+    """
+    A long bound vortex of circulation Gamma a height h below a wide flat bottom
+    speeds the flow under it by Gamma h / (2 pi (x^2 + h^2)); the linearized pressure
+    -rho U u integrates along the hull to -rho U Gamma / 2 per unit width: half the
+    vortex's own lift, as suction on the hull (free field, no reflection in the hull).
+    """
+    from aerosandbox.aerodynamics.aero_3D.singularities.uniform_strength_horseshoe_singularities import (
+        calculate_induced_velocity_horseshoe,
+    )
+
+    stations = onp.linspace(-15.0, 15.0, 121)
+    levels = onp.array([-0.6, -0.5, 0.0, 0.5])
+    half_breadths = onp.zeros((len(stations), len(levels)))
+    half_breadths[:, 1:] = 1.0  # a 2 m wide box drawing 0.5 m, flat-bottomed
+    barge = Hull(stations, levels, half_breadths, transom_closure="none")
+
+    u_inf, rho, gamma, clearance, span = 5.0, 1000.0, 2.0, 1.0, 60.0
+    depth = barge.sections(u_inf)["mean_depth"]
+    z_vortex = -float(onp.max(depth)) - clearance
+
+    def vortex_u(x, y, z):
+        u, _, _ = calculate_induced_velocity_horseshoe(
+            x_field=x, y_field=y, z_field=z,
+            x_left=0.0, y_left=-span / 2, z_left=z_vortex,
+            x_right=0.0, y_right=span / 2, z_right=z_vortex,
+            gamma=gamma, trailing_vortex_direction=onp.array([1.0, 0.0, 0.0]),
+        )
+        return u
+
+    load = barge.pressure_load(vortex_u, u_inf, rho)
+    lift_under_hull = rho * u_inf * gamma * 2.0  # the vortex's lift over the hull's 2 m beam
+    # Over a finite hull length the integral of h / (x^2 + h^2) falls a little short of pi.
+    expected = -0.5 * lift_under_hull * (2.0 / onp.pi) * onp.arctan(15.0 / clearance)
+    assert scalar(load["force_up"]) == pytest.approx(expected, rel=0.05)
+    # A wall-sided box has no bow or stern slope: no axial force; and by symmetry no moment.
+    assert abs(scalar(load["moment_bow_up"])) < 1e-6 * abs(expected) * 15.0
+
+
+def test_hull_induced_flow_is_outward_at_the_bow_inward_at_the_stern_and_dies_away():
+    hull = Hull.wigley(10.0, 1.0, 0.625)
+    u_inf = 3.0
+
+    def at(x, y, z, **kw):
+        u, v, w = hull.induced_velocity([x], [y], [z], u_inf, **kw)
+        return scalar(u), scalar(v), scalar(w)
+
+    # Beside the bow the hull pushes water outward and down; beside the stern it
+    # draws it back in. (No surface image here: just the hull's own sources.)
+    _, v_bow, w_bow = at(-3.5, 1.0, -1.0, free_surface="none")
+    _, v_stern, w_stern = at(3.5, 1.0, -1.0, free_surface="none")
+    assert v_bow > 0.0 and w_bow < 0.0
+    assert v_stern == pytest.approx(-v_bow, rel=1e-6) and w_stern == pytest.approx(-w_bow, rel=1e-6)
+    # Amidships, beside a fore-aft symmetric hull, the flow is sped up.
+    u_mid, _, _ = at(0.0, 1.0, -0.3, free_surface="rigid_lid")
+    assert u_mid > 0.0
+    # The sources sum to zero, so far away the disturbance falls off quickly.
+    near = max(abs(c) for c in at(0.0, 3.0, -0.3))
+    far = max(abs(c) for c in at(0.0, 30.0, -0.3))
+    assert far < 2e-3 * near
+    # A catamaran's other hull adds its own field.
+    lone = at(0.0, 1.0, -0.3)
+    paired = hull.induced_velocity([0.0], [0.0], [-0.3], u_inf, demihull_spacing=2.0)
+    assert scalar(paired[0]) == pytest.approx(2.0 * lone[0], rel=1e-6)
+    assert abs(scalar(paired[1])) < 1e-12
+
+
+def test_hull_foil_interaction_in_the_craft_model():
+    import casadi as cas
+
+    water, hull, mass = _small_craft()
+    common = dict(hull=hull, velocity=4.5, mass=mass, xyz_cg=[0.2, 0.0, 0.1], water=water,
+                  sinkage=0.0, trim=0.5, include_hull_dynamics=False,
+                  include_interference_breakdown=False)
+    assembly = _t_foil(0.5)
+
+    off = CraftBuildup(assembly=assembly, include_hull_foil_interaction=False, **common).run()
+    on = CraftBuildup(assembly=assembly, **common).run()
+    assert scalar(off["F_z_foil_on_hull"]) == 0.0
+    # A lifting foil under the hull draws the hull down, by a modest share of its lift.
+    assert scalar(on["L_foil"]) > 0.0
+    assert -0.3 * scalar(on["L_foil"]) < scalar(on["F_z_foil_on_hull"]) < 0.0
+    # The books balance: the net vertical force changes by the load on the hull plus
+    # the change in the foil's own force from the hull's flow.
+    foil_change = (
+        scalar(on["foil"]["F_g_with_buoyancy"][2]) - scalar(off["foil"]["F_g_with_buoyancy"][2])
+    ) * onp.cos(onp.radians(0.5)) - (
+        scalar(on["foil"]["F_g_with_buoyancy"][0]) - scalar(off["foil"]["F_g_with_buoyancy"][0])
+    ) * onp.sin(onp.radians(0.5))
+    assert scalar(on["F_z_net"]) - scalar(off["F_z_net"]) == pytest.approx(
+        scalar(on["F_z_foil_on_hull"]) + foil_change, rel=1e-9, abs=1e-9
+    )
+
+    # Symbolic attitude reproduces the numeric evaluation.
+    s, t = cas.MX.sym("sinkage"), cas.MX.sym("trim")
+    symbolic = CraftBuildup(assembly=assembly, **dict(common, sinkage=s, trim=t)).run()
+    f = cas.Function("f", [s, t], [symbolic["F_z_net"], symbolic["M_y_net"], symbolic["F_z_foil_on_hull"]])
+    values = [float(v) for v in f(0.0, 0.5)]
+    for value, key in zip(values, ("F_z_net", "M_y_net", "F_z_foil_on_hull")):
+        assert value == pytest.approx(scalar(on[key]), rel=1e-8, abs=1e-8)

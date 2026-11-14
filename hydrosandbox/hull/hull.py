@@ -1260,6 +1260,170 @@ class Hull(AeroSandboxObject):
             "moment_wave": moment_wave,
         }
 
+    # ------------------------------------------------------------------
+    # Interaction with things near the hull (foils, propellers)
+    # ------------------------------------------------------------------
+    def sections(
+        self,
+        velocity: Vectorizable,
+        gravity: float = 9.80665,
+        sinkage: Vectorizable = 0.0,
+        trim: Vectorizable = 0.0,
+        pivot_xz: Sequence[float] = (0.0, 0.0),
+    ) -> dict[str, Vectorizable]:
+        """
+        The hull reduced to its stations at an attitude, as columns over the
+        station strips (and, where there is one, the strips of the transom's closing
+        hollow): earth-axes ``x``, strip length ``dx``, immersed section ``area``
+        [m^2], its change along the strip ``d_area``, the depth of its centroid
+        ``z_centroid`` (negative below the surface), the wetted ``half_beam`` at the
+        waterline and the ``mean_depth`` (area over beam) of the section.
+        """
+        strips = self._strips(velocity, gravity, sinkage, trim, pivot_xz)
+        n_hull = strips["n_hull"]
+        half_area_x_dx = self._sum_groups(np.reshape(strips["half_volume"], (-1, 1)), n_hull)
+        z_mid = 0.5 * (strips["z_lo_hull"] + strips["z_hi_hull"])
+        moment = self._sum_groups(np.reshape(strips["half_volume"] * z_mid, (-1, 1)), n_hull)
+        dx = np.reshape(strips["dx_hull"], (-1, 1))
+        area = 2.0 * half_area_x_dx / dx
+        f_wl = self._waterline_half_breadths(sinkage, trim, pivot_xz)
+        half_beam = 0.5 * (f_wl[1:, :] + f_wl[:-1, :])
+        out = {
+            "x": np.reshape(strips["x_hull"], (-1, 1)),
+            "dx": dx,
+            "area": area,
+            "d_area": 2.0 * self._sum_groups(np.reshape(strips["slope_hull"], (-1, 1)), n_hull),
+            "z_centroid": moment / (half_area_x_dx + 1e-12),
+            "half_beam": half_beam,
+            "mean_depth": 0.5 * area / (half_beam + 1e-6),
+            "n_hull": n_hull,
+        }
+        if strips["n_hollow"] > 0:
+            n_h = strips["n_hollow"]
+            slope = np.reshape(strips["slope_hollow"], (-1, 1))
+            z_h = 0.5 * (strips["z_lo_hollow"] + strips["z_hi_hollow"])
+            weight = self._sum_groups(np.fabs(slope), n_h)
+            out.update(
+                x_hollow=np.reshape(strips["x_hollow"], (-1, 1)),
+                d_area_hollow=2.0 * self._sum_groups(slope, n_h),
+                z_hollow=self._sum_groups(np.fabs(slope) * np.reshape(z_h, (-1, 1)), n_h)
+                / (weight + 1e-12),
+            )
+        return out
+
+    def induced_velocity(
+        self,
+        x: Vectorizable,
+        y: Vectorizable,
+        z: Vectorizable,
+        velocity: Vectorizable,
+        gravity: float = 9.80665,
+        sinkage: Vectorizable = 0.0,
+        trim: Vectorizable = 0.0,
+        pivot_xz: Sequence[float] = (0.0, 0.0),
+        demihull_spacing: float | None = None,
+        free_surface: Literal["zero_potential", "rigid_lid", "none"] = "zero_potential",
+        sections: dict[str, Vectorizable] | None = None,
+    ) -> tuple[Vectorizable, Vectorizable, Vectorizable]:
+        """
+        The flow the hull's thickness induces at field points, in earth axes
+        (``x`` aft, ``z`` up from the still water surface): ``(u, v, w)`` [m/s],
+        columns over the points.
+
+        Slender-body form of the thin-ship sources: each station strip is a point
+        source of strength ``U dA`` (the change in immersed section area along it)
+        at the section's centroid, softened over the section's own size, with an
+        image above the surface: of opposite sign for ``"zero_potential"``
+        (``phi = 0``, the high-speed limit used for the foils' own images) or the
+        same sign for ``"rigid_lid"``. The transom's closing hollow is included, so
+        the sources sum to zero. ``y`` is measured from the hull's centreplane; with
+        ``demihull_spacing`` it is measured from the craft's centreline and both
+        demihulls contribute.
+
+        This is the local (double-body-like) flow only: the hull's wave system at
+        the field points is not included.
+        """
+        if sections is None:
+            sections = self.sections(velocity, gravity, sinkage, trim, pivot_xz)
+        px, py, pz = (np.reshape(v, (-1, 1)) for v in (x, y, z))
+        n_points = px.shape[0]
+        image = {"zero_potential": -1.0, "rigid_lid": 1.0, "none": 0.0}[free_surface]
+
+        groups = [(sections["x"], sections["z_centroid"], sections["d_area"],
+                   sections["area"] / _onp.pi + 1e-8)]
+        if "x_hollow" in sections:
+            groups.append((sections["x_hollow"], sections["z_hollow"],
+                           sections["d_area_hollow"], 1e-6))
+        y_hulls = [0.0] if demihull_spacing is None else [-0.5 * demihull_spacing, 0.5 * demihull_spacing]
+
+        u = v = w = 0.0
+        for xs, zs, d_area, core2 in groups:
+            n_s = xs.shape[0]
+            ones_p, ones_s = _onp.ones((n_points, 1)), _onp.ones((1, n_s))
+            rx = px @ ones_s - ones_p @ np.reshape(xs, (1, -1))
+            strength = ones_p @ np.reshape(velocity * d_area, (1, -1)) / (4.0 * _onp.pi)
+            core = ones_p @ np.reshape(0.25 * core2, (1, -1))
+            for y_hull in y_hulls:
+                ry = (py - y_hull) @ ones_s
+                for sign, weight in ((1.0, 1.0), (-1.0, image)):
+                    if weight == 0.0:
+                        continue
+                    rz = pz @ ones_s - sign * (ones_p @ np.reshape(zs, (1, -1)))
+                    inv_r3 = weight * strength / (rx**2 + ry**2 + rz**2 + core) ** 1.5
+                    u = u + np.reshape(np.sum(inv_r3 * rx, axis=1), (-1, 1))
+                    v = v + np.reshape(np.sum(inv_r3 * ry, axis=1), (-1, 1))
+                    w = w + np.reshape(np.sum(inv_r3 * rz, axis=1), (-1, 1))
+        return u, v, w
+
+    def pressure_load(
+        self,
+        perturbation_u,
+        velocity: Vectorizable,
+        density: Vectorizable,
+        gravity: float = 9.80665,
+        sinkage: Vectorizable = 0.0,
+        trim: Vectorizable = 0.0,
+        pivot_xz: Sequence[float] = (0.0, 0.0),
+        x_ref: Vectorizable | None = None,
+        z_ref: Vectorizable = 0.0,
+        y_hull: float = 0.0,
+        sections: dict[str, Vectorizable] | None = None,
+    ) -> dict[str, Vectorizable]:
+        """
+        The load on the hull from an external flow disturbance, such as a foil's
+        field: the linearized pressure ``p = -rho U u`` it brings to the hull's
+        bottom, integrated.
+
+        ``perturbation_u(x, y, z)`` returns the disturbance's streamwise velocity
+        [m/s] at earth-axes points (columns). Each station's pressure is sampled at
+        three points across its wetted beam, at the section's mean depth, and acts
+        upward on the beam's plan area and aft on the growth of the section's area
+        along the strip. ``y_hull`` places the hull off the craft's centreline.
+
+        Returns ``force_up`` and ``force_aft`` [N] and ``moment_bow_up`` [N m] about
+        ``(x_ref, z_ref)`` (earth axes; default the pivot's x).
+        """
+        if sections is None:
+            sections = self.sections(velocity, gravity, sinkage, trim, pivot_xz)
+        if x_ref is None:
+            x_ref = pivot_xz[0]
+        xs, half_beam, depth = sections["x"], sections["half_beam"], sections["mean_depth"]
+        n_s = xs.shape[0]
+        nodes = (-_onp.sqrt(0.6), 0.0, _onp.sqrt(0.6))
+        gauss = (5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0)
+        pressure = 0.0
+        for node, weight in zip(nodes, gauss):
+            u = perturbation_u(xs, y_hull + node * half_beam, -depth)
+            pressure = pressure + weight * (-density * velocity * np.reshape(u, (-1, 1)))
+        f_up = pressure * 2.0 * half_beam * sections["dx"]
+        f_aft = pressure * sections["d_area"]
+        return {
+            "force_up": np.sum(f_up),
+            "force_aft": np.sum(f_aft),
+            "moment_bow_up": np.sum((-depth - z_ref) * f_aft - (xs - x_ref) * f_up),
+            "pressure": pressure,
+        }
+
     def dynamic_force_table(
         self,
         velocity: float,

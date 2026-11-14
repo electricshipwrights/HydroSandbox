@@ -105,6 +105,7 @@ class HydroBuildup(ExplicitAnalysis):
         include_wave_drag: bool | Literal["elements_only"] = True,
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
+        inflow_perturbation: Any = None,
         airplane: Airplane | HydrofoilAssembly | None = None,
     ):
         """
@@ -147,6 +148,10 @@ class HydroBuildup(ExplicitAnalysis):
         self.include_wave_drag = include_wave_drag
         self.wave_length_scales = wave_length_scales
         self.wave_reference_velocity = wave_reference_velocity
+        # A callable (x_g, y_g, z_g) -> (du, dv, dw) [m/s, geometry axes]: a flow
+        # disturbance from something else (a hull, say), added to each section's
+        # inflow where its aerodynamic centre is.
+        self.inflow_perturbation = inflow_perturbation
 
     @property
     def airplane(self) -> HydrofoilAssembly | Airplane:
@@ -961,6 +966,9 @@ class HydroBuildup(ExplicitAnalysis):
                 manual=True,
             )
             vel_vector_g = [vel_freestream_g[k] + vel_rot_g[k] for k in range(3)]
+            if self.inflow_perturbation is not None:
+                disturbance = self.inflow_perturbation(*sect_AC_raw)
+                vel_vector_g = [vel_vector_g[k] + disturbance[k] for k in range(3)]
             vel_mag_g = np.sqrt(sum(comp**2 for comp in vel_vector_g))
             vel_dir_g = [vel_vector_g[k] / vel_mag_g for k in range(3)]
             vel_dot_x = np.dot(vel_dir_g, xg_local, manual=True)
