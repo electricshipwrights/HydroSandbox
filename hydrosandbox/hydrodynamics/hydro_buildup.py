@@ -150,7 +150,13 @@ class HydroBuildup(ExplicitAnalysis):
         self.wave_reference_velocity = wave_reference_velocity
         # A callable (x_g, y_g, z_g) -> (du, dv, dw) [m/s, geometry axes]: a flow
         # disturbance from something else (a hull, say), added to each section's
-        # inflow where its aerodynamic centre is.
+        # inflow where its aerodynamic centre is. It may instead return a dict with
+        # "flow" (as above) and "incidence_only": a further disturbance that changes
+        # the section's angle of attack and speed but not the direction its lift and
+        # drag are resolved in. That is how another body's *wave* field enters when
+        # the mutual wave drag is already counted in a far-field wave integral: the
+        # foil's circulation responds, but the tilt of its lift in that wave flow,
+        # which is this foil's share of the mutual wave drag, is not added again.
         self.inflow_perturbation = inflow_perturbation
 
     @property
@@ -968,16 +974,33 @@ class HydroBuildup(ExplicitAnalysis):
             vel_vector_g = [vel_freestream_g[k] + vel_rot_g[k] for k in range(3)]
             if self.inflow_perturbation is not None:
                 disturbance = self.inflow_perturbation(*sect_AC_raw)
+                if isinstance(disturbance, dict):
+                    incidence_only = disturbance.get("incidence_only")
+                    disturbance = disturbance["flow"]
+                else:
+                    incidence_only = None
                 vel_vector_g = [vel_vector_g[k] + disturbance[k] for k in range(3)]
+            else:
+                incidence_only = None
             vel_mag_g = np.sqrt(sum(comp**2 for comp in vel_vector_g))
             vel_dir_g = [vel_vector_g[k] / vel_mag_g for k in range(3)]
             vel_dot_x = np.dot(vel_dir_g, xg_local, manual=True)
             vel_dot_z = np.dot(vel_dir_g, zg_local, manual=True)
 
+            # What the section's circulation responds to: the inflow above, plus any
+            # incidence-only disturbance.
+            if incidence_only is not None:
+                vel_alpha_g = [vel_vector_g[k] + incidence_only[k] for k in range(3)]
+                vel_mag_g = np.sqrt(sum(comp**2 for comp in vel_alpha_g))
+                alpha_dot_x = np.dot(vel_alpha_g, xg_local, manual=True) / vel_mag_g
+                alpha_dot_z = np.dot(vel_alpha_g, zg_local, manual=True) / vel_mag_g
+            else:
+                alpha_dot_x, alpha_dot_z = vel_dot_x, vel_dot_z
+
             alpha_gen = np.where(
-                vel_dot_x > 0,
-                90.0 - np.arccosd(np.clip(vel_dot_z, -1.0, 1.0)),
-                90.0 + np.arccosd(np.clip(vel_dot_z, -1.0, 1.0)),
+                alpha_dot_x > 0,
+                90.0 - np.arccosd(np.clip(alpha_dot_z, -1.0, 1.0)),
+                90.0 + np.arccosd(np.clip(alpha_dot_z, -1.0, 1.0)),
             )
 
             alpha_gen_eff = (

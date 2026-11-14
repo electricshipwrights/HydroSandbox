@@ -1101,3 +1101,100 @@ def test_hull_foil_interaction_in_the_craft_model():
     values = [float(v) for v in f(0.0, 0.5)]
     for value, key in zip(values, ("F_z_net", "M_y_net", "F_z_foil_on_hull")):
         assert value == pytest.approx(scalar(on[key]), rel=1e-8, abs=1e-8)
+
+
+def test_hull_wave_field_trails_the_hull_and_obeys_the_surface_condition():
+    hull = Hull.wigley(10.0, 1.0, 0.625)
+    u_inf = 0.4 * onp.sqrt(G * 10.0)
+    waves = hull.wave_field(u_inf, level=2, k_cap=20.0)
+
+    # Radiation: waves astern, almost nothing ahead of the bow.
+    ahead = onp.ravel(waves.elevation(onp.linspace(-25.0, -12.0, 40), onp.zeros(40)))
+    astern = onp.ravel(waves.elevation(onp.linspace(8.0, 30.0, 60), onp.zeros(60)))
+    assert onp.max(onp.abs(ahead)) < 0.05 * onp.max(onp.abs(astern))
+
+    # Astern on the track, the transverse waves have the wavelength 2 pi U^2 / g.
+    x = onp.linspace(12.0, 40.0, 280)
+    zeta = onp.ravel(waves.elevation(x, onp.zeros_like(x)))
+    upward = x[1:][(zeta[:-1] < 0) & (zeta[1:] >= 0)]
+    assert onp.mean(onp.diff(upward)) == pytest.approx(2 * onp.pi * u_inf**2 / G, rel=0.08)
+
+    # Port/starboard symmetric about the hull's centreplane.
+    left = waves.elevation([6.0], [-1.5])
+    right = waves.elevation([6.0], [1.5])
+    assert scalar(left) == pytest.approx(scalar(right), rel=1e-9)
+
+    # Linearized kinematic condition on the surface: w = U d(zeta)/dx, where w is
+    # the whole flow's: the wave part plus the local part (the Rankine source minus
+    # its negative image, which has no elevation of its own but does have a w there).
+    xs = onp.array([7.0, 9.0, 14.0, 22.0])
+    h = 1e-3
+    slope = (
+        onp.ravel(waves.elevation(xs + h, 0.8 * onp.ones(4)))
+        - onp.ravel(waves.elevation(xs - h, 0.8 * onp.ones(4)))
+    ) / (2 * h)
+    _, _, w = waves.induced_velocity(xs, 0.8 * onp.ones(4), onp.zeros(4))
+    _, _, w_local = hull.induced_velocity(xs, 0.8 * onp.ones(4), onp.zeros(4), u_inf)
+    # (Approximately: the local part is the slender-body one, and the two parts are
+    # integrated differently, so they close the condition to about a tenth.)
+    assert onp.ravel(w) + onp.ravel(w_local) == pytest.approx(u_inf * slope, rel=0.15, abs=5e-3)
+
+    # The wave flow itself is exactly a potential flow: no divergence, no vorticity.
+    point = onp.array([9.0, 0.8, -0.4])
+
+    def velocity_at(offset):
+        q = point + offset
+        return onp.array([scalar(c) for c in waves.induced_velocity([q[0]], [q[1]], [q[2]])])
+
+    def derivative(component, axis):
+        step = onp.zeros(3)
+        step[axis] = 1e-3
+        return (velocity_at(step)[component] - velocity_at(-step)[component]) / 2e-3
+
+    scale = onp.max(onp.abs(velocity_at(onp.zeros(3)))) / 1.0  # per metre
+    assert abs(derivative(0, 0) + derivative(1, 1) + derivative(2, 2)) < 1e-4 * scale
+    assert abs(derivative(0, 2) - derivative(2, 0)) < 1e-4 * scale
+    assert abs(derivative(0, 1) - derivative(1, 0)) < 1e-4 * scale
+    # And the dynamic one: zeta = -(U / g) u.
+    # (the local part has no streamwise velocity on the surface)
+    u, _, _ = waves.induced_velocity(xs, 0.8 * onp.ones(4), onp.zeros(4))
+    zeta_here = onp.ravel(waves.elevation(xs, 0.8 * onp.ones(4)))
+    assert zeta_here == pytest.approx(-(u_inf / G) * onp.ravel(u), rel=1e-9, abs=1e-12)
+    u_local, _, _ = hull.induced_velocity(xs, 0.8 * onp.ones(4), onp.zeros(4), u_inf)
+    assert onp.max(onp.abs(onp.ravel(u_local))) < 1e-12
+
+    # The wave flow dies away with depth.
+    shallow = onp.abs(onp.ravel(waves.induced_velocity([9.0], [0.0], [-0.5])[2]))
+    deep = onp.abs(onp.ravel(waves.induced_velocity([9.0], [0.0], [-8.0])[2]))
+    assert deep < 0.1 * shallow
+
+
+def test_hull_wave_field_reaches_the_foil_without_tilting_its_forces():
+    import casadi as cas
+
+    water, hull, mass = _small_craft()
+    common = dict(hull=hull, velocity=4.5, mass=mass, xyz_cg=[0.2, 0.0, 0.1], water=water,
+                  sinkage=0.0, trim=0.5, include_hull_dynamics=False,
+                  include_interference_breakdown=False)
+    assembly = _t_foil(2.0)  # near the stern, in the hull's wave
+
+    local = CraftBuildup(assembly=assembly, include_hull_wave_field=False, **common).run()
+    waves = CraftBuildup(assembly=assembly, **common).run()
+    # The hull's wave changes the foil's lift and its submergence...
+    assert scalar(local["hull_wave_elevation_at_foil"]) == 0.0
+    assert abs(scalar(waves["hull_wave_elevation_at_foil"])) > 1e-3
+    assert abs(scalar(waves["L_foil"]) / scalar(local["L_foil"]) - 1.0) > 0.01
+    # ...but the foil's drag changes only as its lift does (induced and profile
+    # drag), not by its lift being tilted in the wave flow, which the shared
+    # far-field wave integral already accounts for.
+    lift_ratio = scalar(waves["L_foil"]) / scalar(local["L_foil"])
+    assert scalar(waves["D_foil"]) == pytest.approx(
+        scalar(local["D_foil"]), rel=2.5 * abs(lift_ratio - 1.0) + 0.02
+    )
+
+    # Symbolic attitude reproduces the numeric evaluation.
+    s, t = cas.MX.sym("sinkage"), cas.MX.sym("trim")
+    symbolic = CraftBuildup(assembly=assembly, **dict(common, sinkage=s, trim=t)).run()
+    f = cas.Function("f", [s, t], [symbolic["F_z_net"], symbolic["M_y_net"], symbolic["D"]])
+    for value, key in zip([float(v) for v in f(0.0, 0.5)], ("F_z_net", "M_y_net", "D")):
+        assert value == pytest.approx(scalar(waves[key]), rel=1e-8, abs=1e-8)

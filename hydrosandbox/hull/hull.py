@@ -1375,6 +1375,161 @@ class Hull(AeroSandboxObject):
                     w = w + np.reshape(np.sum(inv_r3 * rz, axis=1), (-1, 1))
         return u, v, w
 
+    def wave_field(
+        self,
+        velocity: float,
+        gravity: float = 9.80665,
+        sinkage: Vectorizable = 0.0,
+        trim: Vectorizable = 0.0,
+        pivot_xz: Sequence[float] = (0.0, 0.0),
+        demihull_spacing: float | None = None,
+        k_cap: float = 100.0,
+        level: int = 1,
+    ) -> "HullWaveField":
+        """
+        The hull's steady **wave field**: the wave part of its thin-ship flow, which
+        ``induced_velocity`` leaves out. A port of the wave part of boatmath's
+        ``thinship::nearfield``.
+
+        The Kelvin source splits (Havelock) into a Rankine source minus its negative
+        image, which is ``induced_velocity(free_surface="zero_potential")``, and a
+        regular wave part. The wave part is a two-dimensional wavenumber integral of
+        the hull's own source transform ``q``: ``k`` on a log grid, the direction
+        ``theta`` by Gauss panels, the pole on the dispersion curve
+        ``k0 = nu sec^2(theta)`` by subtraction (principal value), and the radiation
+        condition as a half-residue on that curve, which puts the waves astern. It
+        becomes a sum over wavenumber nodes,
+
+            phi_x = sum_n Re(c_n exp(i kx_n X)) cos(ky_n Y) exp(-k_n depth),
+
+        from which the returned ``HullWaveField`` gives the wave elevation and the
+        wave-induced velocity anywhere at or below the surface.
+
+        Parameters
+        ----------
+        velocity : Speed [m/s]; numeric (it lays out the wavenumber nodes).
+        k_cap : Wavenumbers are tapered away between ``0.6 k_cap`` and ``k_cap``
+            [1/m]. Features shorter than about ``2 pi / k_cap`` are smoothed; at a
+            depth ``d`` everything above ``~30 / d`` is negligible anyway.
+        level : Quadrature refinement (panel counts scale with it).
+        """
+        velocity = float(velocity)
+        nu = gravity / velocity**2
+        strips = self._strips(velocity, gravity, sinkage, trim, pivot_xz)
+        groups = [
+            (strips["slope_hull"], strips["z_lo_hull"], strips["z_hi_hull"],
+             strips["n_hull"], strips["x_hull"], strips["dx_hull"])
+        ]
+        if strips["n_bow"] > 0:
+            groups.append((strips["slope_bow"], strips["z_lo_bow"], strips["z_hi_bow"],
+                           strips["n_bow"], strips["x_bow"], strips["dx_bow"]))
+        if strips["n_hollow"] > 0:
+            groups.append((strips["slope_hollow"], strips["z_lo_hollow"], strips["z_hi_hollow"],
+                           strips["n_hollow"], strips["x_hollow"], strips["dx_hollow"]))
+
+        def tile(matrix, repeats: int):
+            if repeats == 1:
+                return matrix
+            if np.is_casadi_type(matrix, recursive=False):
+                import casadi as cas
+
+                return cas.repmat(matrix, 1, repeats)
+            return _onp.tile(matrix, (1, repeats))
+
+        def source_transform(kx_row, k_row, repeats: int = 1):
+            """
+            ``q = iint (df/dX) exp(-k depth) exp(-i kx X)`` in boatmath's frame (X
+            forward), for the distinct ``k_row`` repeated ``repeats`` times against
+            ``kx_row``: minus the conjugate of ``sum slope exp(k z - i kx x)``.
+            """
+            kx_row = _onp.reshape(kx_row, (1, -1))
+            k_row = _onp.reshape(k_row, (1, -1))
+            re = im = 0.0
+            for slope, z_lo, z_hi, n, x, dx in groups:
+                g = self._sum_groups(
+                    self._scale_rows(slope, self._depth_average(z_lo, z_hi, k_row)), n
+                )
+                g_re, g_im = self._strip_transform(tile(g, repeats), x, dx, kx_row, sign=-1.0)
+                re, im = re + g_re, im + g_im
+            return -re, im
+
+        gx, gw = _onp.polynomial.legendre.leggauss(8)
+
+        def panels(edges):
+            half = 0.5 * _onp.diff(edges)
+            mid = 0.5 * (edges[1:] + edges[:-1])
+            return (
+                (mid[:, None] + half[:, None] * gx[None, :]).reshape(-1),
+                (half[:, None] * gw[None, :]).reshape(-1),
+            )
+
+        def taper(k):
+            a = 0.6 * k_cap
+            s_ = _onp.clip((k - a) / (k_cap - a), 0.0, 1.0)
+            return _onp.where(k >= k_cap, 0.0, _onp.cos(0.5 * _onp.pi * s_) ** 2)
+
+        ### Principal-value part: every (theta, k) node, and the pole's node per theta.
+        k_lo = 0.05 / self.length
+        n_log = 12 * level
+        k_nodes, k_weights = panels(
+            _onp.concatenate([[0.0], k_lo * (k_cap / k_lo) ** (_onp.arange(n_log + 1) / n_log)])
+        )
+        theta, theta_w = panels(_onp.linspace(0.0, _onp.pi / 2, 24 * level + 1))
+        sec, sin_t, cos_t = 1.0 / _onp.cos(theta), _onp.sin(theta), _onp.cos(theta)
+        k0 = nu * sec**2
+        pref = 2.0 * velocity * nu / _onp.pi**2
+        n_k, n_t = len(k_nodes), len(theta)
+
+        d = k_nodes[None, :] - k0[:, None]  # (theta, k)
+        live = _onp.abs(d) > 1e-9 * k0[:, None]
+        inv_d = _onp.where(live, 1.0 / _onp.where(live, d, 1.0), 0.0)
+        w_grid = (
+            theta_w[:, None] * pref * sec[:, None]
+            * (k_nodes * taper(k_nodes) * k_weights)[None, :] * inv_d
+        )
+        kx_grid = cos_t[:, None] * k_nodes[None, :]
+        ky_grid = sin_t[:, None] * k_nodes[None, :]
+        q_re, q_im = source_transform(kx_grid.reshape(-1), k_nodes, repeats=n_t)
+        w_flat = w_grid.reshape(1, -1)
+        # c = (-i q) w
+        sets = [(kx_grid.reshape(-1), ky_grid.reshape(-1), _onp.tile(k_nodes, n_t),
+                 q_im * w_flat, -q_re * w_flat)]
+
+        pole = (taper(k0) > 0.0) & (k0 < k_cap)
+        if _onp.any(pole):
+            sum_w = _onp.sum(k_weights[None, :] * inv_d, axis=1)
+            w0 = (
+                theta_w * pref * sec * k0 * taper(k0)
+                * (_onp.log(_onp.where(pole, (k_cap - k0) / k0, 1.0)) - sum_w)
+            )[pole]
+            q_re, q_im = source_transform((k0 * cos_t)[pole], k0[pole])
+            sets.append(((k0 * cos_t)[pole], (k0 * sin_t)[pole], k0[pole],
+                         q_im * w0.reshape(1, -1), -q_re * w0.reshape(1, -1)))
+
+        ### Half-residue on the dispersion curve: the radiated waves, astern.
+        theta_r = min(_onp.arccos(_onp.sqrt(min(nu / k_cap, 1.0))), _onp.pi / 2 - 1e-7)
+        rt, rw = panels(_onp.linspace(0.0, theta_r, 48 * level + 1))
+        r_sec = 1.0 / _onp.cos(rt)
+        r_k0 = nu * r_sec**2
+        w_res = (rw * (-2.0 * velocity * nu / _onp.pi) * r_sec * r_k0 * taper(r_k0)).reshape(1, -1)
+        q_re, q_im = source_transform(r_k0 * _onp.cos(rt), r_k0)
+        sets.append((r_k0 * _onp.cos(rt), r_k0 * _onp.sin(rt), r_k0, q_re * w_res, q_im * w_res))
+
+        def row(pieces):
+            return np.concatenate([np.reshape(v, (1, -1)) for v in pieces], axis=1)
+
+        return HullWaveField(
+            kx=_onp.concatenate([s_[0] for s_ in sets]),
+            ky=_onp.concatenate([s_[1] for s_ in sets]),
+            k=_onp.concatenate([s_[2] for s_ in sets]),
+            c_re=row([s_[3] for s_ in sets]),
+            c_im=row([s_[4] for s_ in sets]),
+            velocity=velocity,
+            gravity=gravity,
+            y_hulls=[0.0] if demihull_spacing is None
+            else [-0.5 * demihull_spacing, 0.5 * demihull_spacing],
+        )
+
     def pressure_load(
         self,
         perturbation_u,
@@ -1571,3 +1726,88 @@ class DynamicForceTable:
             "force_up": force,
             "moment_bow_up": moment + slope * (x_ref - x_table),
         }
+
+
+class HullWaveField:
+    """
+    The wave part of a hull's steady flow as a sum over wavenumber nodes (see
+    ``Hull.wave_field``). Points are in earth axes: ``x`` aft, ``y`` from the craft's
+    centreline, ``z`` up from the still water surface.
+    """
+
+    def __init__(self, kx, ky, k, c_re, c_im, velocity, gravity, y_hulls):
+        self.kx, self.ky, self.k = (_onp.asarray(v, dtype=float).reshape(1, -1) for v in (kx, ky, k))
+        self.c_re, self.c_im = c_re, c_im
+        self.velocity, self.gravity = velocity, gravity
+        self.y_hulls = list(y_hulls)
+
+    def _terms(self, x, y, z):
+        x, y, z = (np.reshape(v, (-1, 1)) for v in (x, y, z))
+        n_points = x.shape[0]
+        ones = _onp.ones((n_points, 1))
+        # boatmath's frame: X forward, depth down.
+        phase = (-x) @ self.kx
+        cos_p, sin_p = np.cos(phase), np.sin(phase)
+        decay = np.exp(np.fmin(z, 0.0) @ self.k)
+        c_re, c_im = ones @ self.c_re, ones @ self.c_im
+        across = across_slope = 0.0
+        for y_hull in self.y_hulls:
+            arg = (y - y_hull) @ self.ky
+            across = across + np.cos(arg)
+            across_slope = across_slope - (ones @ self.ky) * np.sin(arg)
+        phi_x = (c_re * cos_p - c_im * sin_p) * decay  # d(phi)/dX, per unit `across`
+        phi = (c_re * sin_p + c_im * cos_p) * decay / (ones @ self.kx)
+        return phi_x, phi, across, across_slope, ones
+
+    #: Numeric evaluations are done this many points at a time, to bound memory
+    #: (each point meets every wavenumber node).
+    chunk = 32
+
+    def _in_chunks(self, method, *coordinates):
+        """Evaluate a numeric many-point request piecewise; None if not applicable."""
+        if any(np.is_casadi_type(c, recursive=False) for c in coordinates) or np.is_casadi_type(
+            self.c_re, recursive=False
+        ):
+            return None
+        columns = [_onp.reshape(_onp.asarray(c, dtype=float), (-1, 1)) for c in coordinates]
+        n_points = max(c.shape[0] for c in columns)
+        if n_points <= self.chunk:
+            return None
+        columns = [c if c.shape[0] == n_points else _onp.full((n_points, 1), c[0, 0]) for c in columns]
+        pieces = [
+            method(*(c[i:i + self.chunk] for c in columns))
+            for i in range(0, n_points, self.chunk)
+        ]
+        if isinstance(pieces[0], tuple):
+            return tuple(_onp.concatenate([p[k] for p in pieces]) for k in range(len(pieces[0])))
+        return _onp.concatenate(pieces)
+
+    def elevation(self, x: Vectorizable, y: Vectorizable) -> Vectorizable:
+        """Wave elevation [m], positive up: ``(U / g) phi_X`` on the still surface."""
+        chunked = self._in_chunks(self.elevation, x, y)
+        if chunked is not None:
+            return chunked
+        phi_x, _, across, _, _ = self._terms(x, y, 0.0 * np.reshape(x, (-1, 1)))
+        return (self.velocity / self.gravity) * np.reshape(
+            np.sum(phi_x * across, axis=1), (-1, 1)
+        )
+
+    def induced_velocity(
+        self, x: Vectorizable, y: Vectorizable, z: Vectorizable
+    ) -> tuple[Vectorizable, Vectorizable, Vectorizable]:
+        """
+        Wave-induced flow ``(u, v, w)`` [m/s] at points at or below the surface: aft,
+        to starboard, and up.
+        """
+        chunked = self._in_chunks(self.induced_velocity, x, y, z)
+        if chunked is not None:
+            return chunked
+        phi_x, phi, across, across_slope, ones = self._terms(x, y, z)
+
+        def total(matrix):
+            return np.reshape(np.sum(matrix, axis=1), (-1, 1))
+
+        u = -total(phi_x * across)  # X runs forward, x aft
+        v = total(phi * across_slope)
+        w = total((ones @ self.k) * phi * across)  # d/d(depth) = -k; z up = -depth
+        return u, v, w
