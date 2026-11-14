@@ -83,6 +83,8 @@ class CraftBuildup(ExplicitAnalysis):
         demihull_spacing: float | None = None,
         include_transom_drag: bool = False,
         include_hull_dynamics: bool = True,
+        hull_dynamics: Any = None,
+        pitch_rate: Vectorizable = 0.0,
         include_interference_breakdown: bool = True,
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
@@ -122,6 +124,13 @@ class CraftBuildup(ExplicitAnalysis):
             boatmath's ``study --transom-drag``.
         include_hull_dynamics : Include the thin-ship dynamic sinkage force and trim
             moment of the hull's own pressure field in the balance.
+        hull_dynamics : A ``Hull.dynamic_force_table(...)`` for this speed (and
+            demihull spacing). The hull's dynamic force is then interpolated from it
+            instead of being integrated afresh, which makes each evaluation, and
+            above all each ``Opti`` solve, far cheaper in time and memory.
+        pitch_rate : Bow-up pitch rate about the centre of gravity [rad/s]. Seen by
+            the foils (quasi-steadily, as a change in local inflow), not by the hull.
+            Used by ``run_with_stability`` to find the foils' pitch damping.
         include_interference_breakdown : Also evaluate the hull's and the
             assembly's wave resistance alone (two more wave integrals), to report
             the interference between them.
@@ -158,6 +167,8 @@ class CraftBuildup(ExplicitAnalysis):
         self.demihull_spacing = demihull_spacing
         self.include_transom_drag = include_transom_drag
         self.include_hull_dynamics = include_hull_dynamics
+        self.hull_dynamics = hull_dynamics
+        self.pitch_rate = pitch_rate
         self.include_interference_breakdown = include_interference_breakdown
         self.wave_length_scales = wave_length_scales
         self.wave_reference_velocity = wave_reference_velocity
@@ -263,7 +274,11 @@ class CraftBuildup(ExplicitAnalysis):
         M_y = moment_about_cg(statics["x_cb"], statics["z_cb"], 0.0, buoyancy_hull)
 
         dynamic = None
-        if self.include_hull_dynamics:
+        if self.include_hull_dynamics and self.hull_dynamics is not None:
+            dynamic = self.hull_dynamics(self.sinkage, trim, pivot_xz=pivot, x_ref=x_cg)
+            F_z = F_z + dynamic["force_up"]
+            M_y = M_y + dynamic["moment_bow_up"]
+        elif self.include_hull_dynamics:
             dynamic = hull.dynamic_force(
                 velocity,
                 rho,
@@ -292,6 +307,7 @@ class CraftBuildup(ExplicitAnalysis):
                 water=water,
                 velocity=velocity,
                 alpha=trim,
+                q=self.pitch_rate,
                 surface_z=anchor[2] - z_anchor_earth,
             )
             options = dict(
@@ -394,6 +410,7 @@ class CraftBuildup(ExplicitAnalysis):
         self,
         d_sinkage: float = 2e-3,
         d_trim: float = 0.1,
+        d_pitch_rate: float = 0.01,
     ) -> dict[str, Any]:
         """
         ``run()``, plus the craft's static heave and pitch stiffness at this attitude
@@ -410,9 +427,16 @@ class CraftBuildup(ExplicitAnalysis):
           stability: positive is stable.
         - ``GM_L`` [m]: ``k_pitch / (m g)``, the effective longitudinal metacentric
           height at speed (at rest, the hydrostatic ``GM_L``).
+        - ``c_pitch_foils`` [N m s/rad]: the **foils' pitch damping**,
+          ``-dM_y/d(pitch rate)`` about the centre of gravity: the moment opposing a
+          pitching motion, from the change in each foil's inflow as it is carried up
+          and down (quasi-steady; it grows with the square of a foil's distance
+          from the centre of gravity, on either side of it).
 
-        This is *static* stability: whether a pitch disturbance is opposed. It says
-        nothing about damping or porpoising, which need the unsteady forces.
+        Limits: the stiffnesses are static. The damping is the foils' share only:
+        the hull's own pitch damping (wave radiation, and its lift at speed) and its
+        added inertia are not modelled, so this is what the foils *add*, not a
+        total, and no damping ratio or porpoising boundary can be derived from it.
         """
         import copy
 
@@ -427,6 +451,14 @@ class CraftBuildup(ExplicitAnalysis):
 
         sunk = nudged(d_sinkage, 0.0)
         pitched = nudged(0.0, d_trim)
+        if self.assembly is not None:
+            pitching = copy.copy(self)
+            pitching.pitch_rate = self.pitch_rate + d_pitch_rate
+            pitching.include_interference_breakdown = False
+            pitching = pitching.run()
+            c_pitch = -(pitching["M_y_net"] - base["M_y_net"]) / d_pitch_rate
+        else:
+            c_pitch = 0.0
         d_trim_rad = d_trim * _onp.pi / 180.0
 
         f_s = (sunk["F_z_net"] - base["F_z_net"]) / d_sinkage
@@ -440,6 +472,7 @@ class CraftBuildup(ExplicitAnalysis):
             k_pitch_fixed_heave=-m_t,
             k_pitch=k_pitch,
             GM_L=k_pitch / (self.mass * self.water.gravity),
+            c_pitch_foils=c_pitch,
             dFz_dtrim=f_t,
             dMy_dsinkage=m_s,
         )

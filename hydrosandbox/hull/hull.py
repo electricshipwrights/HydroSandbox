@@ -747,7 +747,11 @@ class Hull(AeroSandboxObject):
     def _waterline_half_breadths(self, sinkage, trim, pivot_xz):
         """Half-breadth of each station at the water surface, (n_stations, 1)."""
         cos, sin = np.cosd(trim), np.sind(trim)
-        z_w = pivot_xz[1] + (sinkage + (self.stations - pivot_xz[0]) * sin) / cos
+        # Hull-frame height of the water surface at each station: where
+        # z_earth = z_p - sinkage - (x - x_p) sin + (z - z_p) cos vanishes.
+        z_w = pivot_xz[1] + (
+            sinkage + (self.stations - pivot_xz[0]) * sin - pivot_xz[1]
+        ) / cos
         z_w = np.reshape(np.clip(z_w, self.levels[0], self.levels[-1]), (-1, 1))
         n_x, n_z = self.half_breadths.shape
         offset = z_w @ _onp.ones((1, n_z)) - _onp.ones((n_x, 1)) @ self.levels[None, :]
@@ -1071,4 +1075,152 @@ class Hull(AeroSandboxObject):
             "moment_bow_up": moment_local + moment_wave,
             "moment_local": moment_local,
             "moment_wave": moment_wave,
+        }
+
+    def dynamic_force_table(
+        self,
+        velocity: float,
+        density: float,
+        gravity: float = 9.80665,
+        sinkage_range: tuple[float, float] = (-0.15, 0.05),
+        trim_range: tuple[float, float] = (-2.0, 4.0),
+        n_sinkage: int = 9,
+        n_trim: int = 13,
+        pivot_xz: Sequence[float] | None = None,
+        demihull_spacing: float | None = None,
+        level: float = 1,
+        jobs: int | None = 1,
+    ) -> "DynamicForceTable":
+        """
+        Tabulate ``dynamic_force`` over a grid of attitudes at one speed, for reuse.
+
+        The hull's dynamic sinkage force and trim moment depend only on its own
+        attitude and speed, not on anything attached to it. Inside a design
+        optimization they are therefore the same smooth two-variable function at
+        every iteration, and by far the most expensive thing to rebuild and
+        differentiate. The returned table evaluates them by cubic B-spline
+        interpolation (numerically or symbolically), at any pivot and moment
+        reference; pass it to ``CraftBuildup(hull_dynamics=...)``.
+
+        Parameters
+        ----------
+        sinkage_range, trim_range : The attitudes covered [m], [deg]. Evaluations
+            outside are clamped to the edge, so make them generous.
+        pivot_xz : The point whose sinkage the table is indexed by (default: the
+            middle of the hull at the design waterline).
+        jobs : Worker processes for filling the table (``None``: all cores).
+        """
+        from hydrosandbox.parallel import parallel_map
+
+        if pivot_xz is None:
+            pivot_xz = (0.5 * float(self.stations[0] + self.stations[-1]), 0.0)
+        sinkages = _onp.linspace(sinkage_range[0], sinkage_range[1], n_sinkage)
+        trims = _onp.linspace(trim_range[0], trim_range[1], n_trim)
+        tasks = [
+            (self, float(velocity), float(density), gravity, float(s), float(t),
+             tuple(pivot_xz), level, demihull_spacing)
+            for t in trims
+            for s in sinkages
+        ]
+        values = parallel_map(_dynamic_force_point, tasks, jobs=jobs)
+        return DynamicForceTable(
+            sinkages=sinkages,
+            trims=trims,
+            force=_onp.array([v[0] for v in values]),
+            moment=_onp.array([v[1] for v in values]),
+            moment_slope=_onp.array([v[2] for v in values]),
+            pivot_xz=tuple(float(v) for v in pivot_xz),
+            velocity=float(velocity),
+        )
+
+
+def _dynamic_force_point(hull, velocity, density, gravity, sinkage, trim, pivot_xz, level, spacing):
+    """
+    One table entry: (force_up, moment_bow_up about the pivot, and the moment's
+    change per metre the reference is moved aft).
+    """
+    def at(x_ref):
+        return hull.dynamic_force(
+            velocity, density, gravity, sinkage, trim, pivot_xz, x_ref=x_ref,
+            level=level, demihull_spacing=spacing,
+        )
+
+    here, aft = at(pivot_xz[0]), at(pivot_xz[0] + 1.0)
+    return (
+        float(here["force_up"]),
+        float(here["moment_bow_up"]),
+        float(aft["moment_bow_up"]) - float(here["moment_bow_up"]),
+    )
+
+
+class DynamicForceTable:
+    """
+    A hull's dynamic sinkage force and trim moment at one speed, tabulated over
+    attitude (see ``Hull.dynamic_force_table``).
+    """
+
+    def __init__(self, sinkages, trims, force, moment, moment_slope, pivot_xz, velocity):
+        import casadi as cas
+
+        self.sinkages = _onp.asarray(sinkages, dtype=float)
+        self.trims = _onp.asarray(trims, dtype=float)
+        self.force = _onp.asarray(force, dtype=float)
+        self.moment = _onp.asarray(moment, dtype=float)
+        self.moment_slope = _onp.asarray(moment_slope, dtype=float)
+        self.pivot_xz = pivot_xz
+        self.velocity = velocity
+        grid = [self.sinkages.tolist(), self.trims.tolist()]
+        # Values are ordered with sinkage varying fastest, as CasADi expects.
+        self._force = cas.interpolant("hull_dynamic_force", "bspline", grid, self.force.tolist())
+        self._moment = cas.interpolant("hull_dynamic_moment", "bspline", grid, self.moment.tolist())
+        self._slope = cas.interpolant(
+            "hull_dynamic_moment_slope", "bspline", grid, self.moment_slope.tolist()
+        )
+
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+    def __setstate__(self, state):
+        self.__init__(**state)
+
+    def __call__(
+        self,
+        sinkage: Vectorizable,
+        trim: Vectorizable,
+        pivot_xz: Sequence[Vectorizable] | None = None,
+        x_ref: Vectorizable | None = None,
+    ) -> dict[str, Vectorizable]:
+        """
+        ``force_up`` [N] and ``moment_bow_up`` [N m] for a hull whose ``pivot_xz``
+        has sunk by ``sinkage`` and which is trimmed ``trim`` [deg] about it, the
+        moment taken about earth-axes ``x_ref`` (default: the pivot).
+        """
+        import casadi as cas
+
+        x0, z0 = self.pivot_xz
+        if pivot_xz is None:
+            pivot_xz = self.pivot_xz
+        if x_ref is None:
+            x_ref = pivot_xz[0]
+        cos, sin = np.cosd(trim), np.sind(trim)
+        # The table's own pivot, carried by this pose: how far it has sunk, and where
+        # it now is along the track.
+        sinkage_table = sinkage + (x0 - pivot_xz[0]) * sin + (z0 - pivot_xz[1]) * (1.0 - cos)
+        x_table = pivot_xz[0] + (x0 - pivot_xz[0]) * cos + (z0 - pivot_xz[1]) * sin
+        s_clamped = np.clip(sinkage_table, self.sinkages[0], self.sinkages[-1])
+        t_clamped = np.clip(trim, self.trims[0], self.trims[-1])
+        symbolic = np.is_casadi_type(s_clamped, recursive=False) or np.is_casadi_type(
+            t_clamped, recursive=False
+        )
+        point = cas.vertcat(s_clamped, t_clamped)
+        force, moment, slope = self._force(point), self._moment(point), self._slope(point)
+        if not symbolic:
+            force, moment, slope = float(force), float(moment), float(slope)
+        # The moment is exactly linear in its reference. Its slope is the force for a
+        # hull that closes aft; with an immersed transom the wave part of the moment
+        # adds to it (the closing hollow radiates but carries no pressure), so the
+        # slope is tabulated rather than assumed.
+        return {
+            "force_up": force,
+            "moment_bow_up": moment + slope * (x_ref - x_table),
         }
