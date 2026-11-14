@@ -41,3 +41,20 @@ def test_parallel_map_reports_progress(capsys):
     parallel_map(math.sqrt, [4.0, 9.0], jobs=1, progress=True, labels=["first", "second"])
     err = capsys.readouterr().err
     assert "[1/2] done: first" in err and "[2/2] done: second" in err
+
+
+def test_parallel_map_jobs_one_pins_thread_vars_and_restores_env():
+    before = os.environ.get("OPENBLAS_NUM_THREADS")
+    seen = parallel_map(
+        str,
+        [1],
+        jobs=1,
+    )
+    assert seen == ["1"]
+    seen_vars = parallel_map(
+        os.environ.get,
+        ["OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"],
+        jobs=1,
+    )
+    assert seen_vars == ["1", "1"]
+    assert os.environ.get("OPENBLAS_NUM_THREADS") == before

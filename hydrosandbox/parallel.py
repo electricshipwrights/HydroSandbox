@@ -93,23 +93,23 @@ def parallel_map(
                 flush=True,
             )
 
-    if jobs == 1:
-        results = []
-        for index, task in enumerate(tasks):
-            results.append(_call((function, task)))
-            report(index + 1, index, results[-1])
-        return results
-
     saved = {name: os.environ.get(name) for name in _THREAD_VARIABLES}
     os.environ.update({name: "1" for name in _THREAD_VARIABLES})
     try:
+        if jobs == 1:
+            results = []
+            for index, task in enumerate(tasks):
+                results.append(_call((function, task)))
+                report(index + 1, index, results[-1])
+            return results
+
         context = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
             futures = {
                 pool.submit(_call, (function, task)): index
                 for index, task in enumerate(tasks)
             }
-            results: list[Any] = [None] * n_total
+            results = [None] * n_total
             for n_done, future in enumerate(as_completed(futures), start=1):
                 index = futures[future]
                 results[index] = future.result()
