@@ -54,10 +54,80 @@ def build_assembly(
     design: dict,
     stabilizer: bool,
     strut_freeboard: float = 0.25,
+    layout: str = "centreline",
+    hull: Hull | None = None,
+    demihull_spacing: float | None = None,
 ) -> hsb.HydrofoilAssembly:
-    """A main T-foil and, optionally, a stabilizer T-foil, from design variables."""
+    """
+    The foils, from design variables.
+
+    ``layout="centreline"``: a main T-foil on the craft's centreline, its strut
+    running up through the waterline (and, optionally, a stabilizer T-foil).
+
+    For a catamaran (``hull`` is a demihull, ``demihull_spacing`` apart):
+
+    - ``layout="pi"``: one foil spanning from hull to hull, on two struts, one
+      under each demihull. Its span is the hull spacing.
+    - ``layout="twin"``: a T-foil under each demihull, each on its own strut.
+
+    In both, each strut runs from the foil up to that hull's keel.
+    """
     main_airfoil = asb.Airfoil("naca2412")
     strut_airfoil = asb.Airfoil("naca0012")
+
+    if layout in ("pi", "twin"):
+        x, depth = design["x_main"], design["depth_main"]
+        root_chord = design["root_chord_main"]
+        tip_chord = design["taper_main"] * root_chord
+        incidence = design["incidence_main"]
+        y_hull = 0.5 * demihull_spacing
+        sweep = 0.25 * (root_chord - tip_chord)
+
+        def section(x_le, y, chord):
+            return asb.WingXSec(
+                xyz_le=[x_le, y, -depth], chord=chord, twist=incidence, airfoil=main_airfoil
+            )
+
+        if layout == "pi":
+            # Root chord on the centreline, tip chord where the foil meets each strut.
+            foils = [
+                hsb.Foil(
+                    name="Main foil",
+                    symmetric=True,
+                    role="main",
+                    xsecs=[section(x, 0.0, root_chord), section(x + sweep, y_hull, tip_chord)],
+                )
+            ]
+            strut_chord, x_strut = 0.8 * tip_chord, x + sweep + 0.1 * tip_chord
+        else:
+            half_span = design["half_span_main"]
+            foils = [
+                hsb.Foil(
+                    name=f"{side} foil",
+                    symmetric=False,
+                    role="main",
+                    xsecs=[
+                        section(x + sweep, y - half_span, tip_chord),
+                        section(x, y, root_chord),
+                        section(x + sweep, y + half_span, tip_chord),
+                    ],
+                )
+                for side, y in (("Starboard", y_hull), ("Port", -y_hull))
+            ]
+            strut_chord, x_strut = 0.8 * root_chord, x + 0.1 * root_chord
+        struts = [
+            hsb.Strut(
+                name="Hull struts",
+                symmetric=True,
+                xsecs=[
+                    asb.WingXSec(
+                        xyz_le=[x_strut, y_hull, z], chord=strut_chord, airfoil=strut_airfoil
+                    )
+                    for z in (-depth, hull.keel_height(x_strut))
+                ],
+            )
+        ]
+        return hsb.HydrofoilAssembly(name="Lift-assist foils", foils=foils, struts=struts)
 
     def t_foil(name, x, depth, half_span, root_chord, tip_chord, incidence, airfoil, role):
         foil = hsb.Foil(
@@ -115,9 +185,22 @@ def build_assembly(
     return hsb.HydrofoilAssembly(name="Lift-assist foils", foils=foils, struts=struts)
 
 
-def design_bounds(hull: Hull, stabilizer: bool) -> dict[str, tuple[float, float]]:
+def design_bounds(
+    hull: Hull, stabilizer: bool, layout: str = "centreline"
+) -> dict[str, tuple[float, float]]:
     x_bow, x_stern = float(hull.stations[0]), float(hull.stations[-1])
     length = x_stern - x_bow
+    if layout in ("pi", "twin"):
+        bounds = {
+            "x_main": (x_bow + 0.10 * length, x_bow + 0.95 * length),
+            "depth_main": (0.25, 0.80),
+            "root_chord_main": (0.05, 0.30),
+            "taper_main": (0.40, 1.00),
+            "incidence_main": (-3.0, 6.0),
+        }
+        if layout == "twin":
+            bounds["half_span_main"] = (0.15, 0.50)
+        return bounds
     bounds = {
         "x_main": (x_bow + 0.10 * length, x_bow + 0.95 * length),
         "depth_main": (0.20, 0.50),
@@ -182,6 +265,8 @@ def optimize(
     max_iterations: int = 120,
     craft_options: dict | None = None,
     bounds: dict[str, tuple[float, float]] | None = None,
+    layout: str = "centreline",
+    keel_clearance: float = 0.10,
     objective: str = "drag",
     drag_cap: float | None = None,
     damping_floor: float | None = None,
@@ -196,7 +281,8 @@ def optimize(
     [m above the design waterline]. Each is fixed if None (thrust then acts through
     the centre of gravity). ``craft_options`` are further ``CraftBuildup`` arguments
     (e.g. ``demihull_spacing`` for a catamaran); ``bounds`` overrides entries of
-    ``design_bounds``.
+    ``design_bounds``. ``layout`` chooses the arrangement (see ``build_assembly``);
+    under-hull layouts keep the foil ``keel_clearance`` [m] below the keel above it.
 
     ``objective`` is what to optimize: ``"drag"`` (minimize it), ``"pitch_stiffness"``
     (maximize the heave-free pitch stiffness, as ``GM_L``) or ``"pitch_damping"``
@@ -218,9 +304,12 @@ def optimize(
         include_interference_breakdown=False,
     )
     common.update(craft_options or {})
+    layout_options = dict(
+        layout=layout, hull=hull, demihull_spacing=common.get("demihull_spacing")
+    )
     try:
         at_start = CraftBuildup.solve_equilibrium(
-            assembly=build_assembly(start, stabilizer) if with_foils else None,
+            assembly=build_assembly(start, stabilizer, **layout_options) if with_foils else None,
             mass=mass,
             xyz_cg=xyz_cg,
             xyz_thrust=thrust_start,
@@ -234,7 +323,10 @@ def optimize(
     if with_foils:
         design = {
             name: opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
-            for name, (lo, hi) in {**design_bounds(hull, stabilizer), **(bounds or {})}.items()
+            for name, (lo, hi) in {
+                **design_bounds(hull, stabilizer, layout), **(bounds or {})
+            }.items()
+            if name in design_bounds(hull, stabilizer, layout)
         }
     loading = {"x_cg": xyz_cg[0], "mass": mass, "thrust_height": None}
     if cg_range is not None:
@@ -271,7 +363,7 @@ def optimize(
         upper_bound=trim_bounds[1],
     )
 
-    assembly = build_assembly(design, stabilizer) if with_foils else None
+    assembly = build_assembly(design, stabilizer, **layout_options) if with_foils else None
     craft = CraftBuildup(
         assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading), **common
     )
@@ -291,10 +383,18 @@ def optimize(
         constraints += [
             foil["cavitation_margin"] >= 0.3,
             foil["ventilation_margin"] >= 0.1,
-            # Main foil: aspect ratio within a sensible structural limit.
-            2.0 * design["half_span_main"]
-            <= 10.0 * 0.5 * (1.0 + design["taper_main"]) * design["root_chord_main"],
         ]
+        if layout != "pi":
+            # A cantilevered foil: aspect ratio within a sensible structural limit.
+            constraints.append(
+                2.0 * design["half_span_main"]
+                <= 10.0 * 0.5 * (1.0 + design["taper_main"]) * design["root_chord_main"]
+            )
+        if layout in ("pi", "twin"):
+            # The foil stays clear below the hull above it.
+            constraints.append(
+                design["depth_main"] >= -hull.keel_height(design["x_main"]) + keel_clearance
+            )
         # Foil loading within stall limits.
         for wing, component in zip(assembly.wings, foil["wing_hydro_components"]):
             if not getattr(wing, "is_strut", False):
@@ -338,7 +438,7 @@ def optimize(
     solved_loading = {name: value(v) for name, v in loading.items()}
     # Re-evaluate numerically at the solution, with the interference breakdown.
     final = CraftBuildup(
-        assembly=build_assembly(solved, stabilizer) if with_foils else None,
+        assembly=build_assembly(solved, stabilizer, **layout_options) if with_foils else None,
         sinkage=float(sol(sinkage)),
         trim=float(sol(trim)),
         **craft_inputs(solved_loading),
