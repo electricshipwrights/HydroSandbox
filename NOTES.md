@@ -54,6 +54,10 @@ total mass 664 kg (two narrow Cal 20s), CG level at rest, Fn 0.30/0.45/0.60.
 Magnitudes sensible (R/W ~1.3% / 4.5% / 6.5%). Optimum blend: t~0.05 at Fn 0.3
 (Cal-ish), t~0.40 at Fn 0.45 and 0.6 (14% / 10% below the Cal 20 shape, both
 parents worse). t=0.80 fails to find equilibrium at the two higher speeds.
+Optimizer on the same family (`local/camber_cat_opt.py`, `optimize(...,
+cg_level_at_rest=True)`, blend_t free, starts t=0.1 and 0.8, ~160 s each, 3
+workers): t* = 0.034 / 0.37 / 0.406 at Fn 0.30 / 0.45 / 0.60, exact-blend drag
+within 0.2 N of the scan's best at every speed from both starts.
 
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family

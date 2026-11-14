@@ -522,6 +522,7 @@ def optimize(
     pod_start: tuple[float, float] | None = None,
     propeller_interaction: bool = True,
     blend_start: list[float] | None = None,
+    cg_level_at_rest: bool = False,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -572,6 +573,11 @@ def optimize(
     the family's polynomial interpolant; the solution is re-evaluated on the exact
     blend, swept from camber's blended control points, which is returned as
     ``"hull"`` with the weights as ``"blend_weights"``.
+
+    ``cg_level_at_rest=True`` puts the centre of gravity (fore and aft) wherever the
+    hull floats level at rest under ``mass``: at its centre of buoyancy at the
+    level sinkage that displaces it. The CG then follows the hull when the hull is a
+    variable (a blend), which ``xyz_cg[0]`` and ``cg_range`` are ignored for.
     """
     from hydrosandbox.hull.camber import HullFamily
 
@@ -579,6 +585,22 @@ def optimize(
     if family is not None:
         blend_start = list(blend_start) if blend_start is not None else [1.0 / family.n_hulls] * family.n_hulls
         hull = family.at(blend_start)
+    n_hulls = 1 if (craft_options or {}).get("demihull_spacing") is None else 2
+
+    def level_at_rest(h, m):
+        """Level sinkage at which hull(s) `h` displace mass `m`, and the LCB there."""
+        from scipy.optimize import brentq
+
+        volume = m / water.density() / n_hulls
+        s0 = brentq(
+            lambda s_: float(h.hydrostatics(s_, 0.0, (0.0, 0.0))["volume"]) - volume, -0.5, 0.5, xtol=1e-7
+        )
+        return s0, float(h.hydrostatics(s0, 0.0, (0.0, 0.0))["x_cb"])
+
+    if cg_level_at_rest:
+        rest_start, x_cg_start = level_at_rest(hull, mass)
+        xyz_cg = [x_cg_start, xyz_cg[1], xyz_cg[2]]
+        cg_range = None
     with_foils = start is not None
     with_assembly = with_foils or pods is not None
     n_pods = 0 if pods is None else (1 if (craft_options or {}).get("demihull_spacing") is None else 2)
@@ -749,6 +771,14 @@ def optimize(
             upper_bound=thrust_height_range[1],
         )
 
+    rest_constraints = []
+    if cg_level_at_rest:
+        rest_sinkage = opti.variable(init_guess=rest_start, lower_bound=-0.5, upper_bound=0.5)
+        at_rest = hull.hydrostatics(rest_sinkage, 0.0, (0.0, 0.0))
+        loading["x_cg"] = at_rest["x_cb"]
+        rest_constraints.append(
+            n_hulls * at_rest["volume"] * water.density() / loading["mass"] == 1.0
+        )
     sinkage = opti.variable(init_guess=at_start["sinkage"], lower_bound=-0.4, upper_bound=0.2)
     trim = opti.variable(
         init_guess=float(onp.clip(at_start["trim"], *trim_bounds)),
@@ -834,7 +864,7 @@ def optimize(
     constraints = [
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
-    ] + blend_constraints
+    ] + blend_constraints + rest_constraints
     if pods is not None:
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
@@ -937,6 +967,8 @@ def optimize(
         solved_weights = [w / sum(solved_weights) for w in solved_weights]
         hull = family.exact(solved_weights)
         exact_common = dict(exact_common, hull=hull)
+        if cg_level_at_rest:
+            solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
         layout_options["hull"] = hull
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
