@@ -271,3 +271,59 @@ def test_hydro_lifting_line_decomposition_cavitation_and_draw():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _rectangular_foil(z: float, airfoils=("naca2412", "naca2412"), x: float = 0.0):
+    return Foil(
+        name=f"Foil x={x}",
+        symmetric=False,
+        xsecs=[
+            asb.WingXSec(
+                xyz_le=[x, 0.0, z], chord=0.15, airfoil=asb.Airfoil(airfoils[0])
+            ),
+            asb.WingXSec(
+                xyz_le=[x, 0.9, z], chord=0.15, airfoil=asb.Airfoil(airfoils[1])
+            ),
+        ],
+    )
+
+
+def test_vlm_cavitation_margin_is_mesh_convergent():
+    """Suction peak must not track the (singular) leading-edge panel loading."""
+    assembly = HydrofoilAssembly(foils=[_rectangular_foil(z=-0.6)])
+    op = HydroOperatingPoint(velocity=10.0, alpha=3.0, surface_z=0.0)
+
+    v_inc = [
+        HydroVLM(
+            assembly=assembly,
+            op_point=op,
+            spanwise_resolution=6,
+            chordwise_resolution=n_c,
+        ).run()["V_cavitation_inception"]
+        for n_c in (4, 8, 16)
+    ]
+    assert abs(v_inc[1] - v_inc[0]) / v_inc[0] < 0.03
+    assert abs(v_inc[2] - v_inc[1]) / v_inc[1] < 0.015
+
+
+def test_vlm_panel_thickness_matches_each_foil():
+    """Panel t/c on each foil must come from that foil's own (blended) airfoils."""
+    pairs = [("naca0006", "naca0008"), ("naca0020", "naca0024"), ("naca0012", "naca0015")]
+    assembly = HydrofoilAssembly(
+        foils=[
+            _rectangular_foil(z=-0.6, airfoils=pair, x=float(i))
+            for i, pair in enumerate(pairs)
+        ]
+    )
+    op = HydroOperatingPoint(velocity=10.0, alpha=2.0, surface_z=0.0)
+    vlm = HydroVLM(
+        assembly=assembly, op_point=op, spanwise_resolution=4, chordwise_resolution=2
+    )
+    vlm.run()
+
+    tc_by_foil = vlm.panel_t_over_c.reshape(len(pairs), -1)
+    for tc, (root, tip) in zip(tc_by_foil, pairs):
+        tc_root = int(root[-2:]) / 100.0
+        tc_tip = int(tip[-2:]) / 100.0
+        assert np.all(np.diff(tc) >= -1e-12)
+        assert tc_root - 0.005 <= tc.min() and tc.max() <= tc_tip + 0.005

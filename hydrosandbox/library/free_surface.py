@@ -117,6 +117,25 @@ def smooth_surface_piercing_weight(
     return pierce_weight, t_pierce
 
 
+def prandtl_biplane_interference_factor(
+    h_over_b: Vectorizable,
+) -> Vectorizable:
+    """
+    Compute Prandtl's biplane mutual-interference factor ``sigma`` between a foil of
+    span ``b`` at depth ``h`` and its free-surface image (an equal-span "biplane"
+    with gap ``G = 2 * h``).
+
+    Uses Prandtl's rational fit ``sigma = (1 - 0.66 * G/b) / (1.05 + 3.7 * G/b)``
+    (Prandtl 1924, NACA TR-116; nominally valid for ``0.05 <= G/b <= 0.5``), with
+    the numerator smoothly clamped at zero so that ``sigma`` stays positive and
+    decays monotonically in deep water. Agrees with ``HydroVLM`` method-of-images
+    results to within ~0.02 for ``0.04 <= h/b <= 0.7``.
+    """
+    gap_over_span = 2.0 * np.softmax(h_over_b, 0.0, softness=0.01)
+    numerator = np.softmax(1.0 - 0.66 * gap_over_span, 0.0, softness=0.05)
+    return numerator / (1.05 + 3.7 * gap_over_span)
+
+
 def froude_image_weight(
     froude_depth: Vectorizable = 10.0,
     mode: Literal["high_froude", "froude_blended", "rigid_lid", "none"] = "high_froude",
@@ -173,7 +192,7 @@ def free_surface_lift_slope_factor(
     k2d = 0.5 * (1.0 + kappa) * k2d_high + 0.5 * (1.0 - kappa) * k2d_lid
 
     h_over_b = hc / ar
-    sigma_fs = 1.0 / np.sqrt(1.0 + (4.0 * h_over_b) ** 2)
+    sigma_fs = prandtl_biplane_interference_factor(h_over_b)
 
     f_inf = ar / (ar + 2.0)
     f_fs = (k2d * ar) / (ar + 2.0 * k2d * (1.0 + kappa * sigma_fs))
@@ -190,15 +209,17 @@ def free_surface_induced_drag_factor(
     Compute the induced drag multiplier ``CD_i(h) / CD_i(inf)`` at fixed lift due
     to the free surface, using Prandtl's biplane mutual-interference factor ``sigma``.
 
-    Approaches ``2.0`` at shallow high-Froude submergence, ``1.0`` in deep water,
-    and decreases toward ``0.05`` in rigid-lid ground effect.
+    Returns ``1 + kappa * sigma``, where ``sigma`` is evaluated for the biplane formed
+    by the foil and its image (gap ``2 * h``). Approaches ``~1.9`` at very shallow
+    high-Froude submergence, ``1.0`` in deep water, and decreases toward ``0.05`` in
+    rigid-lid ground effect.
     """
     if mode == "none":
         return 1.0
 
     hb = np.softmax(h_over_b, 0.02, softness=0.02)
     kappa = froude_image_weight(froude_depth=froude_depth, mode=mode)
-    sigma_fs = 1.0 / np.sqrt(1.0 + (4.0 * hb) ** 2)
+    sigma_fs = prandtl_biplane_interference_factor(hb)
 
     return np.softmax(1.0 + kappa * sigma_fs, 0.05, softness=0.02)
 

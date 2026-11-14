@@ -159,3 +159,52 @@ def test_hydro_buildup_opti_mdo_convergence():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_buildup_free_surface_induced_drag_matches_vlm():
+    """
+    The buildup's free-surface induced-drag multiplier must track the method-of-images
+    VLM (which Prandtl's biplane factor reproduces) across submergence depths.
+    """
+    from hydrosandbox.hydrodynamics import HydroVLM
+    from hydrosandbox.library import free_surface_induced_drag_factor
+
+    span, chord = 0.9, 0.15
+
+    def assembly_at(z: float) -> HydrofoilAssembly:
+        airfoil = asb.Airfoil("naca2412")
+        return HydrofoilAssembly(
+            foils=[
+                Foil(
+                    symmetric=True,
+                    xsecs=[
+                        asb.WingXSec(xyz_le=[0.0, 0.0, z], chord=chord, airfoil=airfoil),
+                        asb.WingXSec(
+                            xyz_le=[0.0, span / 2.0, z], chord=chord, airfoil=airfoil
+                        ),
+                    ],
+                )
+            ]
+        )
+
+    def vlm_induced_drag_parameter(depth: float | None) -> float:
+        op = HydroOperatingPoint(
+            velocity=10.0, alpha=3.0, surface_z=None if depth is None else 0.0
+        )
+        res = HydroVLM(
+            assembly=assembly_at(-0.6 if depth is None else -depth),
+            op_point=op,
+            spanwise_resolution=8,
+            chordwise_resolution=6,
+        ).run()
+        return res["CD"] / res["CL"] ** 2
+
+    k_deep = vlm_induced_drag_parameter(None)
+    for h_over_b in (0.08, 0.17, 0.33, 0.67):
+        k_vlm = vlm_induced_drag_parameter(h_over_b * span) / k_deep
+        k_buildup = float(free_surface_induced_drag_factor(h_over_b=h_over_b))
+        assert k_buildup == pytest.approx(k_vlm, abs=0.05)
+
+    assert float(free_surface_induced_drag_factor(h_over_b=5.0)) == pytest.approx(
+        1.0, abs=1e-3
+    )
