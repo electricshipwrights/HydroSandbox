@@ -147,6 +147,32 @@ class _StepWriter:
         self.product_name = product_name
         self._next_id = 1
         self._lines: list[str] = []
+        self._colours: list[tuple[int, tuple[float, float, float]]] = []
+
+    def colour(self, item_id: int, rgb: tuple[float, float, float]) -> None:
+        """Give a solid or surface model a display colour (RGB, each 0 to 1)."""
+        self._colours.append((item_id, tuple(float(c) for c in rgb)))
+
+    def emit_sphere(self, name: str, centre: Any, radius: float) -> int:
+        """
+        Emit a solid sphere (metres) and return its ``MANIFOLD_SOLID_BREP`` id: one
+        spherical face, closed, bounded by a vertex loop at its pole.
+        """
+        centre_mm = 1000.0 * np.asarray(centre, dtype=float)
+        radius_mm = 1000.0 * float(radius)
+        placement = self.axis2_placement_3d(
+            self.cartesian_point(centre_mm), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0)
+        )
+        surface = self.add(f"SPHERICAL_SURFACE('',#{placement},{_fmt_real(radius_mm)})")
+        pole = self.add(
+            f"VERTEX_POINT('',#{self.cartesian_point(centre_mm + np.array([0.0, 0.0, radius_mm]))})"
+        )
+        loop = self.add(f"VERTEX_LOOP('',#{pole})")
+        bound = self.add(f"FACE_BOUND('',#{loop},.T.)")
+        face = self.add(f"ADVANCED_FACE('',(#{bound}),#{surface},.T.)")
+        shell = self.add(f"CLOSED_SHELL('',(#{face}))")
+        safe_name = name.replace("'", "")
+        return self.add(f"MANIFOLD_SOLID_BREP('{safe_name}',#{shell})")
 
     def add(self, body: str) -> int:
         eid = self._next_id
@@ -466,6 +492,22 @@ class _StepWriter:
                 self.add(
                     f"ADVANCED_BREP_SHAPE_REPRESENTATION('{safe_prod}',({items_str}),#{geom_ctx_id})"
                 ),
+            )
+        if self._colours:
+            styled = []
+            for item_id, (red, green, blue) in self._colours:
+                rgb = self.add(
+                    f"COLOUR_RGB('',{_fmt_real(red)},{_fmt_real(green)},{_fmt_real(blue)})"
+                )
+                fill_colour = self.add(f"FILL_AREA_STYLE_COLOUR('',#{rgb})")
+                fill = self.add(f"FILL_AREA_STYLE('',(#{fill_colour}))")
+                side = self.add(f"SURFACE_SIDE_STYLE('',(#{self.add(f'SURFACE_STYLE_FILL_AREA(#{fill})')}))")
+                usage = self.add(f"SURFACE_STYLE_USAGE(.BOTH.,#{side})")
+                assignment = self.add(f"PRESENTATION_STYLE_ASSIGNMENT((#{usage}))")
+                styled.append(self.add(f"STYLED_ITEM('colour',(#{assignment}),#{item_id})"))
+            self.add(
+                "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',"
+                f"({','.join(f'#{i}' for i in styled)}),#{geom_ctx_id})"
             )
         if surface_ids:
             items_str = ",".join([f"#{sid}" for sid in surface_ids] + [f"#{ax_id}"])
@@ -996,6 +1038,7 @@ def export_assembly_step(
     merge_symmetric_wings: bool = True,
     surface_shells: list[tuple[str, list[dict[str, Any]]]] | None = None,
     product_name: str | None = None,
+    markers: list[dict[str, Any]] | None = None,
 ) -> Path:
     """
     Export a ``HydrofoilAssembly`` (or ``Airplane``) to a watertight ISO 10303-21
@@ -1022,6 +1065,9 @@ def export_assembly_step(
             to write alongside (see ``export_craft_step``); ``assembly`` may then be
             None.
         product_name: Name of the STEP product (default: the assembly's name).
+        markers: Spheres to add as annotations, each a dict of ``name``, ``xyz``
+            [m], ``radius`` [m] and optionally ``rgb`` (each 0 to 1), e.g. to mark a
+            centre of gravity.
 
     Returns:
         Resolved ``Path`` of the written STEP file.
@@ -1100,6 +1146,12 @@ def export_assembly_step(
         )
         solid_ids.append(sid_f)
 
+    for marker in markers or []:
+        marker_id = writer.emit_sphere(marker["name"], marker["xyz"], marker["radius"])
+        if marker.get("rgb") is not None:
+            writer.colour(marker_id, marker["rgb"])
+        solid_ids.append(marker_id)
+
     surface_ids = [
         writer.emit_surface_shell(shell_name, patches)
         for shell_name, patches in (surface_shells or [])
@@ -1118,6 +1170,8 @@ def export_craft_step(
     assembly: Any = None,
     demihull_spacing: float | None = None,
     name: str | None = None,
+    xyz_cg: Any = None,
+    cg_marker_radius: float = 0.05,
     **assembly_options,
 ) -> Path:
     """
@@ -1131,6 +1185,9 @@ def export_craft_step(
     the ``Hull`` was read from B-spline geometry, otherwise its offsets table as
     bilinear patches. With ``demihull_spacing`` the hull is placed twice, centred
     ``spacing / 2`` either side of ``y = 0``, the second mirrored.
+
+    ``xyz_cg`` [m], if given, is marked by a red sphere of ``cg_marker_radius`` [m]
+    named "Centre of gravity".
     """
     patches = hull.surface_patches()
 
@@ -1155,5 +1212,17 @@ def export_craft_step(
         filename=filename,
         surface_shells=shells,
         product_name=name or getattr(assembly, "name", None) or hull_name,
+        markers=(
+            None
+            if xyz_cg is None
+            else [
+                {
+                    "name": "Centre of gravity",
+                    "xyz": [float(v) for v in xyz_cg],
+                    "radius": cg_marker_radius,
+                    "rgb": (1.0, 0.0, 0.0),
+                }
+            ]
+        ),
         **assembly_options,
     )
