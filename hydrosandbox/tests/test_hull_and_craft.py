@@ -995,3 +995,135 @@ def test_keel_height_and_under_hull_foil_layouts():
         if not getattr(w, "is_strut", False)
     ]
     assert lifts[0] > 0.0 and lifts[0] == pytest.approx(lifts[1], rel=1e-6)
+
+
+def test_wave_amplitude_table_reproduces_direct_evaluation_and_interference():
+    import pickle
+
+    hull = _transom_hull()
+    water = hsb.Water.seawater()
+    u, rho = 3.5, water.density()
+    mass = 0.9 * scalar(hull.hydrostatics()["volume"]) * rho
+    scales = hull.default_wave_length_scales()
+
+    wave_table = hull.wave_amplitude_table(
+        u, water.gravity, length_scales=scales,
+        sinkage_range=(-0.06, 0.06), trim_range=(-1.0, 3.0), n_sinkage=7, n_trim=9,
+    )
+    wave_table = pickle.loads(pickle.dumps(wave_table))
+    dyn_table = hull.dynamic_force_table(
+        u, rho, sinkage_range=(-0.06, 0.06), trim_range=(-1.0, 3.0), n_sinkage=7, n_trim=9,
+    )
+
+    # Numerically reproduces bare hull and foil-hull interference across attitudes and shifted pivots.
+    for sinkage, trim, cg in [
+        (0.013, 1.7, [0.6, 0.0, 0.2]),
+        (-0.022, 0.4, [-0.3, 0.0, 0.0]),
+        (0.031, 2.6, [0.9, 0.0, 0.1]),
+    ]:
+        common = dict(
+            hull=hull, assembly=_t_foil(0.8), velocity=u, mass=mass, xyz_cg=cg,
+            water=water, sinkage=sinkage, trim=trim, wave_length_scales=scales,
+            include_interference_breakdown=True,
+        )
+        direct = CraftBuildup(**common).run()
+        tabled = CraftBuildup(
+            hull_dynamics=dyn_table, hull_wave_amplitude=wave_table, **common
+        ).run()
+        assert scalar(tabled["D_wave_hull_alone"]) == pytest.approx(
+            scalar(direct["D_wave_hull_alone"]), rel=2e-2
+        )
+        assert scalar(tabled["D_wave"]) == pytest.approx(scalar(direct["D_wave"]), rel=2e-2)
+        assert scalar(tabled["D_wave_interference"]) == pytest.approx(
+            scalar(direct["D_wave_interference"]), rel=5e-2, abs=0.5
+        )
+
+    # Catamaran spacing matches direct evaluation.
+    cat_scales = hull.default_wave_length_scales(demihull_spacing=2.0)
+    cat_table = hull.wave_amplitude_table(
+        u, water.gravity, length_scales=cat_scales,
+        sinkage_range=(-0.06, 0.06), trim_range=(-1.0, 3.0), n_sinkage=7, n_trim=9,
+        demihull_spacing=2.0,
+    )
+    cat_common = dict(
+        hull=hull, assembly=_t_foil(0.8), velocity=u, mass=2.0 * mass, xyz_cg=[0.4, 0.0, 0.1],
+        water=water, sinkage=0.01, trim=1.2, demihull_spacing=2.0,
+        wave_length_scales=cat_scales, include_interference_breakdown=False,
+        include_hull_dynamics=False,
+    )
+    cat_direct = CraftBuildup(**cat_common).run()
+    cat_tabled = CraftBuildup(hull_wave_amplitude=cat_table, **cat_common).run()
+    assert scalar(cat_tabled["D_wave"]) == pytest.approx(scalar(cat_direct["D_wave"]), rel=2e-2)
+
+    # Symbolic Opti equilibrium solve matches direct CraftBuildup.solve_equilibrium.
+    ref = CraftBuildup.solve_equilibrium(
+        hull=hull, assembly=_t_foil(0.2), velocity=u, mass=mass, xyz_cg=[-0.3, 0.0, 0.1],
+        water=water, wave_length_scales=scales, include_interference_breakdown=False,
+    )
+    opti = asb.Opti()
+    s_var = opti.variable(init_guess=0.0, lower_bound=-0.06, upper_bound=0.06)
+    t_var = opti.variable(init_guess=0.0, lower_bound=-1.0, upper_bound=3.0)
+    sym = CraftBuildup(
+        hull=hull, assembly=_t_foil(0.2), velocity=u, mass=mass, xyz_cg=[-0.3, 0.0, 0.1],
+        water=water, sinkage=s_var, trim=t_var, wave_length_scales=scales,
+        hull_dynamics=dyn_table, hull_wave_amplitude=wave_table,
+        include_interference_breakdown=False,
+    ).run()
+    weight = mass * G
+    opti.subject_to([sym["F_z_net"] / weight == 0.0, sym["M_y_net"] / (weight * hull.length) == 0.0])
+    opti.minimize(0)
+    sol = opti.solve(verbose=False, options={"ipopt.hessian_approximation": "limited-memory"})
+    assert float(sol(s_var)) == pytest.approx(ref["sinkage"], abs=1e-3)
+    assert float(sol(t_var)) == pytest.approx(ref["trim"], abs=5e-2)
+
+    # Stability quantities (GM_L, k_heave) from tabled run_with_stability match direct evaluation.
+    stab_common = dict(
+        hull=hull, assembly=_t_foil(0.2), velocity=u, mass=mass, xyz_cg=[-0.3, 0.0, 0.1],
+        water=water, sinkage=0.01, trim=1.2, wave_length_scales=scales,
+        include_interference_breakdown=False,
+    )
+    stab_direct = CraftBuildup(**stab_common).run_with_stability(include_pitch_damping=False)
+    stab_tabled = CraftBuildup(
+        hull_dynamics=dyn_table, hull_wave_amplitude=wave_table, **stab_common
+    ).run_with_stability(include_pitch_damping=False)
+    assert scalar(stab_tabled["GM_L"]) == pytest.approx(scalar(stab_direct["GM_L"]), rel=3e-2)
+    assert scalar(stab_tabled["k_heave"]) == pytest.approx(scalar(stab_direct["k_heave"]), rel=3e-2)
+
+    # Hull.dynamic_force exposes exact moment_slope == d(moment_bow_up)/dx_ref (mono and cat).
+    for spacing in (None, 2.0):
+        h_here = hull.dynamic_force(u, rho, G, 0.013, 1.7, (0.6, 0.2), x_ref=0.6, demihull_spacing=spacing)
+        h_aft = hull.dynamic_force(u, rho, G, 0.013, 1.7, (0.6, 0.2), x_ref=1.6, demihull_spacing=spacing)
+        assert scalar(h_here["moment_slope"]) == pytest.approx(
+            scalar(h_aft["moment_bow_up"]) - scalar(h_here["moment_bow_up"]), rel=1e-12
+        )
+
+
+def test_run_with_stability_hull_reuse_and_optional_pitch_damping():
+    import casadi as cas
+
+    water, hull, mass = _small_craft()
+    common = dict(
+        hull=hull, velocity=4.0, mass=mass, xyz_cg=[0.0, 0.0, 0.1],
+        assembly=_t_foil(1.2), water=water, include_interference_breakdown=False,
+    )
+    craft_num = CraftBuildup(sinkage=-0.01, trim=1.2, **common)
+    with_damp = craft_num.run_with_stability(include_pitch_damping=True)
+    no_damp = craft_num.run_with_stability(include_pitch_damping=False)
+    assert scalar(with_damp["c_pitch_foils"]) > 0.0
+    assert no_damp["c_pitch_foils"] is None
+    assert scalar(no_damp["GM_L"]) == pytest.approx(scalar(with_damp["GM_L"]), rel=1e-12)
+    assert scalar(no_damp["k_heave"]) == pytest.approx(scalar(with_damp["k_heave"]), rel=1e-12)
+
+    s_sym, t_sym = cas.MX.sym("s"), cas.MX.sym("t")
+    sym_craft = CraftBuildup(sinkage=s_sym, trim=t_sym, **common)
+    sym_with = sym_craft.run_with_stability(include_pitch_damping=True)
+    sym_no = sym_craft.run_with_stability(include_pitch_damping=False)
+    assert sym_no["c_pitch_foils"] is None
+    fn = cas.Function(
+        "stab_cmp",
+        [s_sym, t_sym],
+        [sym_with["GM_L"], sym_no["GM_L"], sym_with["c_pitch_foils"]],
+    )
+    gml_a, gml_b, c_pitch = (float(x) for x in fn(-0.01, 1.2))
+    assert gml_a == pytest.approx(gml_b, rel=1e-12)
+    assert c_pitch == pytest.approx(scalar(with_damp["c_pitch_foils"]), rel=1e-9)

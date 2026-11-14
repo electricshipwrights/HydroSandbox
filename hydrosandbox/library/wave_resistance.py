@@ -333,78 +333,110 @@ def kelvin_wave_resistance(
         extra_re = np.reshape(extra_re, (1, -1))
         extra_im = np.reshape(extra_im, (1, -1))
     else:
-        extra_re = extra_im = 0.0
+        extra_re = extra_im = None
     has_elements = q_row is not None or fy_row is not None or fz_row is not None
+    smear_col = (
+        0.5 * _column(smear_length)
+        if smear_length is not None and has_elements
+        else None
+    )
 
-    ### Streamwise smearing: uniform over `smear_length` -> sinc(kx * c / 2)
-    if smear_length is not None and has_elements:
-        arg = outer(0.5 * _column(smear_length), kx)
-        arg_safe = np.where(np.fabs(arg) < 1e-6, 1.0, arg)
-        smear = np.where(np.fabs(arg) < 1e-6, 1.0, np.sin(arg_safe) / arg_safe)
-    else:
-        smear = 1.0
+    def _eval_wave_chunk(kx_c, kappa_c, ky_c, lam_c, s_c, w_c, ex_re_c, ex_im_c):
+        ### Streamwise smearing: uniform over `smear_length` -> sinc(kx * c / 2)
+        if smear_col is not None:
+            arg = outer(smear_col, kx_c)
+            arg_safe = np.where(np.fabs(arg) < 1e-6, 1.0, arg)
+            smear = np.where(np.fabs(arg) < 1e-6, 1.0, np.sin(arg_safe) / arg_safe)
+        else:
+            smear = 1.0
 
-    if has_elements:
-        re_a = outer(za, kappa)
-        re_b = outer(zb, kappa)
-        d_re = re_b - re_a
-        px_a = outer(xa, kx)
-        px_b = outer(xb, kx)
-        py_a = outer(ya, ky)
-        py_b = outer(yb, ky)
-        exp_a = np.exp(re_a)
-        exp_b = np.exp(re_b)
-
-    def segment_transform(sign: float):
-        """
-        E = int_0^1 exp(w(t)) dt along each segment, w = kappa*z - i(kx*x +/- ky*y),
-        returned as (real, imag) (N x M) matrices: (e^wb - e^wa) / (wb - wa).
-        """
-        im_a = -(px_a + sign * py_a)
-        im_b = -(px_b + sign * py_b)
-        d_im = im_b - im_a
-
-        num_re = exp_b * np.cos(im_b) - exp_a * np.cos(im_a)
-        num_im = exp_b * np.sin(im_b) - exp_a * np.sin(im_a)
-        mag2 = d_re**2 + d_im**2
-        small = mag2 < 1e-8
-        mag2_safe = np.where(small, 1.0, mag2)
-
-        e_re = (num_re * d_re + num_im * d_im) / mag2_safe
-        e_im = (num_im * d_re - num_re * d_im) / mag2_safe
-
-        # Degenerate (constant-phase) limit: exp(w_mid).
-        exp_mid = np.exp(0.5 * (re_a + re_b))
-        im_mid = 0.5 * (im_a + im_b)
-        e_re = np.where(small, exp_mid * np.cos(im_mid), e_re) * smear
-        e_im = np.where(small, exp_mid * np.sin(im_mid), e_im) * smear
-        return e_re, e_im
-
-    integrand = 0.0
-    for sign in (1.0, -1.0):
-        b_re = extra_re
-        b_im = extra_im
         if has_elements:
-            e_re, e_im = segment_transform(sign)
-        if q_row is not None:
-            b_re = b_re + q_row @ e_re
-            b_im = b_im + q_row @ e_im
-        if fz_row is not None:
-            # i * lambda * F_z / (rho U) * E
-            coeff = lam / (density * velocity)
-            b_re = b_re - coeff * (fz_row @ e_im)
-            b_im = b_im + coeff * (fz_row @ e_re)
-        if fy_row is not None:
-            # +/- sqrt(lambda^2 - 1) * F_y / (rho U) * E
-            coeff = sign * s / (density * velocity)
-            b_re = b_re + coeff * (fy_row @ e_re)
-            b_im = b_im + coeff * (fy_row @ e_im)
-        integrand = integrand + 0.5 * (b_re**2 + b_im**2)
+            re_a = outer(za, kappa_c)
+            re_b = outer(zb, kappa_c)
+            d_re = re_b - re_a
+            px_a = outer(xa, kx_c)
+            px_b = outer(xb, kx_c)
+            py_a = outer(ya, ky_c)
+            py_b = outer(yb, ky_c)
+            exp_a = np.exp(re_a)
+            exp_b = np.exp(re_b)
+
+        def segment_transform(sign: float):
+            """
+            E = int_0^1 exp(w(t)) dt along each segment, w = kappa*z - i(kx*x +/- ky*y),
+            returned as (real, imag) (N x M) matrices: (e^wb - e^wa) / (wb - wa).
+            """
+            im_a = -(px_a + sign * py_a)
+            im_b = -(px_b + sign * py_b)
+            d_im = im_b - im_a
+
+            num_re = exp_b * np.cos(im_b) - exp_a * np.cos(im_a)
+            num_im = exp_b * np.sin(im_b) - exp_a * np.sin(im_a)
+            mag2 = d_re**2 + d_im**2
+            small = mag2 < 1e-8
+            mag2_safe = np.where(small, 1.0, mag2)
+
+            e_re = (num_re * d_re + num_im * d_im) / mag2_safe
+            e_im = (num_im * d_re - num_re * d_im) / mag2_safe
+
+            # Degenerate (constant-phase) limit: exp(w_mid).
+            exp_mid = np.exp(0.5 * (re_a + re_b))
+            im_mid = 0.5 * (im_a + im_b)
+            e_re = np.where(small, exp_mid * np.cos(im_mid), e_re) * smear
+            e_im = np.where(small, exp_mid * np.sin(im_mid), e_im) * smear
+            return e_re, e_im
+
+        integrand = 0.0
+        for sign in (1.0, -1.0):
+            b_re = 0.0 if ex_re_c is None else ex_re_c
+            b_im = 0.0 if ex_im_c is None else ex_im_c
+            if has_elements:
+                e_re, e_im = segment_transform(sign)
+            if q_row is not None:
+                b_re = b_re + q_row @ e_re
+                b_im = b_im + q_row @ e_im
+            if fz_row is not None:
+                # i * lambda * F_z / (rho U) * E
+                coeff = lam_c / (density * velocity)
+                b_re = b_re - coeff * (fz_row @ e_im)
+                b_im = b_im + coeff * (fz_row @ e_re)
+            if fy_row is not None:
+                # +/- sqrt(lambda^2 - 1) * F_y / (rho U) * E
+                coeff = sign * s_c / (density * velocity)
+                b_re = b_re + coeff * (fy_row @ e_re)
+                b_im = b_im + coeff * (fy_row @ e_im)
+            integrand = integrand + 0.5 * (b_re**2 + b_im**2)
+
+        return np.sum(integrand * lam_c * w_c)
 
     # R = (4 rho g^2 / (pi U^2)) * int |A|^2 sec^3 dtheta, with A = B / (2U) and
     # sec^3(theta) dtheta = lambda * d(tan theta) = lambda * dsigma / sqrt(nu).
-    integral = np.sum(integrand * lam * weights) / np.sqrt(nu)
-    return density * gravity**2 / (np.pi * velocity**4) * integral
+    m = sigma.shape[1]
+    is_sym_elements = (
+        has_elements
+        and m > 256
+        and any(
+            v is not None and np.is_casadi_type(v, recursive=False)
+            for v in (xa, ya, za, xb, yb, zb, q_row, fy_row, fz_row, smear_col, velocity, density)
+        )
+    )
+    if is_sym_elements:
+        integral = 0.0
+        for s0 in range(0, m, 256):
+            s1 = min(s0 + 256, m)
+            integral = integral + _eval_wave_chunk(
+                kx[:, s0:s1],
+                kappa[:, s0:s1],
+                ky[:, s0:s1],
+                lam[:, s0:s1],
+                s[:, s0:s1],
+                weights[:, s0:s1],
+                None if extra_re is None else extra_re[:, s0:s1],
+                None if extra_im is None else extra_im[:, s0:s1],
+            )
+    else:
+        integral = _eval_wave_chunk(kx, kappa, ky, lam, s, weights, extra_re, extra_im)
+    return density * gravity**2 / (np.pi * velocity**4) * (integral / np.sqrt(nu))
 
 
 def wing_thickness_wave_sources(
