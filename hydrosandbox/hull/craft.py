@@ -93,6 +93,7 @@ class CraftBuildup(ExplicitAnalysis):
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
         buildup_options: dict[str, Any] | None = None,
+        inflow_perturbation: Any = None,
         thrust_deduction: Vectorizable = 0.0,
         squat_level: float = 1,
     ):
@@ -168,6 +169,10 @@ class CraftBuildup(ExplicitAnalysis):
         wave_reference_velocity : Numeric speed for sizing the wave quadrature
             when ``velocity`` is symbolic.
         buildup_options : Extra keyword arguments for ``HydroBuildup``.
+        inflow_perturbation : Optional callable ``(x, y, z) -> [u, v, w]``: a further
+            steady flow [m/s] at points on the foils, both in geometry axes, added
+            to the hull's (e.g. a propeller's, from
+            ``hydrosandbox.propulsion.interaction.actuator_disc_velocity``).
         """
         super().__init__()
         self.hull = hull
@@ -205,6 +210,7 @@ class CraftBuildup(ExplicitAnalysis):
         self.wave_length_scales = wave_length_scales
         self.wave_reference_velocity = wave_reference_velocity
         self.buildup_options = buildup_options or {}
+        self.inflow_perturbation = inflow_perturbation
         self.thrust_deduction = thrust_deduction
         self.squat_level = squat_level
 
@@ -428,8 +434,21 @@ class CraftBuildup(ExplicitAnalysis):
                 wave_length_scales=self.wave_length_scales,
                 wave_reference_velocity=self.wave_reference_velocity,
             )
-            if interacting:
+            if interacting and self.inflow_perturbation is not None:
+                extra_inflow = self.inflow_perturbation
+
+                def all_inflow(x_g, y_g, z_g):
+                    flow = hull_inflow(x_g, y_g, z_g)
+                    extra = extra_inflow(x_g, y_g, z_g)
+                    if isinstance(flow, dict):
+                        return dict(flow, flow=[flow["flow"][k] + extra[k] for k in range(3)])
+                    return [flow[k] + extra[k] for k in range(3)]
+
+                options["inflow_perturbation"] = all_inflow
+            elif interacting:
                 options["inflow_perturbation"] = hull_inflow
+            elif self.inflow_perturbation is not None:
+                options["inflow_perturbation"] = self.inflow_perturbation
             options.update(self.buildup_options)
             foil = HydroBuildup(
                 assembly=self.assembly,
