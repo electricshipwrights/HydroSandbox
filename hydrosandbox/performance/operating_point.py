@@ -86,36 +86,38 @@ class HydroOperatingPoint(OperatingPoint):
             "surface_z": self.surface_z,
         }
 
-    def local_depth(self, z_g: Vectorizable = 0.0) -> Vectorizable:
+    def local_depth(self, z_g: Vectorizable = 0.0, x_g: Vectorizable = 0.0) -> Vectorizable:
         """
-        Return local submergence depth [m] at geometry coordinate ``z_g``.
+        Return local submergence depth [m] at geometry coordinates ``(x_g, z_g)``.
 
         Positive values lie below the free surface.
         """
         if self.surface_z is not None:
+            if callable(self.surface_z):
+                return -self.surface_z(x_g, z_g)
             return self.surface_z - z_g
         return self.water.depth - z_g
 
-    def local_pressure(self, z_g: Vectorizable = 0.0) -> Vectorizable:
-        """Return local absolute hydrostatic pressure [Pa] at geometry coordinate ``z_g``."""
-        return self.water.pressure(depth=self.local_depth(z_g))
+    def local_pressure(self, z_g: Vectorizable = 0.0, x_g: Vectorizable = 0.0) -> Vectorizable:
+        """Return local absolute hydrostatic pressure [Pa] at geometry ``(x_g, z_g)``."""
+        return self.water.pressure(depth=self.local_depth(z_g, x_g=x_g))
 
-    def total_pressure(self, z_g: Vectorizable = 0.0) -> Vectorizable:
+    def total_pressure(self, z_g: Vectorizable = 0.0, x_g: Vectorizable = 0.0) -> Vectorizable:
         """
         Return total (stagnation) pressure [Pa] via incompressible Bernoulli:
-        ``p_static(z_g) + 0.5 * rho * V^2``.
+        ``p_static(x_g, z_g) + 0.5 * rho * V^2``.
         """
-        return self.local_pressure(z_g) + self.dynamic_pressure()
+        return self.local_pressure(z_g, x_g=x_g) + self.dynamic_pressure()
 
     def total_temperature(self) -> Vectorizable:
         """Return water temperature [K] (incompressible liquid)."""
         return self.water.temperature()
 
-    def cavitation_number(self, z_g: Vectorizable = 0.0) -> Vectorizable:
+    def cavitation_number(self, z_g: Vectorizable = 0.0, x_g: Vectorizable = 0.0) -> Vectorizable:
         """
         Return the local cavitation number ``sigma = (p_local - p_v) / q`` [-].
         """
-        p_local = self.local_pressure(z_g)
+        p_local = self.local_pressure(z_g, x_g=x_g)
         p_vapor = self.water.vapor_pressure()
         q_dyn = np.maximum(self.dynamic_pressure(), 1e-12)
         return (p_local - p_vapor) / q_dyn

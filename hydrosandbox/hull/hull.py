@@ -114,7 +114,13 @@ class Hull(AeroSandboxObject):
             0.5 * ((f[:-1, 1:] - f[:-1, :-1]) + (f[1:, 1:] - f[1:, :-1]))
         ).reshape(-1)
 
-        ### Transom: the aft station's section, if it has any breadth.
+        ### Bow & transom end-station sections (stations[0] and stations[-1]).
+        f_bow = f[0, :]
+        self._bow_f = 0.5 * (f_bow[:-1] + f_bow[1:])
+        self._bow_half_beam = float(_onp.max(f_bow))
+        self.has_bow_step = self._bow_half_beam > 1e-6 * max(
+            float(_onp.max(f)), 1e-12
+        )
         f_transom = f[-1, :]
         self._transom_f = 0.5 * (f_transom[:-1] + f_transom[1:])
         self._transom_z_lo = z[:-1]
@@ -425,6 +431,31 @@ class Hull(AeroSandboxObject):
         c_v = (1.0 + self.form_factor) * ittc57_cf(reynolds) + self.roughness_delta_cf
         return c_v * 0.5 * density * velocity**2 * wetted_surface
 
+    def _end_station_submergence(
+        self,
+        x_station: float,
+        sinkage: Vectorizable,
+        trim: Vectorizable,
+        pivot_xz: Sequence[float],
+    ) -> dict[str, Vectorizable]:
+        """Submerged waterplane bands of an end station ``x = x_station``."""
+        x_earth, _ = self.to_earth(x_station, 0.0, sinkage, trim, pivot_xz)
+        xa, za = self.to_earth(x_station, self._transom_z_lo, sinkage, trim, pivot_xz)
+        xb, zb = self.to_earth(x_station, self._transom_z_hi, sinkage, trim, pivot_xz)
+        f_sub, s_sub, h_mid = smooth_submergence_fraction(
+            za, zb, 0.0, transition_thickness=self.waterline_smoothing
+        )
+        t_lo, t_hi = s_sub - 0.5 * f_sub, s_sub + 0.5 * f_sub
+        return {
+            "x_earth": x_earth,
+            "f_sub": f_sub,
+            "h_mid": h_mid,
+            "x_lo": xa + t_lo * (xb - xa),
+            "x_hi": xa + t_hi * (xb - xa),
+            "z_lo": za + t_lo * (zb - za),
+            "z_hi": za + t_hi * (zb - za),
+        }
+
     # ------------------------------------------------------------------
     # Transom
     # ------------------------------------------------------------------
@@ -442,17 +473,11 @@ class Hull(AeroSandboxObject):
         equivalent-rectangle ``depth`` [m], its ``dryness`` (0 wet .. 1 dry, by
         transom Froude number) and the closing ``hollow_length`` [m].
         """
-        x_t = self.stations[-1]
-        x_t_earth, _ = self.to_earth(x_t, 0.0, sinkage, trim, pivot_xz)
-        _, za = self.to_earth(x_t, self._transom_z_lo, sinkage, trim, pivot_xz)
-        _, zb = self.to_earth(x_t, self._transom_z_hi, sinkage, trim, pivot_xz)
-        f_sub, s_sub, h_mid = smooth_submergence_fraction(
-            za, zb, 0.0, transition_thickness=self.waterline_smoothing
-        )
-        t_lo, t_hi = s_sub - 0.5 * f_sub, s_sub + 0.5 * f_sub
+        end = self._end_station_submergence(self.stations[-1], sinkage, trim, pivot_xz)
+        f_sub = end["f_sub"]
         d_area = 2.0 * self._transom_f * (self._transom_z_hi - self._transom_z_lo) * f_sub
         area = np.sum(d_area)
-        depth_moment = np.sum(d_area * h_mid)
+        depth_moment = np.sum(d_area * end["h_mid"])
         # Equivalent rectangle on the widest *immersed* half-breadth (boatmath
         # `SectionalHull::detect_transom`), smoothly.
         immersed = self._transom_f * f_sub
@@ -482,10 +507,10 @@ class Hull(AeroSandboxObject):
             "dryness": dryness,
             "hollow_length": hollow,
             "f_sub": f_sub,
-            "x_earth": x_t_earth,
+            "x_earth": end["x_earth"],
             # Submerged part of each band of the transom section, in earth z.
-            "z_lo": za + t_lo * (zb - za),
-            "z_hi": za + t_hi * (zb - za),
+            "z_lo": end["z_lo"],
+            "z_hi": end["z_hi"],
         }
 
     # ------------------------------------------------------------------
@@ -525,13 +550,21 @@ class Hull(AeroSandboxObject):
             "flux": [flux], "smear": [self._cell_dx * _onp.ones(n)],
         }
 
+        dz = self._transom_z_hi - self._transom_z_lo
+        if _onp.any(self._bow_f > 0.0):
+            bow = self._end_station_submergence(self.stations[0], sinkage, trim, pivot_xz)
+            sets["xa"].append(bow["x_lo"])
+            sets["za"].append(bow["z_lo"])
+            sets["xb"].append(bow["x_hi"])
+            sets["zb"].append(bow["z_hi"])
+            sets["flux"].append(2.0 * velocity * cos * bow["f_sub"] * self._bow_f * dz)
+            sets["smear"].append(_onp.zeros(len(dz)))
+
         transom = self.transom(velocity, gravity, sinkage, trim, pivot_xz)
         hollow = transom["hollow_length"]
         if hollow is not None:
             s_edges = _onp.linspace(0.0, 1.0, n_hollow + 1)
             shape = (1.0 - s_edges) ** 2 * (1.0 + 2.0 * s_edges)
-            x_t = self.stations[-1]
-            dz = self._transom_z_hi - self._transom_z_lo
             for k in range(n_hollow):
                 x_k = transom["x_earth"] + 0.5 * (s_edges[k] + s_edges[k + 1]) * hollow
                 ones = _onp.ones(len(dz))
@@ -542,6 +575,7 @@ class Hull(AeroSandboxObject):
                 sets["flux"].append(
                     2.0
                     * velocity
+                    * cos
                     * transom["f_sub"]
                     * self._transom_f
                     * dz
@@ -613,6 +647,7 @@ class Hull(AeroSandboxObject):
         n_strips = len(self.stations) - 1
         x_mid = 0.5 * (self.stations[:-1] + self.stations[1:])
         x_strip, _ = self.to_earth(x_mid, 0.0 * x_mid, sinkage, trim, pivot_xz)
+        bow = self._end_station_submergence(self.stations[0], sinkage, trim, pivot_xz)
 
         out = {
             "n_hull": n_strips,
@@ -625,8 +660,21 @@ class Hull(AeroSandboxObject):
             "half_volume": cells["f_sub"] * self._cell_f * self._cell_dx * self._cell_dz,
             "z_lo_hull": cells["z_lo"],
             "z_hi_hull": cells["z_hi"],
+            "bow": bow,
+            "n_bow": 0,
             "n_hollow": 0,
         }
+
+        dz = self._transom_z_hi - self._transom_z_lo
+        if _onp.any(self._bow_f > 0.0):
+            out.update(
+                n_bow=1,
+                x_bow=np.reshape(bow["x_earth"], (1,)),
+                dx_bow=0.0,
+                slope_bow=cos * bow["f_sub"] * self._bow_f * dz,
+                z_lo_bow=bow["z_lo"],
+                z_hi_bow=bow["z_hi"],
+            )
 
         transom = self.transom(velocity, gravity, sinkage, trim, pivot_xz)
         out["transom"] = transom
@@ -634,8 +682,6 @@ class Hull(AeroSandboxObject):
         if hollow is not None:
             s_edges = _onp.linspace(0.0, 1.0, n_hollow + 1)
             shape = (1.0 - s_edges) ** 2 * (1.0 + 2.0 * s_edges)
-            x_t = self.stations[-1]
-            dz = self._transom_z_hi - self._transom_z_lo
             # The hollow is a feature of the water surface behind the transom: it
             # carries the transom's immersed section straight aft (it does not
             # pitch with the hull).
@@ -645,7 +691,7 @@ class Hull(AeroSandboxObject):
                     transom["x_earth"] + 0.5 * (s_edges[k] + s_edges[k + 1]) * hollow
                 )
                 slope.append(
-                    transom["f_sub"] * self._transom_f * dz * (shape[k + 1] - shape[k])
+                    cos * transom["f_sub"] * self._transom_f * dz * (shape[k + 1] - shape[k])
                 )
                 z_lo.append(transom["z_lo"])
                 z_hi.append(transom["z_hi"])
@@ -721,6 +767,20 @@ class Hull(AeroSandboxObject):
             re, im = self._strip_transform(
                 g_hull, strips["x_hull"], strips["dx_hull"], kx_row, sign=-1.0
             )
+            if strips["n_bow"] > 0:
+                g_bow = self._sum_groups(
+                    self._scale_rows(
+                        strips["slope_bow"],
+                        self._depth_average(
+                            strips["z_lo_bow"], strips["z_hi_bow"], kappa_row
+                        ),
+                    ),
+                    strips["n_bow"],
+                )
+                re_b, im_b = self._strip_transform(
+                    g_bow, strips["x_bow"], strips["dx_bow"], kx_row, sign=-1.0
+                )
+                re, im = re + re_b, im + im_b
             if strips["n_hollow"] > 0:
                 g_hollow = self._sum_groups(
                     self._scale_rows(
@@ -748,14 +808,18 @@ class Hull(AeroSandboxObject):
         """Half-breadth of each station at the water surface, (n_stations, 1)."""
         cos, sin = np.cosd(trim), np.sind(trim)
         z_w = pivot_xz[1] + (sinkage + (self.stations - pivot_xz[0]) * sin) / cos
-        z_w = np.reshape(np.clip(z_w, self.levels[0], self.levels[-1]), (-1, 1))
+        z_w_clip = np.reshape(np.clip(z_w, self.levels[0], self.levels[-1]), (-1, 1))
         n_x, n_z = self.half_breadths.shape
-        offset = z_w @ _onp.ones((1, n_z)) - _onp.ones((n_x, 1)) @ self.levels[None, :]
+        offset = z_w_clip @ _onp.ones((1, n_z)) - _onp.ones((n_x, 1)) @ self.levels[None, :]
         big = 1e12
         below = _onp.concatenate([[big], _onp.diff(self.levels)])[None, :] * _onp.ones((n_x, 1))
         above = _onp.concatenate([_onp.diff(self.levels), [big]])[None, :] * _onp.ones((n_x, 1))
         hat = np.fmax(np.fmin(1.0 + offset / below, 1.0 - offset / above), 0.0)
-        return np.reshape(np.sum(hat * self.half_breadths, axis=1), (-1, 1))
+        wl = np.reshape(np.sum(hat * self.half_breadths, axis=1), (-1, 1))
+        clear = np.reshape(z_w - self.levels[0], (-1, 1))
+        s_scale = max(float(self.waterline_smoothing), 1e-6)
+        in_water = 0.5 * (1.0 + np.tanh(clear / s_scale))
+        return wl * in_water
 
     def dynamic_force(
         self,
@@ -819,20 +883,23 @@ class Hull(AeroSandboxObject):
 
         strips = self._strips(velocity, gravity, sinkage, trim, pivot_xz)
         n_hull = strips["n_hull"]
+        cos = np.cosd(trim)
         # boatmath's frame for these transforms: X forward (bow at high X).
         big_x_hull = -np.reshape(strips["x_hull"], (-1, 1))
         arm_hull = big_x_hull + x_ref  # X - X_ref, with X_ref = -x_ref
-        x_t_earth, _ = self.to_earth(self.stations[-1], 0.0, sinkage, trim, pivot_xz)
+        x_t_earth = strips["transom"]["x_earth"]
         arm_transom = -x_t_earth + x_ref
+        x_b_earth = strips["bow"]["x_earth"]
+        arm_bow = -x_b_earth + x_ref
 
         f_wl = self._waterline_half_breadths(sinkage, trim, pivot_xz)
         d_f_wl = -(f_wl[1:, :] - f_wl[:-1, :])  # d f / dX per strip, times dx
         f_wl_mid = 0.5 * (f_wl[1:, :] + f_wl[:-1, :]) * np.reshape(strips["dx_hull"], (-1, 1))
-        f_wl_transom = f_wl[-1, :] if self.has_transom else 0.0
+        f_wl_transom = f_wl[-1, :]
+        f_wl_bow = f_wl[0, :]
         transom_f_sub = strips["transom"]["f_sub"]
+        bow_f_sub = strips["bow"]["f_sub"]
         transom_dz = self._transom_z_hi - self._transom_z_lo
-        _, transom_za = self.to_earth(self.stations[-1], self._transom_z_lo, sinkage, trim, pivot_xz)
-        _, transom_zb = self.to_earth(self.stations[-1], self._transom_z_hi, sinkage, trim, pivot_xz)
 
         def cols(matrix_or_col, m):
             """Broadcast an (n, 1) column across m wavenumber columns."""
@@ -872,17 +939,26 @@ class Hull(AeroSandboxObject):
                     self._scale_rows(strips["slope_hollow"], depth_hollow),
                     strips["n_hollow"],
                 )
-            if self.has_transom:
-                depth_t = self._depth_average(
-                    strips["transom"]["z_lo"], strips["transom"]["z_hi"], k_row
-                )
-                out["z_t"] = np.reshape(
-                    np.sum(
-                        self._scale_rows(transom_f_sub * self._transom_f * transom_dz, depth_t),
-                        axis=0,
-                    ),
-                    (1, -1),
-                )
+            depth_t = self._depth_average(
+                strips["transom"]["z_lo"], strips["transom"]["z_hi"], k_row
+            )
+            out["z_t"] = np.reshape(
+                np.sum(
+                    self._scale_rows(cos * transom_f_sub * self._transom_f * transom_dz, depth_t),
+                    axis=0,
+                ),
+                (1, -1),
+            )
+            depth_b = self._depth_average(
+                strips["bow"]["z_lo"], strips["bow"]["z_hi"], k_row
+            )
+            out["z_b"] = np.reshape(
+                np.sum(
+                    self._scale_rows(cos * bow_f_sub * self._bow_f * transom_dz, depth_b),
+                    axis=0,
+                ),
+                (1, -1),
+            )
             return out
 
         def forms(kx_row, k_row, contraction=None, repeats: int = 1):
@@ -910,8 +986,12 @@ class Hull(AeroSandboxObject):
             pw_re, pw_im = transform(cols(f_wl_mid, m))
             q1w_re, q1w_im = transform(cols(arm_hull * d_f_wl, m))
 
-            # Sources: the hull's, plus the closing hollow's.
+            # Sources: the hull's, the bow step (-z_b), plus the closing hollow.
             src_re, src_im = q_re, q_im
+            z_b = tile(contraction["z_b"], repeats)
+            phase_b = x_b_earth * kx_row
+            cos_b, sin_b = np.cos(phase_b), np.sin(phase_b)
+            src_re, src_im = src_re - z_b * cos_b, src_im - z_b * sin_b
             if strips["n_hollow"] > 0:
                 g_h = tile(contraction["g_h"], repeats)
                 h_re, h_im = self._strip_transform(
@@ -919,16 +999,19 @@ class Hull(AeroSandboxObject):
                 )
                 src_re, src_im = src_re + h_re, src_im + h_im
 
-            # Weights: the hull ends at its transom, where f steps from f_T to 0.
-            if self.has_transom:
-                z_t = tile(contraction["z_t"], repeats)
-                phase_t = x_t_earth * kx_row
-                cos_t, sin_t = np.cos(phase_t), np.sin(phase_t)
-                q_re, q_im = q_re + z_t * cos_t, q_im + z_t * sin_t
-                q1_re, q1_im = q1_re + arm_transom * z_t * cos_t, q1_im + arm_transom * z_t * sin_t
-                w_re, w_im = w_re + f_wl_transom * cos_t, w_im + f_wl_transom * sin_t
-                q1w_re = q1w_re + arm_transom * f_wl_transom * cos_t
-                q1w_im = q1w_im + arm_transom * f_wl_transom * sin_t
+            # Weights: stern (0 -> +f_T) and bow (+f_B -> 0) end-station steps,
+            # included unconditionally so near-field force stays smooth as breadth -> 0.
+            z_t = tile(contraction["z_t"], repeats)
+            phase_t = x_t_earth * kx_row
+            cos_t, sin_t = np.cos(phase_t), np.sin(phase_t)
+            q_re = q_re + z_t * cos_t - z_b * cos_b
+            q_im = q_im + z_t * sin_t - z_b * sin_b
+            q1_re = q1_re + arm_transom * z_t * cos_t - arm_bow * z_b * cos_b
+            q1_im = q1_im + arm_transom * z_t * sin_t - arm_bow * z_b * sin_b
+            w_re = w_re + f_wl_transom * cos_t - f_wl_bow * cos_b
+            w_im = w_im + f_wl_transom * sin_t - f_wl_bow * sin_b
+            q1w_re = q1w_re + arm_transom * f_wl_transom * cos_t - arm_bow * f_wl_bow * cos_b
+            q1w_im = q1w_im + arm_transom * f_wl_transom * sin_t - arm_bow * f_wl_bow * sin_b
 
             r_re, r_im = p_re + q1_re, p_im + q1_im
             rw_re, rw_im = pw_re + q1w_re, pw_im + q1w_im
@@ -1013,16 +1096,18 @@ class Hull(AeroSandboxObject):
         coef_row = row(two_nu_sec2)
         k_mat = k_col @ _onp.ones((1, n_t))
         denom = k_mat - ones_k @ k0_row
+        eps_d = 1e-12 * _onp.maximum(k_mat, 1.0)
+        inv_denom = denom / (denom * denom + eps_d * eps_d)
         h_f = (ones_k @ coef_row) * (k_mat * qq - wq)
         h_m = (ones_k @ coef_row) * (k_mat * rq_re - rwq_re)
         h0_f = coef_row * (k0_row * row(pole[0]) - row(pole[1]))
         h0_m = coef_row * (k0_row * row(pole[2]) - row(pole[4]))
         inner_f = np.reshape(
-            np.sum((wk_col @ _onp.ones((1, n_t))) * (k_mat * qq + (h_f - ones_k @ h0_f) / denom), axis=0),
+            np.sum((wk_col @ _onp.ones((1, n_t))) * (k_mat * qq + (h_f - ones_k @ h0_f) * inv_denom), axis=0),
             (1, -1),
         )
         inner_m = np.reshape(
-            np.sum((wk_col @ _onp.ones((1, n_t))) * (k_mat * rq_re + (h_m - ones_k @ h0_m) / denom), axis=0),
+            np.sum((wk_col @ _onp.ones((1, n_t))) * (k_mat * rq_re + (h_m - ones_k @ h0_m) * inv_denom), axis=0),
             (1, -1),
         )
 
@@ -1041,11 +1126,18 @@ class Hull(AeroSandboxObject):
             k0_i, coef_i = k0_all[i], two_nu_sec2[i]
             e_hf = coef_i * (ext_k * e_qq - e_wq)
             e_hm = coef_i * (ext_k * e_rq - e_rwq)
-            extension_f[i] = np.sum(ext_w * (ext_k * e_qq + (e_hf - h0_f[0, i]) / (ext_k - k0_i)))
-            extension_m[i] = np.sum(ext_w * (ext_k * e_rq + (e_hm - h0_m[0, i]) / (ext_k - k0_i)))
+            ext_d = ext_k - k0_i
+            eps_ext = 1e-12 * _onp.maximum(ext_k, 1.0)
+            inv_ext_d = ext_d / (ext_d * ext_d + eps_ext * eps_ext)
+            extension_f[i] = np.sum(ext_w * (ext_k * e_qq + (e_hf - h0_f[0, i]) * inv_ext_d))
+            extension_m[i] = np.sum(ext_w * (ext_k * e_rq + (e_hm - h0_m[0, i]) * inv_ext_d))
 
         for i in range(n_t):
-            log_term = np.log((k_hi[i] - k0_all[i]) / k0_all[i])
+            diff_k = k_hi[i] - k0_all[i]
+            eps_k = 1e-12 * np.fmax(k_hi[i], k0_all[i])
+            log_term = 0.5 * np.log(
+                (diff_k * diff_k + eps_k * eps_k) / (k0_all[i] * k0_all[i])
+            )
             force_integral = force_integral + theta_weights[i] * (
                 inner_f[0, i] + extension_f[i] + h0_f[0, i] * log_term
             )

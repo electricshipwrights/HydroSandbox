@@ -1,4 +1,5 @@
 from hydrosandbox.library.free_surface import (
+    resolve_surface_segment,
     smooth_submergence_fraction,
     smooth_surface_piercing_weight,
     froude_image_weight,
@@ -26,6 +27,7 @@ from hydrosandbox.library.wave_resistance import (
 )
 
 __all__ = [
+    "resolve_surface_segment",
     "smooth_submergence_fraction",
     "smooth_surface_piercing_weight",
     "froude_image_weight",

@@ -170,15 +170,18 @@ class HydrofoilAssembly(Airplane):
         water: Water,
         surface_z: Vectorizable | None = None,
         xyz_ref: Sequence[float] | None = None,
+        up_direction_g: Sequence[Vectorizable] | None = None,
     ) -> dict[str, Any]:
         """
         Compute Archimedes hydrostatic buoyancy force and moment about ``xyz_ref``.
 
-        Buoyancy acts vertically upward (``+z_g`` in geometry axes).
+        Buoyancy acts along ``up_direction_g`` in geometry axes (defaults to
+        ``[0, 0, 1]``).
         """
         v_disp, xyz_cb = self.submerged_volume_and_centroid(surface_z=surface_z)
         buoyancy = water.density() * water.gravity * v_disp
-        f_buoyancy_g = [0.0, 0.0, buoyancy]
+        up = [0.0, 0.0, 1.0] if up_direction_g is None else list(up_direction_g)
+        f_buoyancy_g = [buoyancy * up[k] for k in range(3)]
 
         ref = self.xyz_ref if xyz_ref is None else xyz_ref
         r = [xyz_cb[k] - ref[k] for k in range(3)]
