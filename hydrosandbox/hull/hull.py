@@ -346,6 +346,41 @@ class Hull(AeroSandboxObject):
             ]
         return result
 
+    def __getstate__(self):
+        # The cached CasADi keel interpolant cannot be pickled; it is rebuilt on use.
+        state = dict(self.__dict__)
+        state.pop("_keel_interpolant", None)
+        return state
+
+    def keel_height(self, x: Vectorizable) -> Vectorizable:
+        """
+        Height ``z`` [m] of the hull's keel at station ``x`` (hull axes, negative
+        below the design waterline): the lowest level of the offsets table at which
+        the hull has breadth, taken one level lower so it bounds the hull from
+        below. Interpolated linearly along the hull; numeric or symbolic in ``x``.
+
+        Useful for hanging things under the hull: where a strut meets it, and how
+        much clearance a foil has.
+        """
+        import casadi as cas
+
+        if not hasattr(self, "_keel_interpolant"):
+            threshold = 1e-4 * float(_onp.max(self.half_breadths))
+            keel = _onp.full(len(self.stations), _onp.nan)
+            for i, row in enumerate(self.half_breadths):
+                wet = _onp.nonzero(row > threshold)[0]
+                if wet.size:
+                    keel[i] = self.levels[max(int(wet[0]) - 1, 0)]
+            valid = ~_onp.isnan(keel)
+            keel = _onp.interp(self.stations, self.stations[valid], keel[valid])
+            self._keel_z = keel
+            self._keel_interpolant = cas.interpolant(
+                "keel_height", "linear", [self.stations.tolist()], keel.tolist()
+            )
+        x_clamped = np.clip(x, self.stations[0], self.stations[-1])
+        value = self._keel_interpolant(x_clamped)
+        return value if np.is_casadi_type(x_clamped, recursive=False) else float(value)
+
     def surface_patches(self) -> list[dict[str, Any]]:
         """
         The hull's surfaces as B-spline patches in its own axes (x aft, y from the

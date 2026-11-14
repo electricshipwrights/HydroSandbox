@@ -945,3 +945,53 @@ def test_craft_step_export_marks_the_centre_of_gravity_in_red(tmp_path):
     # Without a CG, no marker and no styling.
     plain = hsb.export_craft_step(tmp_path / "plain.step", hull, _t_foil(1.5)).read_text()
     assert "SPHERICAL_SURFACE" not in plain and "STYLED_ITEM" not in plain
+
+
+def test_keel_height_and_under_hull_foil_layouts():
+    import pickle
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(hsb.__file__).parent / "examples"))
+    from optimize_foils_on_hull import build_assembly
+
+    hull = Hull.wigley(5.0, 0.4, 0.2, freeboard=0.3, n_stations=21, n_levels=13)
+    # Deepest amidships, shallower toward the ends; never above the keel itself.
+    assert hull.keel_height(0.0) == pytest.approx(-0.2, abs=1e-9)
+    assert hull.keel_height(0.0) <= hull.keel_height(2.0) <= 0.0
+    assert pickle.loads(pickle.dumps(hull)).keel_height(1.0) == hull.keel_height(1.0)
+
+    spacing = 2.0
+    design = {"x_main": 1.5, "depth_main": 0.45, "root_chord_main": 0.14, "taper_main": 0.7,
+              "incidence_main": 1.0, "half_span_main": 0.35}
+    pi = build_assembly(design, False, layout="pi", hull=hull, demihull_spacing=spacing)
+    twin = build_assembly(design, False, layout="twin", hull=hull, demihull_spacing=spacing)
+
+    # One foil from hull to hull on two struts...
+    assert len(pi.foils) == 1 and pi.foils[0].symmetric
+    assert pi.foils[0].span() == pytest.approx(spacing)
+    # ...or a T-foil under each hull, each a wing of its own.
+    assert len(twin.foils) == 2 and not any(f.symmetric for f in twin.foils)
+    assert sorted(float(f.xsecs[1].xyz_le[1]) for f in twin.foils) == [-1.0, 1.0]
+    assert all(f.span() == pytest.approx(0.7) for f in twin.foils)
+    for assembly in (pi, twin):
+        (strut,) = assembly.struts
+        assert strut.symmetric and float(strut.xsecs[0].xyz_le[1]) == pytest.approx(spacing / 2)
+        # Each strut runs from the foil up to the keel of the hull above it.
+        assert float(strut.xsecs[0].xyz_le[2]) == pytest.approx(-0.45)
+        assert float(strut.xsecs[1].xyz_le[2]) == pytest.approx(
+            hull.keel_height(float(strut.xsecs[1].xyz_le[0]))
+        )
+
+    # Both run through the craft model, and the two T-foils share the lift equally.
+    water = hsb.Water.seawater()
+    mass = 2.0 * scalar(hull.hydrostatics()["volume"]) * water.density()
+    res = CraftBuildup(
+        hull=hull, assembly=twin, velocity=4.0, mass=mass, xyz_cg=[0.0, 0.0, 0.0], water=water,
+        demihull_spacing=spacing, include_hull_dynamics=False, include_interference_breakdown=False,
+    ).run()
+    lifts = [
+        scalar(c.L) for w, c in zip(twin.wings, res["foil"]["wing_hydro_components"])
+        if not getattr(w, "is_strut", False)
+    ]
+    assert lifts[0] > 0.0 and lifts[0] == pytest.approx(lifts[1], rel=1e-6)
