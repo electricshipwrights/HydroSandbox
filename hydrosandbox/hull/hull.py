@@ -186,6 +186,9 @@ class Hull(AeroSandboxObject):
         n_levels: int = 25,
         x_forward: bool = False,
         centerplane_y: float | None = None,
+        stations: Sequence[float] | None = None,
+        levels: Sequence[float] | None = None,
+        level_oversampling: int = 1,
         **kwargs,
     ) -> "Hull":
         """
@@ -193,6 +196,16 @@ class Hull(AeroSandboxObject):
         offset table. The half-breadth at each (station, level) is the largest
         distance from the hull's centreplane at which the line through it, parallel
         to ``y``, meets the mesh; either one side or both sides may be meshed.
+
+        By default the grid spans the mesh (``n_stations`` cosine-clustered
+        stations, ``n_levels`` levels split at the waterline). Pass ``stations`` and
+        ``levels`` (in this class's axes, ``x`` aft) to cut on a given grid instead,
+        e.g. one shared by every member of a hull family.
+
+        With ``level_oversampling > 1`` each level's half-breadth is instead the
+        mean over its band (the levels either side, weighted by a hat), sampled that
+        many times per gap: smoother as the geometry moves through the levels (a
+        flat bottom, a hard chine, a raked transom), and area-conserving.
 
         ``centerplane_y`` is the hull's own centreplane (a demihull drawn off the
         centreline, say). If None, it is taken as the median mid-point of the lines
@@ -208,10 +221,17 @@ class Hull(AeroSandboxObject):
 
         x_min, x_max = v[:, 0].min(), v[:, 0].max()
         z_min, z_max = v[:, 2].min(), v[:, 2].max()
-        # Cosine-clustered stations, pulled a hair inside the ends.
-        s = 0.5 * (1.0 - _onp.cos(_onp.pi * _onp.linspace(0.0, 1.0, n_stations)))
-        stations = x_min + (x_max - x_min) * (1e-6 + (1.0 - 2e-6) * s)
-        if z_min < 0.0 < z_max:
+        if stations is not None:
+            stations = _onp.asarray(stations, dtype=float)
+            n_stations = len(stations)
+        else:
+            # Cosine-clustered stations, pulled a hair inside the ends.
+            s = 0.5 * (1.0 - _onp.cos(_onp.pi * _onp.linspace(0.0, 1.0, n_stations)))
+            stations = x_min + (x_max - x_min) * (1e-6 + (1.0 - 2e-6) * s)
+        if levels is not None:
+            levels = _onp.asarray(levels, dtype=float)
+            n_levels = len(levels)
+        elif z_min < 0.0 < z_max:
             # Resolve the underwater body: half the levels below the design
             # waterline, half above it.
             n_below = n_levels // 2
@@ -224,34 +244,19 @@ class Hull(AeroSandboxObject):
         else:
             levels = z_min + (z_max - z_min) * _onp.linspace(1e-6, 1.0 - 1e-6, n_levels)
 
-        a, b, c = v[tri[:, 0]], v[tri[:, 1]], v[tri[:, 2]]
-        # Barycentric coordinates of each (x, z) query in each triangle's xz-projection.
-        v0 = (b - a)[:, [0, 2]]
-        v1 = (c - a)[:, [0, 2]]
-        det = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
-        ok = _onp.abs(det) > 1e-14
-        inv = _onp.where(ok, 1.0 / _onp.where(ok, det, 1.0), 0.0)
-
-        y_low = _onp.full((n_stations, n_levels), _onp.nan)
-        y_high = _onp.full((n_stations, n_levels), _onp.nan)
-        for i, xs in enumerate(stations):
-            px = xs - a[:, 0]
-            near = (a[:, 0].clip(max=_onp.minimum(b[:, 0], c[:, 0])) <= xs) & (
-                _onp.maximum(a[:, 0], _onp.maximum(b[:, 0], c[:, 0])) >= xs
+        if level_oversampling > 1:
+            # Each level's half-breadth is the hat-weighted mean over its band (the
+            # levels either side), sampled `level_oversampling` times per gap. That
+            # keeps the table continuous as a flat bottom, a chine or a raked transom
+            # moves through a level, and conserves each section's area.
+            sub = _onp.linspace(0.0, 1.0, level_oversampling + 1)[:-1]
+            fine = _onp.concatenate(
+                [levels[j] + (levels[j + 1] - levels[j]) * sub for j in range(n_levels - 1)]
+                + [levels[-1:]]
             )
-            idx = _onp.nonzero(near & ok)[0]
-            if idx.size == 0:
-                continue
-            for j, zs in enumerate(levels):
-                pz = zs - a[idx, 2]
-                u = (px[idx] * v1[idx, 1] - pz * v1[idx, 0]) * inv[idx]
-                w = (pz * v0[idx, 0] - px[idx] * v0[idx, 1]) * inv[idx]
-                hit = (u >= -1e-9) & (w >= -1e-9) & (u + w <= 1.0 + 1e-9)
-                if _onp.any(hit):
-                    k = idx[hit]
-                    y = a[k, 1] + u[hit] * (b[k, 1] - a[k, 1]) + w[hit] * (c[k, 1] - a[k, 1])
-                    y_low[i, j], y_high[i, j] = _onp.min(y), _onp.max(y)
-
+        else:
+            fine = levels
+        y_low, y_high = _mesh_y_extent(v, tri, stations, fine)
         hit = ~_onp.isnan(y_low)
         if centerplane_y is None:
             both = hit & ((y_high - y_low) > 1e-6)
@@ -266,9 +271,69 @@ class Hull(AeroSandboxObject):
             ),
             0.0,
         )
+        if level_oversampling > 1:
+            # Trapezoid weights on the fine levels, times each level's hat.
+            dz = _onp.diff(fine)
+            trap = _onp.zeros(len(fine))
+            trap[:-1] += 0.5 * dz
+            trap[1:] += 0.5 * dz
+            hats = _onp.zeros((n_levels, len(fine)))
+            for j in range(n_levels):
+                lo = levels[j - 1] if j > 0 else levels[0]
+                hi = levels[j + 1] if j < n_levels - 1 else levels[-1]
+                rise = (fine - lo) / max(levels[j] - lo, 1e-300) if j > 0 else _onp.ones_like(fine)
+                fall = (hi - fine) / max(hi - levels[j], 1e-300) if j < n_levels - 1 else _onp.ones_like(fine)
+                hat = _onp.where(fine <= levels[j], rise, fall)
+                hat = _onp.where((fine >= lo) & (fine <= hi), _onp.clip(hat, 0.0, 1.0), 0.0)
+                hats[j] = hat * trap
+            hats /= hats.sum(axis=1, keepdims=True)
+            half_breadths = half_breadths @ hats.T
         hull = cls(stations, levels, half_breadths, **kwargs)
         hull.source_centerplane_y = float(centerplane_y)
         return hull
+
+    @classmethod
+    def from_camber(
+        cls,
+        document,
+        n_stations: int = 41,
+        n_levels: int = 25,
+        stations: Sequence[float] | None = None,
+        levels: Sequence[float] | None = None,
+        n_columns: int = 121,
+        rows_per_segment: int = 8,
+        level_oversampling: int = 8,
+        **kwargs,
+    ) -> "Hull":
+        """
+        Build a hull from a camber document: a ``CamberHull``, its JSON text, a path
+        to it, or the decoded dict. The document's sweep is evaluated (see
+        ``hydrosandbox.hull.camber``), floated at its deck trim with its design
+        waterline at ``z = 0``, turned bow-first (``x`` aft) and cut into an offset
+        table over the hull's own extent (or on given ``stations`` and ``levels``),
+        each level averaged over its band (``level_oversampling``; see
+        ``from_mesh``) so the table moves smoothly with the authored numbers.
+
+        ``n_columns`` and ``rows_per_segment`` set how finely the sweep is sampled
+        along the hull and around each section.
+        """
+        from hydrosandbox.hull.camber import CamberHull, SweptHull
+
+        if isinstance(document, dict):
+            document = CamberHull.from_dict(document)
+        elif not isinstance(document, CamberHull):
+            document = CamberHull.from_json(document)
+        vertices, triangles = SweptHull(document).hull_mesh(
+            n_columns=n_columns, R=rows_per_segment
+        )
+        kwargs.setdefault("name", document.name or "camber hull")
+        result = cls.from_mesh(
+            vertices, triangles, n_stations=n_stations, n_levels=n_levels,
+            centerplane_y=0.0, stations=stations, levels=levels,
+            level_oversampling=level_oversampling, **kwargs,
+        )
+        result.camber_document = document
+        return result
 
     @classmethod
     def from_boatmath_geometry(
@@ -1786,6 +1851,39 @@ class Hull(AeroSandboxObject):
             velocity=vel,
             length_scales=tuple(float(v) for v in length_scales),
         )
+
+
+def _mesh_y_extent(v, tri, stations, levels):
+    """
+    Least and greatest ``y`` at which the line through each (station, level),
+    parallel to ``y``, meets the triangle mesh (NaN where it misses).
+    """
+    a, b, c = v[tri[:, 0]], v[tri[:, 1]], v[tri[:, 2]]
+    # Barycentric coordinates of each (x, z) query in each triangle's xz-projection.
+    v0 = (b - a)[:, [0, 2]]
+    v1 = (c - a)[:, [0, 2]]
+    det = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
+    ok = _onp.abs(det) > 1e-14
+    inv = _onp.where(ok, 1.0 / _onp.where(ok, det, 1.0), 0.0)
+    x_lo = _onp.minimum(a[:, 0], _onp.minimum(b[:, 0], c[:, 0]))
+    x_hi = _onp.maximum(a[:, 0], _onp.maximum(b[:, 0], c[:, 0]))
+    levels = _onp.asarray(levels, dtype=float)
+    y_low = _onp.full((len(stations), len(levels)), _onp.nan)
+    y_high = _onp.full((len(stations), len(levels)), _onp.nan)
+    for i, xs in enumerate(stations):
+        idx = _onp.nonzero((x_lo <= xs) & (x_hi >= xs) & ok)[0]
+        if idx.size == 0:
+            continue
+        px = (xs - a[idx, 0])[:, None]
+        pz = levels[None, :] - a[idx, 2][:, None]  # (triangles, levels)
+        u = (px * v1[idx, 1][:, None] - pz * v1[idx, 0][:, None]) * inv[idx][:, None]
+        w = (pz * v0[idx, 0][:, None] - px * v0[idx, 1][:, None]) * inv[idx][:, None]
+        hit = (u >= -1e-9) & (w >= -1e-9) & (u + w <= 1.0 + 1e-9)
+        y = a[idx, 1][:, None] + u * (b[idx, 1] - a[idx, 1])[:, None] + w * (c[idx, 1] - a[idx, 1])[:, None]
+        any_hit = hit.any(axis=0)
+        y_low[i] = _onp.where(any_hit, _onp.where(hit, y, _onp.inf).min(axis=0), _onp.nan)
+        y_high[i] = _onp.where(any_hit, _onp.where(hit, y, -_onp.inf).max(axis=0), _onp.nan)
+    return y_low, y_high
 
 
 def _wave_amplitude_row(hull, velocity, gravity, sinkage, trims, pivot_xz, spacing, kx, kappa, ky):

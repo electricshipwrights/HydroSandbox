@@ -124,9 +124,9 @@ class CamberHull:
         return parse_document(doc)
 
     @classmethod
-    def from_json(cls, path_or_text: str) -> "CamberHull":
+    def from_json(cls, path_or_text) -> "CamberHull":
         """Read a camber document from a path or from its JSON text."""
-        text = path_or_text
+        text = path_or_text = str(path_or_text) if hasattr(path_or_text, "__fspath__") else path_or_text
         if not path_or_text.lstrip().startswith("{"):
             with open(path_or_text) as f:
                 text = f.read()

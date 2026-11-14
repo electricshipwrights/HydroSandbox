@@ -231,6 +231,28 @@ class SweptHull:
             rows.append(s["pts"])
         return _onp.stack(rows)
 
+    def to_hull_axes(self, points: _onp.ndarray) -> _onp.ndarray:
+        """
+        Document-frame points to ``Hull``'s axes: floated at the deck trim (a rotation
+        about the transverse axis through the sheer origin), design waterline at
+        ``z = 0``, ``x`` aft, in metres.
+        """
+        points = _onp.asarray(points, dtype=float)
+        th = self.hull.deck_trim
+        x, y, z = points[..., 0], points[..., 1], points[..., 2]
+        x_h = x * math.cos(th) - z * math.sin(th)
+        z_w = x * math.sin(th) + z * math.cos(th)
+        return self.hull.unit_m * _onp.stack([-x_h, y, z_w + self.hull.waterline], axis=-1)
+
+    def hull_mesh(self, n_columns: int = 121, R: int = 8) -> tuple[_onp.ndarray, _onp.ndarray]:
+        """The trimmed starboard surface as a triangle mesh in ``Hull``'s axes (vertices, triangles)."""
+        grid = self.to_hull_axes(self.surface_grid(n_columns, R))
+        n_u, n_v, _ = grid.shape
+        idx = _onp.arange(n_u * n_v).reshape(n_u, n_v)
+        quads = _onp.stack([idx[:-1, :-1], idx[1:, :-1], idx[1:, 1:], idx[:-1, 1:]], axis=-1).reshape(-1, 4)
+        triangles = _onp.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
+        return grid.reshape(-1, 3), triangles
+
 
 def _bisect_root(g, a: float, b: float, ga: float) -> float:
     for _ in range(40):

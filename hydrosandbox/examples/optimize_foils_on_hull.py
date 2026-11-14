@@ -519,6 +519,7 @@ def optimize(
     pods: dict | None = None,
     pod_start: tuple[float, float] | None = None,
     propeller_interaction: bool = True,
+    blend_start: list[float] | None = None,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -561,7 +562,21 @@ def optimize(
     reach the propellers as a wake fraction and an inflow angle. The blade tips are
     kept ``min_tip_immersion`` under the still surface, and a propeller in line
     with a foil strut ``min_strut_gap`` diameters clear of it fore and aft.
+
+    ``hull`` may also be a camber ``HullFamily`` (``hydrosandbox.hull.camber``): its
+    blend weights then become design variables too (a slider ``blend_t`` for two
+    hulls, else ``blend_w0, blend_w1, ...`` on the simplex), starting from
+    ``blend_start`` (default: the family's centroid). The hull inside the solve is
+    the family's polynomial interpolant; the solution is re-evaluated on the exact
+    blend, swept from camber's blended control points, which is returned as
+    ``"hull"`` with the weights as ``"blend_weights"``.
     """
+    from hydrosandbox.hull.camber import HullFamily
+
+    family = hull if isinstance(hull, HullFamily) else None
+    if family is not None:
+        blend_start = list(blend_start) if blend_start is not None else [1.0 / family.n_hulls] * family.n_hulls
+        hull = family.at(blend_start)
     with_foils = start is not None
     with_assembly = with_foils or pods is not None
     n_pods = 0 if pods is None else (1 if (craft_options or {}).get("demihull_spacing") is None else 2)
@@ -684,6 +699,27 @@ def optimize(
             lo, hi = (bounds or {}).get(name, limits)
             design[name] = opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
         rpm = pods["max_rpm"] * opti.variable(init_guess=0.92, lower_bound=0.2, upper_bound=1.0)
+    blend_constraints = []
+    if family is not None:
+        # The blend: the hull inside the solve becomes the family's interpolant at
+        # variable weights, and so does everything built from it.
+        if family.n_hulls == 2:
+            design["blend_t"] = opti.variable(init_guess=blend_start[1], lower_bound=0.0, upper_bound=1.0)
+            blend_weights = [1.0 - design["blend_t"], design["blend_t"]]
+        else:
+            free = [
+                opti.variable(init_guess=blend_start[i], lower_bound=0.0, upper_bound=1.0)
+                for i in range(family.n_hulls - 1)
+            ]
+            design.update({f"blend_w{i}": w for i, w in enumerate(free)})
+            blend_weights = free + [1.0 - sum(free)]
+            blend_constraints.append(blend_weights[-1] >= 0.0)
+        hull = family.at(blend_weights)
+        common["hull"] = hull
+        for key in ("hull_dynamics", "hull_wave_amplitude"):
+            if key in common:
+                common[key] = hull.rebind(common[key])
+        layout_options["hull"] = hull
     interacting = pods is not None and propeller_interaction
     wake_fraction = inflow_angle = 0.0
     if interacting:
@@ -796,7 +832,7 @@ def optimize(
     constraints = [
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
-    ]
+    ] + blend_constraints
     if pods is not None:
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
@@ -892,6 +928,14 @@ def optimize(
 
     solved = {name: float(sol(var)) for name, var in design.items()}
     solved_loading = {name: value(v) for name, v in loading.items()}
+    solved_weights = None
+    if family is not None:
+        # Re-evaluate on the exact blend, not the interpolant.
+        solved_weights = [float(onp.clip(sol(w), 0.0, 1.0)) for w in blend_weights]
+        solved_weights = [w / sum(solved_weights) for w in solved_weights]
+        hull = family.exact(solved_weights)
+        exact_common = dict(exact_common, hull=hull)
+        layout_options["hull"] = hull
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
     final = CraftBuildup(
@@ -952,7 +996,10 @@ def optimize(
                 wake_fraction_viscous=scalar(seen["wake_fraction_viscous"]),
                 propeller_inflow_angle=angle_solved,
             )
-    return {"design": solved, "loading": solved_loading, "results": final}
+    outcome = {"design": solved, "loading": solved_loading, "results": final}
+    if family is not None:
+        outcome.update(blend_weights=solved_weights, hull=hull)
+    return outcome
 
 
 def optimize_task(task: tuple, freedoms: dict) -> dict | None:
