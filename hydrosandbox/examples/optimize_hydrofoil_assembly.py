@@ -217,11 +217,17 @@ def run_optimization(
         alpha=alpha,
         surface_z=0.0,
     )
+    wave_scales = (
+        0.8 * scale,
+        (0.65 if include_stabilizer else 0.20) * scale,
+        submergence_depth,
+    )
     buildup = hsb.HydroBuildup(
         assembly=assembly,
         op_point=op_point,
         model_size="small",
         free_surface_mode="high_froude",
+        wave_length_scales=wave_scales,
     )
     res = buildup.run()
 
@@ -249,6 +255,7 @@ def run_optimization(
             op_point=op_pert,
             model_size="small",
             free_surface_mode="high_froude",
+            wave_length_scales=wave_scales,
         ).run()
         cma_approx = (res_pert["Cm"] - res["Cm"]) / np.radians(delta_alpha_deg)
         constraints.extend([res["m_b"] == 0.0, cma_approx <= -0.10])
@@ -292,6 +299,7 @@ def run_optimization(
         op_point=opt_op,
         model_size="small",
         free_surface_mode="high_froude",
+        wave_length_scales=wave_scales,
     ).run_with_stability_derivatives()
 
     vlm_res = hsb.HydroVLM(

@@ -24,6 +24,19 @@ Done:
   - Validated: Wigley closed form (0.13%), 2D vortex (<0.5%), infinite-Froude
     image limit (0.02% kernel, 0.4% through VLM/LL).
 
+- Follow-up review fixes, merged from branch `hydrosandbox-fixes`:
+  - `wing_thickness_wave_sources` now interpolates chord and thickness jumps
+    onto the submerged `[t_lo, t_hi]` sub-interval (fixing tapered piercing struts).
+  - `kelvin_wave_resistance` infers quadrature scales from any numeric
+    coordinates in partially symbolic `Opti` graphs. (A symbolic `velocity`
+    still requires `reference_velocity`: the branch's 5 m/s default was dropped
+    on merge.)
+  - `HydroBuildup._build_wave_lift_elements` projects elliptical weights onto
+    vertical (`|u_z|`) vs lateral (`|u_y|`) lifting spans so multi-section
+    winglet / C-foil tips do not mix vertical lift and tip sideforce.
+  - Fixed `junction_interference_drag` exponent to Hoerner Ch. 8 Eq. 2
+    (`/ tc**2`) and re-exported wave-resistance and biplane helpers at top level.
+
 - Hull in the loop (`hydrosandbox/hull/`): port of boatmath (`hullgeom`,
   `thinship`) to differentiable Python.
   - `Hull`: offsets table (from numbers, mesh, or boatmath hull-record geometry);
@@ -65,11 +78,8 @@ Left (hull port):
 Left:
 - Free-surface effect on *lift* is still the image approximation (kappa); a
   finite-Froude near field (cf. boatmath `thinship::nearfield`) is not ported.
-- Buildup wave quadrature uses default length scales when geometry is symbolic;
-  pass `wave_length_scales` for unusual sizes (large craft, very shallow foils).
 - A foil lying exactly on the surface gives a large, meaningless wave drag in
   VLM/LL (linear theory invalid there; hard clipping).
-- `junction_interference_drag` misquotes Hoerner (`/(tc+0.02)**3` should be `/tc**2`).
 - Free surface is fixed at constant z in geometry axes (pitches with alpha; no heel).
 - Junction drag is buildup-only, cavitation penalty defaults differ, VLM is
   inviscid; HydroLiftingLine is linear despite its docstring.

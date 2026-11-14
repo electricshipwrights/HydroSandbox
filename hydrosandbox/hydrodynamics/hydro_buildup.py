@@ -1086,6 +1086,8 @@ class HydroBuildup(ExplicitAnalysis):
                     ],
                     "force_y": sect_L * L_dir_g[1],
                     "force_z": sect_L * L_dir_g[2],
+                    "u_y": L_dir_g[1],
+                    "u_z": L_dir_g[2],
                     "smear": 0.5 * mean_chord,
                     "span": sectional_spans[sect_id] * f_sub,
                 }
@@ -1269,15 +1271,24 @@ class HydroBuildup(ExplicitAnalysis):
                 continue
             total_fy = sum(rec["force_y"] for rec in side)
             total_fz = sum(rec["force_z"] for rec in side)
-            total_span = sum(rec["span"] for rec in side) + 1e-12
+            spans_y = [rec["span"] * np.abs(rec["u_y"]) for rec in side]
+            spans_z = [rec["span"] * np.abs(rec["u_z"]) for rec in side]
+            total_sy = sum(spans_y) + 1e-12
+            total_sz = sum(spans_z) + 1e-12
 
             pieces = []
-            span_before = 0.0
-            for rec in side:
+            sy_before = 0.0
+            sz_before = 0.0
+            for rec, sy_i, sz_i in zip(side, spans_y, spans_z):
                 for j in range(n_sub):
-                    eta = (span_before + (j + 0.5) / n_sub * rec["span"]) / total_span
-                    d_eta = rec["span"] / n_sub / total_span
-                    shape = d_eta * np.sqrt(np.fmax(1.0 - eta**2, 0.0) + 1e-12)
+                    eta_y = (sy_before + (j + 0.5) / n_sub * sy_i) / total_sy
+                    d_eta_y = (sy_i / n_sub) / total_sy
+                    shape_y = d_eta_y * np.sqrt(np.fmax(1.0 - eta_y**2, 0.0) + 1e-12)
+
+                    eta_z = (sz_before + (j + 0.5) / n_sub * sz_i) / total_sz
+                    d_eta_z = (sz_i / n_sub) / total_sz
+                    shape_z = d_eta_z * np.sqrt(np.fmax(1.0 - eta_z**2, 0.0) + 1e-12)
+
                     t0, t1 = j / n_sub, (j + 1) / n_sub
                     start = [
                         (1.0 - t0) * rec["start"][k] + t0 * rec["end"][k] for k in range(3)
@@ -1285,16 +1296,18 @@ class HydroBuildup(ExplicitAnalysis):
                     end = [
                         (1.0 - t1) * rec["start"][k] + t1 * rec["end"][k] for k in range(3)
                     ]
-                    pieces.append((start, end, shape, rec["smear"]))
-                span_before = span_before + rec["span"]
+                    pieces.append((start, end, shape_y, shape_z, rec["smear"]))
+                sy_before = sy_before + sy_i
+                sz_before = sz_before + sz_i
 
-            shape_sum = sum(piece[2] for piece in pieces)
-            for start, end, shape, smear in pieces:
+            sum_shape_y = sum(piece[2] for piece in pieces) + 1e-30
+            sum_shape_z = sum(piece[3] for piece in pieces) + 1e-30
+            for start, end, shape_y, shape_z, smear in pieces:
                 add(
                     start,
                     end,
-                    total_fy * shape / shape_sum,
-                    total_fz * shape / shape_sum,
+                    total_fy * shape_y / sum_shape_y,
+                    total_fz * shape_z / sum_shape_z,
                     smear,
                 )
         return elements

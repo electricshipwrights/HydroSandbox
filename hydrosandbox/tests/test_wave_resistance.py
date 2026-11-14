@@ -254,3 +254,95 @@ def test_buildup_wave_drag_is_differentiable_in_opti():
     assert float(sol(res["D_wave"])) == pytest.approx(
         float(onp.ravel(numeric["D_wave"])[0]), rel=1e-6
     )
+
+
+def test_tapered_surface_piercing_strut_wave_drag_matches_lifting_line():
+    """Tapered surface-piercing strut sources must interpolate chord to the waterline."""
+    strut = Strut.from_dimensions(
+        root_xyz=[0.0, 0.0, -0.35],
+        length=0.85,
+        root_chord=0.20,
+        tip_chord=0.05,
+    )
+    assembly = HydrofoilAssembly(struts=[strut], s_ref=0.10, c_ref=0.15, b_ref=0.85)
+    op = HydroOperatingPoint(velocity=2.0, alpha=0.0, surface_z=0.0)
+
+    buildup = HydroBuildup(assembly, op).run()
+    lifting_line = HydroLiftingLine(assembly, op).run()
+    d_buildup = float(onp.ravel(buildup["D_wave"])[0])
+    assert d_buildup > 0.0
+    assert d_buildup == pytest.approx(lifting_line["D_wave"], rel=0.05)
+
+
+def test_symbolic_velocity_in_opti_needs_a_reference_velocity():
+    """A symbolic speed solves with `wave_reference_velocity`, and is an error without."""
+    airfoil = asb.Airfoil("naca0012")
+
+    def problem(**buildup_options):
+        opti = asb.Opti()
+        velocity = opti.variable(init_guess=5.0, lower_bound=3.0, upper_bound=8.0)
+        assembly = HydrofoilAssembly(
+            foils=[
+                Foil(
+                    symmetric=True,
+                    xsecs=[
+                        asb.WingXSec(xyz_le=[0.0, 0.0, -0.35], chord=0.10, twist=3.0, airfoil=airfoil),
+                        asb.WingXSec(xyz_le=[0.0, 0.35, -0.35], chord=0.08, twist=3.0, airfoil=airfoil),
+                    ],
+                )
+            ]
+        )
+        op = HydroOperatingPoint(velocity=velocity, alpha=0.0, surface_z=0.0)
+        res = HydroBuildup(assembly, op, model_size="small", **buildup_options).run()
+        return opti, velocity, res
+
+    with pytest.raises(ValueError, match="reference_velocity"):
+        problem()
+
+    opti, velocity, res = problem(wave_reference_velocity=5.0)
+    opti.subject_to(res["L"] == 200.0)
+    opti.minimize(res["D"])
+    sol = opti.solve(verbose=False)
+    assert 3.0 <= float(sol(velocity)) <= 8.0
+    assert float(sol(res["D_wave"])) >= 0.0
+
+
+def test_winglet_foil_wave_elements_do_not_leak_vertical_lift_onto_winglet():
+    """Vertical tip winglets must not receive the horizontal main foil's vertical lift."""
+    airfoil = asb.Airfoil("naca0012")
+    foil = Foil(
+        name="Winglet Foil",
+        symmetric=True,
+        xsecs=[
+            asb.WingXSec(xyz_le=[0.0, 0.0, -0.35], chord=0.12, twist=4.0, airfoil=airfoil),
+            asb.WingXSec(xyz_le=[0.0, 0.40, -0.35], chord=0.08, twist=4.0, airfoil=airfoil),
+            asb.WingXSec(xyz_le=[0.0, 0.40, -0.20], chord=0.06, twist=0.0, airfoil=airfoil),
+        ],
+    )
+    assembly = HydrofoilAssembly(foils=[foil])
+    op = HydroOperatingPoint(velocity=6.0, alpha=0.0, surface_z=0.0)
+    res = HydroBuildup(assembly, op, model_size="small").run()
+    elems = res["wing_hydro_components"][0].wave_elements
+
+    horiz_fz = 0.0
+    winglet_fz = 0.0
+    horiz_fy = 0.0
+    winglet_fy = 0.0
+    for za, zb, fy, fz in zip(
+        elems["xyz_a"][2], elems["xyz_b"][2], elems["force_y"], elems["force_z"]
+    ):
+        za_f = float(onp.ravel(za)[0])
+        zb_f = float(onp.ravel(zb)[0])
+        fy_f = float(onp.ravel(fy)[0])
+        fz_f = float(onp.ravel(fz)[0])
+        if abs(za_f - zb_f) > 0.01:
+            winglet_fz += abs(fz_f)
+            winglet_fy += abs(fy_f)
+        else:
+            horiz_fz += abs(fz_f)
+            horiz_fy += abs(fy_f)
+
+    assert horiz_fz > 100.0
+    assert winglet_fy > 10.0
+    assert winglet_fz / (horiz_fz + winglet_fz) < 0.005
+    assert horiz_fy / (horiz_fy + winglet_fy) < 0.02
