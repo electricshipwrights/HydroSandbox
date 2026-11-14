@@ -65,7 +65,19 @@ Done:
   range. The hummingbird runs use placeholder loading (91 kg, CG over the
   centre of buoyancy, one demihull), not the real boat's.
 
+- Merged `hydrosandbox-fixes` and `electric-motor` (propulsion: B-series,
+  motors, hull-propeller interaction) into `hydrosandbox`. Fixed on merge:
+  `hull_propeller_interaction` mixed degrees and radians for trim (degrees now).
+- `PoweredCraftBuildup` (propulsion/powered_craft.py) couples the two: drive
+  masses as point masses on the craft, thrust at the propeller along the shaft,
+  propulsion sized at the craft's thrust and attitude. `solve()` iterates
+  attitude -> RPM -> masses (~45 s on a 61x41 hull); residuals for Opti.
+  `CraftBuildup` gained `point_masses` and `shaft_angle`.
+
 Left (hull port):
+- `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
+  fixed-loading case on the hummingbird hull; the full study (GM_L floors, CG and
+  thrust-height variables) has not been run. It does not use the propulsion model.
 - Stability is static only: no pitch inertia, added mass or damping, so no
   porpoising or motion-in-waves prediction.
 - boatmath's 2D+t planing `lift` and `nearfield` (hull flow at the foil) not ported.

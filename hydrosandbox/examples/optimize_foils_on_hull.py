@@ -20,8 +20,10 @@ convex (wave interference oscillates with foil position), so each floor is solve
 from several starting layouts and the best feasible result kept.
 
     python hydrosandbox/examples/optimize_foils_on_hull.py --velocity 4.5 \\
-        --gml-fractions 0.6,0.8,1.0 --stabilizer --cg-range -0.5,0.5 \\
-        --thrust-height-range -0.4,0.2
+        --gml-fractions 0.6,0.8,1.0 --stabilizer --cg-range=-0.5,0.5 \\
+        --thrust-height-range=-0.4,0.2
+
+(Ranges that start with a minus sign need the ``--option=lo,hi`` form.)
 
 Each case is reported against two baselines: the bare hull as loaded, and the bare
 hull with the same loading freedoms optimized (so that what the foils buy is not
@@ -362,7 +364,7 @@ if __name__ == "__main__":
     parser.add_argument("--stabilizer", action="store_true", help="add a stabilizer T-foil")
     parser.add_argument(
         "--cg-range", type=str, default=None,
-        help="allowed fore-aft CG shift 'lo,hi' [m, aft positive], e.g. -0.5,0.5",
+        help="allowed fore-aft CG shift 'lo,hi' [m, aft positive], e.g. --cg-range=-0.5,0.5",
     )
     parser.add_argument(
         "--mass-range", type=str, default=None, help="allowed all-up mass 'lo,hi' [kg]"

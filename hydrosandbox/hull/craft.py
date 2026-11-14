@@ -74,6 +74,8 @@ class CraftBuildup(ExplicitAnalysis):
         trim: Vectorizable = 0.0,
         water: Water | None = None,
         xyz_thrust: Sequence[Vectorizable] | None = None,
+        shaft_angle: Vectorizable = 0.0,
+        point_masses: Sequence[tuple[Vectorizable, Sequence[Vectorizable]]] | None = None,
         model_size: str = "small",
         free_surface_mode: Literal[
             "high_froude", "froude_blended", "rigid_lid"
@@ -97,9 +99,17 @@ class CraftBuildup(ExplicitAnalysis):
         sinkage : Downward displacement of the centre of gravity from its design
             position [m].
         trim : Bow-up rotation about the centre of gravity [deg].
-        xyz_thrust : A point on the thrust line (which runs along the hull's
-            x-axis), in geometry axes. If None, thrust acts through the centre of
-            gravity along the direction of travel: no moment, no vertical force.
+        mass, xyz_cg : Mass [kg] and centre of gravity [m, geometry axes] of
+            everything not listed in ``point_masses``.
+        point_masses : Further items as ``(mass, xyz)`` pairs (a motor, a battery,
+            crew...). They add to the mass and shift the centre of gravity; the
+            attitude's pivot is the combined centre of gravity.
+        xyz_thrust : The point the thrust acts at (the propeller), in geometry
+            axes. If None, thrust acts through the centre of gravity along the
+            direction of travel: no moment, no vertical force.
+        shaft_angle : Inclination of the thrust line to the hull's x-axis [deg],
+            positive for a shaft running down and aft (thrust then has an upward
+            component). The thrust is sized so its horizontal part equals the drag.
         include_transom_drag : Add the hydrostatic thrust a dry transom loses
             (``rho g`` times the transom's first moment, scaled by its dryness), as
             boatmath's ``study --transom-drag``.
@@ -119,8 +129,19 @@ class CraftBuildup(ExplicitAnalysis):
         self.hull = hull
         self.assembly = assembly
         self.velocity = velocity
+        self.base_mass = mass
+        self.base_xyz_cg = xyz_cg
+        self.point_masses = list(point_masses or [])
+        if self.point_masses:
+            total = mass + sum(m for m, _ in self.point_masses)
+            xyz_cg = [
+                (mass * xyz_cg[k] + sum(m * xyz[k] for m, xyz in self.point_masses)) / total
+                for k in range(3)
+            ]
+            mass = total
         self.mass = mass
         self.xyz_cg = xyz_cg
+        self.shaft_angle = shaft_angle
         self.sinkage = sinkage
         self.trim = trim
         self.water = Water.seawater() if water is None else water
@@ -314,15 +335,23 @@ class CraftBuildup(ExplicitAnalysis):
             statics["x_cb"], statics["z_cb"], D_hull + D_wave, 0.0
         )
         if self.xyz_thrust is not None:
-            thrust = D / cos
+            # Thrust along the shaft, inclined (trim + shaft angle) above horizontal.
+            cos_shaft = np.cosd(trim + self.shaft_angle)
+            sin_shaft = np.sind(trim + self.shaft_angle)
+            thrust = D / cos_shaft
             x_t, z_t = self._earth(self.xyz_thrust[0], self.xyz_thrust[2])
-            F_z = F_z + thrust * sin
-            M_y = M_y + moment_about_cg(x_t, z_t, -thrust * cos, thrust * sin)
+            F_z = F_z + thrust * sin_shaft
+            M_y = M_y + moment_about_cg(x_t, z_t, -thrust * cos_shaft, thrust * sin_shaft)
+        else:
+            thrust = D
 
         return {
             "F_z_net": F_z,
             "M_y_net": M_y,
             "D": D,
+            "thrust": thrust,
+            "mass": self.mass,
+            "xyz_cg": self.xyz_cg,
             "P_drag": D * velocity,
             "D_hull_viscous": D_hull_viscous,
             "D_transom": D_transom,
@@ -423,7 +452,10 @@ class CraftBuildup(ExplicitAnalysis):
         with no stable attitude, e.g. a lifting foil far forward at speed).
         """
         hull = kwargs.get("hull", args[0] if args else None)
-        weight = float(kwargs["mass"]) * 9.80665
+        weight = 9.80665 * (
+            float(kwargs["mass"])
+            + sum(float(m) for m, _ in (kwargs.get("point_masses") or []))
+        )
         depth_scale = float(hull.levels[-1] - hull.levels[0])
         scale = _onp.array([weight, weight * hull.length])
         fast = dict(kwargs, include_interference_breakdown=False)

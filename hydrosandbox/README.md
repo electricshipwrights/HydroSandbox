@@ -50,6 +50,19 @@ res["trim"], res["sinkage"], res["D"], res["D_wave_interference"]
 
 `CraftBuildup.run_with_stability()` adds the craft's static heave and pitch stiffness at an attitude, in particular the **heave-free pitch stiffness** `k_pitch` and the effective longitudinal metacentric height `GM_L = k_pitch / (m g)`. They are differentiable, so they can be constrained in a design problem: [`examples/optimize_foils_on_hull.py`](examples/optimize_foils_on_hull.py) minimizes drag over foil position, depth, span, chords and incidence (main foil plus optional stabilizer), with the attitude in equilibrium and `GM_L` above a floor. This is static stability only; damping and porpoising need unsteady forces that are not modelled.
 
+[`PoweredCraftBuildup`](propulsion/powered_craft.py) joins the craft to its electric drive. The motor, controller, gearbox and battery masses load the hull where they are mounted (moving the centre of gravity, and so trim and drag); the propeller position and `shaft_angle` set the thrust's line of action; and the thrust the craft needs, with the hull's wake at the propeller at the craft's actual attitude, sizes the power and the battery. `PoweredCraftBuildup.solve(...)` closes that loop for a fixed design; in `Opti`, constrain the returned residuals to zero.
+
+```python
+res = hsb.PoweredCraftBuildup.solve(
+    hull=hull, velocity=4.5, mass=60.0, xyz_cg=[2.9, 0.0, 0.05],   # without the drive
+    xyz_propeller=[5.3, 0.0, -0.30], xyz_motor=[4.8, 0.0, 0.0], xyz_battery=[2.9, 0.0, 0.0],
+    shaft_angle=0.0,
+    propulsion_options=dict(propeller_diameter=0.20, propeller_pitch_ratio=1.0,
+                            propeller_ear=0.5, motor_kv=60.0, endurance_hours=1.0),
+)
+res["trim"], res["D"], res["P_battery"], res["mass_battery_sized"], res["xyz_cg"]
+```
+
 Validation against boatmath's own Rust output:
 
 | Case | Quantity | Agreement |

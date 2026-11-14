@@ -41,6 +41,7 @@ from hydrosandbox.propulsion.motor import (
     motor_performance_loss,
     through_gearbox,
 )
+from hydrosandbox.propulsion.powered_craft import PoweredCraftBuildup
 
 __all__ = [
     "KT_TERMS",
@@ -76,4 +77,5 @@ __all__ = [
     "match_motors_to_curve",
     "hull_propeller_interaction",
     "ElectricPropulsionBuildup",
+    "PoweredCraftBuildup",
 ]
