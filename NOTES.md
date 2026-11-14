@@ -24,6 +24,25 @@ Done:
   - Validated: Wigley closed form (0.13%), 2D vortex (<0.5%), infinite-Froude
     image limit (0.02% kernel, 0.4% through VLM/LL).
 
+- Hull in the loop (`hydrosandbox/hull/`): first stage of porting boatmath
+  (`hullgeom`, `thinship`) to differentiable Python.
+  - `Hull`: offsets table (from numbers, mesh, or boatmath hull-record geometry),
+    hydrostatics / ITTC-57 / thin-ship sources / transom closure at any
+    sinkage and trim. Matches boatmath's Rust output on Wigley (Rw 0.6%, Rv 0.05%;
+    reference numbers from `cargo run -p thinship --example wigley_curve`, built
+    in a `rust:1-slim` container since there is no Rust toolchain on this box).
+  - `CraftBuildup`: hull + foil assembly as one rigid craft; shared wave
+    spectrum (interference), F_z / M_y residuals for sinkage and trim.
+
+Left (hull port):
+- Hull's own dynamic sinkage/trim/lift (boatmath `squat`, `nearfield`, 2D+t
+  `lift`) not ported: attitude sees hydrostatics, foils and thrust line only.
+- Slow: ~15-35 s per equilibrium solve (800 hull cells in the wave integral).
+  Pre-integrating depth per station, as boatmath does, is the obvious speedup.
+- No real hull tested (no CAD fixtures on this machine); only Wigley shapes.
+- Transom closure ported but validated only for ordering, not against boatmath.
+- Hull near field at the foil, and foil pressure on the hull, not modelled.
+
 Left:
 - Free-surface effect on *lift* is still the image approximation (kappa); a
   finite-Froude near field (cf. boatmath `thinship::nearfield`) is not ported.

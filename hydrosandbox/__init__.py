@@ -14,7 +14,7 @@ from aerosandbox import (
     Wing,
     WingXSec,
 )
-from hydrosandbox import fluid, geometry, hydrodynamics, library, performance
+from hydrosandbox import fluid, geometry, hull, hydrodynamics, library, performance
 from hydrosandbox.fluid import Water
 from hydrosandbox.geometry import (
     Foil,
@@ -26,6 +26,7 @@ from hydrosandbox.geometry import (
     fuselage_submerged_volume_and_centroid,
     wing_submerged_volume_and_centroid,
 )
+from hydrosandbox.hull import CraftBuildup, Hull
 from hydrosandbox.hydrodynamics import (
     HydroBuildup,
     HydroLiftingLine,
@@ -80,6 +81,7 @@ def run_tests() -> int:
 __all__ = [
     "fluid",
     "geometry",
+    "hull",
     "hydrodynamics",
     "library",
     "performance",
@@ -90,6 +92,8 @@ __all__ = [
     "Strut",
     "HydroFuselage",
     "HydrofoilAssembly",
+    "Hull",
+    "CraftBuildup",
     "clip_wing_to_free_surface",
     "export_assembly_step",
     "wing_submerged_volume_and_centroid",
