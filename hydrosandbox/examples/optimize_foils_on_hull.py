@@ -50,7 +50,11 @@ def scalar(value) -> float:
     return float(onp.ravel(value)[0])
 
 
-def build_assembly(design: dict, stabilizer: bool) -> hsb.HydrofoilAssembly:
+def build_assembly(
+    design: dict,
+    stabilizer: bool,
+    strut_freeboard: float = 0.25,
+) -> hsb.HydrofoilAssembly:
     """A main T-foil and, optionally, a stabilizer T-foil, from design variables."""
     main_airfoil = asb.Airfoil("naca2412")
     strut_airfoil = asb.Airfoil("naca0012")
@@ -75,7 +79,7 @@ def build_assembly(design: dict, stabilizer: bool) -> hsb.HydrofoilAssembly:
         strut = hsb.Strut.from_dimensions(
             name=f"{name} strut",
             root_xyz=[x + 0.1 * root_chord, 0.0, -depth],
-            length=depth,
+            length=depth + strut_freeboard,
             root_chord=0.8 * root_chord,
             tip_chord=0.8 * root_chord,
             airfoil=strut_airfoil,
@@ -288,7 +292,8 @@ def optimize(
         if stabilizer:
             constraints.append(design["x_stab"] >= design["x_main"] + 0.5)
     if gml_floor is not None:
-        constraints.append(res["GM_L"] / gml_floor >= 1.0)
+        gml_scale = max(abs(float(gml_floor)), 1.0)
+        constraints.append((res["GM_L"] - gml_floor) / gml_scale >= 0.0)
 
     opti.subject_to(constraints)
     opti.minimize(res["D"] / (0.1 * weight))

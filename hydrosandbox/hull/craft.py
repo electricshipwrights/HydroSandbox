@@ -89,6 +89,8 @@ class CraftBuildup(ExplicitAnalysis):
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
         buildup_options: dict[str, Any] | None = None,
+        thrust_deduction: Vectorizable = 0.0,
+        squat_level: float = 1,
     ):
         """
         Parameters
@@ -113,6 +115,10 @@ class CraftBuildup(ExplicitAnalysis):
         shaft_angle : Inclination of the thrust line to the hull's x-axis [deg],
             positive for a shaft running down and aft (thrust then has an upward
             component). The thrust is sized so its horizontal part equals the drag.
+        thrust_deduction : Hull thrust-deduction fraction ``t`` in [0, 1).
+            When ``xyz_thrust`` is set, propeller suction adds aft drag
+            ``t * thrust * cos(trim + shaft_angle)`` at the hull's centre of
+            buoyancy, so ``thrust = D / ((1 - t) * cos(trim + shaft_angle))``.
         demihull_spacing : If given [m], the craft is a catamaran: ``hull`` is one
             demihull, and there are two, centred this far apart either side of the
             craft's centreline ``y = 0``. Buoyancy, friction and transom drag
@@ -131,6 +137,7 @@ class CraftBuildup(ExplicitAnalysis):
         pitch_rate : Bow-up pitch rate about the centre of gravity [rad/s]. Seen by
             the foils (quasi-steadily, as a change in local inflow), not by the hull.
             Used by ``run_with_stability`` to find the foils' pitch damping.
+        squat_level : Quadrature refinement level passed to ``Hull.dynamic_force``.
         include_interference_breakdown : Also evaluate the hull's and the
             assembly's wave resistance alone (two more wave integrals), to report
             the interference between them.
@@ -173,6 +180,8 @@ class CraftBuildup(ExplicitAnalysis):
         self.wave_length_scales = wave_length_scales
         self.wave_reference_velocity = wave_reference_velocity
         self.buildup_options = buildup_options or {}
+        self.thrust_deduction = thrust_deduction
+        self.squat_level = squat_level
 
     def _earth(self, x, z):
         return self.hull.to_earth(
@@ -288,6 +297,7 @@ class CraftBuildup(ExplicitAnalysis):
                 pivot,
                 x_ref=x_cg,
                 reference_velocity=self.wave_reference_velocity,
+                level=self.squat_level,
                 demihull_spacing=self.demihull_spacing,
             )
             F_z = F_z + dynamic["force_up"]
@@ -298,17 +308,15 @@ class CraftBuildup(ExplicitAnalysis):
         foil_sources: dict[str, Any] | None = None
         D_foil = 0.0
         if self.assembly is not None:
-            # HydroBuildup's free surface is flat in geometry axes, so place it at
-            # the true depth of the main foil beneath the trimmed waterplane.
-            lifting = self.assembly.foils or self.assembly.wings
-            anchor = lifting[0].xsecs[0].xyz_le
-            _, z_anchor_earth = self._earth(anchor[0], anchor[2])
+            # Map geometry (x, z) to height above the undisturbed waterplane
+            # (-z_earth is local depth), so swept, aft, and trimmed surfaces
+            # all see the true slanted waterplane.
             op_point = HydroOperatingPoint(
                 water=water,
                 velocity=velocity,
                 alpha=trim,
                 q=self.pitch_rate,
-                surface_z=anchor[2] - z_anchor_earth,
+                surface_z=lambda x_g, z_g: self._earth(x_g, z_g)[1],
             )
             options = dict(
                 model_size=self.model_size,
@@ -328,7 +336,6 @@ class CraftBuildup(ExplicitAnalysis):
 
             # Forces in geometry axes (x aft, z up), buoyancy included -> earth axes.
             f_g = foil["F_g_with_buoyancy"]
-            f_x_earth = f_g[0] * cos + f_g[2] * sin
             f_z_earth = -f_g[0] * sin + f_g[2] * cos
             F_z = F_z + f_z_earth
             M_y = M_y + foil["M_g_with_buoyancy"][1]
@@ -342,7 +349,7 @@ class CraftBuildup(ExplicitAnalysis):
                     "xyz_b": (xb, _stack([elements["xyz_b"][1]]), zb),
                     "source_flux": _stack([elements["source_flux"]]),
                     "force_y": _stack([elements["force_y"]]),
-                    "force_z": _stack([elements["force_z"]]) * cos,
+                    "force_z": _stack([elements["force_z"]]),
                     "smear_length": _stack([elements["smear_length"]]),
                 }
 
@@ -368,14 +375,22 @@ class CraftBuildup(ExplicitAnalysis):
         )
         if self.xyz_thrust is not None:
             # Thrust along the shaft, inclined (trim + shaft angle) above horizontal.
+            # With thrust deduction t, propeller suction adds t * T * cos(shaft) aft drag
+            # at the hull's centre of buoyancy, so T = D / ((1 - t) * cos(shaft)).
             cos_shaft = np.cosd(trim + self.shaft_angle)
             sin_shaft = np.sind(trim + self.shaft_angle)
-            thrust = D / cos_shaft
+            thrust = D / np.fmax((1.0 - self.thrust_deduction) * cos_shaft, 1e-6)
+            suction_drag = self.thrust_deduction * thrust * cos_shaft
             x_t, z_t = self._earth(self.xyz_thrust[0], self.xyz_thrust[2])
             F_z = F_z + thrust * sin_shaft
-            M_y = M_y + moment_about_cg(x_t, z_t, -thrust * cos_shaft, thrust * sin_shaft)
+            M_y = M_y + moment_about_cg(
+                x_t, z_t, -thrust * cos_shaft, thrust * sin_shaft
+            )
+            M_y = M_y + moment_about_cg(
+                statics["x_cb"], statics["z_cb"], suction_drag, 0.0
+            )
         else:
-            thrust = D
+            thrust = D / np.fmax(1.0 - self.thrust_deduction, 1e-6)
 
         return {
             "F_z_net": F_z,
@@ -408,13 +423,14 @@ class CraftBuildup(ExplicitAnalysis):
 
     def run_with_stability(
         self,
-        d_sinkage: float = 2e-3,
-        d_trim: float = 0.1,
+        d_sinkage: float = 1e-3,
+        d_trim: float = 0.05,
         d_pitch_rate: float = 0.01,
     ) -> dict[str, Any]:
         """
         ``run()``, plus the craft's static heave and pitch stiffness at this attitude
-        and speed, from two further evaluations (sinkage and trim each nudged).
+        and speed. Uses exact CasADi algorithmic differentiation when symbolic
+        (``asb.Opti``) and central finite differences when numeric.
 
         Meaningful at an equilibrium attitude. Works symbolically, so the stiffnesses
         can be constrained or optimized in ``asb.Opti``. Added to the results:
@@ -441,30 +457,61 @@ class CraftBuildup(ExplicitAnalysis):
         import copy
 
         base = self.run()
+        is_symbolic = np.is_casadi_type(
+            base["F_z_net"], recursive=False
+        ) or np.is_casadi_type(base["M_y_net"], recursive=False)
 
-        def nudged(ds: float, dt: float) -> dict[str, Any]:
-            other = copy.copy(self)
-            other.sinkage = self.sinkage + ds
-            other.trim = self.trim + dt
-            other.include_interference_breakdown = False
-            return other.run()
+        if is_symbolic:
+            import casadi as ca
 
-        sunk = nudged(d_sinkage, 0.0)
-        pitched = nudged(0.0, d_trim)
+            s_var = ca.MX.sym("_stab_sinkage")
+            t_var = ca.MX.sym("_stab_trim")
+            probe = copy.copy(self)
+            probe.sinkage = s_var
+            probe.trim = t_var
+            probe.include_interference_breakdown = False
+            probed = probe.run()
+
+            vars_st = ca.vertcat(s_var, t_var)
+            vals_st = ca.vertcat(self.sinkage, self.trim)
+            jac = ca.jacobian(
+                ca.vertcat(probed["F_z_net"], probed["M_y_net"]),
+                vars_st,
+            )
+            jac_at = ca.substitute(jac, vars_st, vals_st)
+            rad_per_deg = _onp.pi / 180.0
+            f_s = jac_at[0, 0]
+            f_t = jac_at[0, 1] / rad_per_deg
+            m_s = jac_at[1, 0]
+            m_t = jac_at[1, 1] / rad_per_deg
+        else:
+            def nudged(ds: float, dt: float) -> dict[str, Any]:
+                other = copy.copy(self)
+                other.sinkage = self.sinkage + ds
+                other.trim = self.trim + dt
+                other.include_interference_breakdown = False
+                return other.run()
+
+            sunk_p = nudged(d_sinkage, 0.0)
+            sunk_m = nudged(-d_sinkage, 0.0)
+            pitch_p = nudged(0.0, d_trim)
+            pitch_m = nudged(0.0, -d_trim)
+            d_trim_rad = d_trim * _onp.pi / 180.0
+
+            f_s = (sunk_p["F_z_net"] - sunk_m["F_z_net"]) / (2.0 * d_sinkage)
+            m_s = (sunk_p["M_y_net"] - sunk_m["M_y_net"]) / (2.0 * d_sinkage)
+            f_t = (pitch_p["F_z_net"] - pitch_m["F_z_net"]) / (2.0 * d_trim_rad)
+            m_t = (pitch_p["M_y_net"] - pitch_m["M_y_net"]) / (2.0 * d_trim_rad)
+
+        # The foils' pitch damping, from one further evaluation at a small pitch rate
+        # (the response is linear in it), numeric or symbolic alike.
         if self.assembly is not None:
             pitching = copy.copy(self)
             pitching.pitch_rate = self.pitch_rate + d_pitch_rate
             pitching.include_interference_breakdown = False
-            pitching = pitching.run()
-            c_pitch = -(pitching["M_y_net"] - base["M_y_net"]) / d_pitch_rate
+            c_pitch = -(pitching.run()["M_y_net"] - base["M_y_net"]) / d_pitch_rate
         else:
             c_pitch = 0.0
-        d_trim_rad = d_trim * _onp.pi / 180.0
-
-        f_s = (sunk["F_z_net"] - base["F_z_net"]) / d_sinkage
-        m_s = (sunk["M_y_net"] - base["M_y_net"]) / d_sinkage
-        f_t = (pitched["F_z_net"] - base["F_z_net"]) / d_trim_rad
-        m_t = (pitched["M_y_net"] - base["M_y_net"]) / d_trim_rad
 
         k_pitch = -(m_t - m_s * f_t / f_s)
         base.update(
@@ -500,14 +547,12 @@ class CraftBuildup(ExplicitAnalysis):
         below ``tolerance``. Raises ``RuntimeError`` if no balance is found (a craft
         with no stable attitude, e.g. a lifting foil far forward at speed).
         """
-        hull = kwargs.get("hull", args[0] if args else None)
-        weight = 9.80665 * (
-            float(kwargs["mass"])
-            + sum(float(m) for m, _ in (kwargs.get("point_masses") or []))
-        )
+        fast = dict(kwargs, include_interference_breakdown=False)
+        probe = cls(*args, sinkage=0.0, trim=0.0, **fast)
+        hull = probe.hull
+        weight = float(probe.mass) * float(probe.water.gravity)
         depth_scale = float(hull.levels[-1] - hull.levels[0])
         scale = _onp.array([weight, weight * hull.length])
-        fast = dict(kwargs, include_interference_breakdown=False)
 
         def residual(state):
             res = cls(*args, sinkage=float(state[0]), trim=float(state[1]), **fast).run()
@@ -548,21 +593,28 @@ class CraftBuildup(ExplicitAnalysis):
                 step = _onp.linalg.solve(jacobian, -value)
             except _onp.linalg.LinAlgError:
                 break
+            if not _onp.all(_onp.isfinite(step)):
+                break
             # Limit the step, then backtrack until the residual falls.
             limit = _onp.array([0.25 * depth_scale, 3.0])
             step = step * min(1.0, float(_onp.min(limit / _onp.maximum(_onp.abs(step), 1e-300))))
             damping = 1.0
+            accepted = False
             while damping > 1e-3:
                 trial = clamp(state + damping * step)
                 trial_value = residual(trial)
                 if _onp.max(_onp.abs(trial_value)) < norm:
+                    state, value = trial, trial_value
+                    accepted = True
                     break
                 damping *= 0.5
-            state, value = trial, trial_value
-        if float(_onp.max(_onp.abs(value))) >= max(tolerance, 1e-12) * 10:
+            if not accepted:
+                break
+        final_norm = float(_onp.max(_onp.abs(value)))
+        if not (final_norm < max(tolerance, 1e-12) * 10):
             raise RuntimeError(
                 "No equilibrium attitude found "
                 f"(last sinkage {state[0]:+.4f} m, trim {state[1]:+.3f} deg, "
-                f"scaled residual {float(_onp.max(_onp.abs(value))):.2e})."
+                f"scaled residual {final_norm:.2e})."
             )
         return cls(*args, sinkage=float(state[0]), trim=float(state[1]), **kwargs).run()
