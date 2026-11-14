@@ -109,6 +109,21 @@ Done:
   and `"twin"` (a T-foil under each hull); `Hull.keel_height`.
 - Avi (2026-11-14): CG may go up to 1.0 m aft; wants two-strut and twin-T
   layouts tried, and hull-foil interaction modelled.
+- Hull wave field at the foils (`include_hull_wave_field`, default on;
+  `Hull.wave_field`, port of boatmath `thinship::nearfield`): elevation within
+  a few mm of boatmath's field grids. It enters the foil as incidence only (the
+  far-field integral already holds the mutual wave drag), and the elevation is
+  taken at the main foil only. On the NACRA: up to ~1 deg inflow change and
+  ~-70 mm elevation near the stern, cutting a fixed foil's lift 10-16%.
+- Merged `memory-opt` (another session's work): `Hull.wave_amplitude_table` +
+  `CraftBuildup(hull_wave_amplitude=...)`, hull state computed once per attitude
+  (`_hull_state`, now also holding the stations and wave field the interaction
+  needs), chunked wave integral, `optimize(use_hull_tables=True)`,
+  `run_with_stability(include_pitch_damping=...)`, BLAS threads pinned in
+  `parallel_map`. 93 tests pass. The `local/` study scripts do not use the
+  tables yet; per-solve memory after the merge not yet measured.
+- Layout study with the wave field (6 m/s, drag <= bare, CG -0.6..+1.0):
+  `local/layouts_6ms.txt`.
 
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
@@ -116,8 +131,10 @@ Left (hull port):
   thrust-height variables) has not been run. It does not use the propulsion model.
 - Stability is static only: no pitch inertia, added mass or damping, so no
   porpoising or motion-in-waves prediction.
-- boatmath's 2D+t planing `lift` and `nearfield` (hull flow at the foil) not ported.
-- The foil's waves do not enter the hull's dynamic force, nor the hull's the foil's inflow.
+- boatmath's 2D+t planing `lift` not ported.
+- The foil's waves do not enter the hull's dynamic force; the foil's field is not
+  reflected in the hull.
+- No hull pitch damping or added inertia (needs boatmath's seakeeping).
 - Default 61x41 offsets give ~2-5% on a shallow real hull; finer grids converge
   to boatmath (121x161: <1% Rw, <2% force).
 - IPOPT needs a good start for the attitude variables; a cold start can report
