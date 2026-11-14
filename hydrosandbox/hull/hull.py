@@ -689,11 +689,17 @@ class Hull(AeroSandboxObject):
         sinkage: Vectorizable = 0.0,
         trim: Vectorizable = 0.0,
         pivot_xz: Sequence[float] = (0.0, 0.0),
+        demihull_spacing: float | None = None,
     ):
         """
         The hull's source-flux transform ``sum Q exp(kappa z - i kx x)`` as a
-        callable ``(kx, kappa) -> (re, im)``, for the ``extra_source_amplitude`` of
-        ``kelvin_wave_resistance``.
+        callable ``(kx, kappa, ky) -> (re, im)``, for the ``extra_source_amplitude``
+        of ``kelvin_wave_resistance``.
+
+        With ``demihull_spacing`` [m], this hull is one of a catamaran's two
+        demihulls, centred ``spacing / 2`` either side of ``y = 0``: their two
+        source systems add with the placement phases ``exp(-/+ i ky spacing / 2)``,
+        i.e. a factor ``2 cos(ky spacing / 2)``, which carries their interference.
 
         Equivalent to ``wave_sources`` (same cells, same transom closure) but
         integrates each station's depth first, as boatmath's sectional kernel
@@ -702,7 +708,7 @@ class Hull(AeroSandboxObject):
         """
         strips = self._strips(velocity, gravity, sinkage, trim, pivot_xz)
 
-        def amplitude(kx_row, kappa_row):
+        def amplitude(kx_row, kappa_row, ky_row=None):
             kx_row = np.reshape(kx_row, (1, -1))
             kappa_row = np.reshape(kappa_row, (1, -1))
             g_hull = self._sum_groups(
@@ -729,6 +735,11 @@ class Hull(AeroSandboxObject):
                     g_hollow, strips["x_hollow"], strips["dx_hollow"], kx_row, sign=-1.0
                 )
                 re, im = re + re_h, im + im_h
+            if demihull_spacing is not None:
+                if ky_row is None:
+                    raise ValueError("A demihull pair's amplitude needs `ky`.")
+                pair = 2.0 * np.cos(0.5 * demihull_spacing * np.reshape(ky_row, (1, -1)))
+                re, im = pair * re, pair * im
             return 2.0 * velocity * re, 2.0 * velocity * im
 
         return amplitude
@@ -757,6 +768,7 @@ class Hull(AeroSandboxObject):
         x_ref: Vectorizable | None = None,
         reference_velocity: float | None = None,
         level: float = 1,
+        demihull_spacing: float | None = None,
     ) -> dict[str, Vectorizable]:
         """
         Thin-ship **dynamic sinkage force and trim moment**: the vertical force and
@@ -781,6 +793,11 @@ class Hull(AeroSandboxObject):
             ``velocity`` is symbolic.
         level : Quadrature refinement (panel counts scale with it; boatmath starts
             at 1 and doubles until converged).
+        demihull_spacing : If given [m], the force and moment on a catamaran of two
+            such demihulls this far apart, each in the other's pressure field as
+            well as its own: every pair of hulls contributes with boatmath's
+            placement factor ``cos(ky dy)``, so the bilinear forms scale by
+            ``2 (1 + cos(ky spacing))``.
 
         Returns
         -------
@@ -923,6 +940,15 @@ class Hull(AeroSandboxObject):
             wq, _ = conj_times_source(w_re, w_im)
             rq_re, rq_im = conj_times_source(r_re, r_im)
             rwq_re, rwq_im = conj_times_source(rw_re, rw_im)
+            if demihull_spacing is not None:
+                k_all = np.reshape(k_row, (1, -1))
+                if repeats > 1:
+                    k_all = tile(k_all, repeats)
+                ky = np.sqrt(np.fmax(k_all**2 - kx_row**2, 0.0))
+                pair = 2.0 * (1.0 + np.cos(demihull_spacing * ky))
+                qq, wq, rq_re, rq_im, rwq_re, rwq_im = (
+                    pair * v for v in (qq, wq, rq_re, rq_im, rwq_re, rwq_im)
+                )
             return qq, wq, rq_re, rq_im, rwq_re, rwq_im
 
         ### Local (principal-value) part: boatmath `Fleet::local_integral`.
@@ -963,7 +989,7 @@ class Hull(AeroSandboxObject):
         kx_grid = (cos_t[:, None] * k_nodes[None, :]).reshape(1, -1)  # theta-major
         k_grid = _onp.tile(k_nodes, n_t).reshape(1, -1)
         qq, wq, rq_re, _, rwq_re, _ = forms(
-            kx_grid, k_grid, contraction=contract(k_nodes), repeats=n_t
+            kx_grid, k_nodes, contraction=contract(k_nodes), repeats=n_t
         )
 
         def per_theta(row):
