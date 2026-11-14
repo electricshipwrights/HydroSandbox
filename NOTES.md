@@ -100,6 +100,16 @@ Done:
   shift with its reference by force x distance (the hollow adds sources but no
   weights). Ported faithfully; flagged to Avi.
 
+- Hull-foil local interaction (`include_hull_foil_interaction`, default on):
+  `Hull.induced_velocity` (hull flow at the foil) and `Hull.pressure_load`
+  (foil's pressure on the hull). Small on the NACRA's slender hulls: <=0.2 deg
+  of inflow change; a T-foil 0.35 m under a hull loses ~3% of its lift to hull
+  suction (6% at 0.10 m clearance).
+- Catamaran foil layouts in the example: `layout="pi"` (one foil, two struts)
+  and `"twin"` (a T-foil under each hull); `Hull.keel_height`.
+- Avi (2026-11-14): CG may go up to 1.0 m aft; wants two-strut and twin-T
+  layouts tried, and hull-foil interaction modelled.
+
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
   fixed-loading case on the hummingbird hull; the full study (GM_L floors, CG and
