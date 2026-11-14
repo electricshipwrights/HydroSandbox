@@ -595,3 +595,78 @@ def merge_wave_elements(*element_sets: dict[str, list]) -> dict[str, list]:
         for key in ("source_flux", "force_y", "force_z", "smear_length"):
             merged[key].extend(elements.get(key, [0.0] * n))
     return merged
+
+
+def element_source_amplitude(
+    xyz_a,
+    xyz_b,
+    velocity: float,
+    density: float,
+    source_flux=None,
+    force_y=None,
+    force_z=None,
+    smear_length=None,
+    surface_z: float = 0.0,
+):
+    """
+    The source-flux transform of a set of line elements (as taken by
+    ``kelvin_wave_resistance``), as a callable ``(kx, kappa, ky) -> (re, im)`` of
+    ``sum Q exp(kappa z - i kx x)`` [m^3/s], for wavenumbers on or off the
+    dispersion curve. Numeric only.
+
+    The set must be symmetric about ``y = 0`` (every element with its mirror
+    image); the transform is then the same for waves heading to port and to
+    starboard, and is what ``kelvin_wave_resistance(extra_source_amplitude=...)``
+    and ``hydrosandbox.hull.hull.wave_field_from_source_amplitude`` take.
+
+    A lifting element is the vortex sheet it trails: vertical dipoles of strength
+    ``F_z / (rho U)`` per unit length over a strip running aft from it, whose
+    transform is that of a source ``i (kappa / kx) F_z / (rho U)`` at the element
+    (on the dispersion curve ``kappa / kx = sec(theta)``). A side force likewise,
+    with ``ky / kx``.
+    """
+    xa, ya, za = (_onp.reshape(_onp.asarray(v, dtype=float), (-1, 1)) for v in xyz_a)
+    xb, yb, zb = (_onp.reshape(_onp.asarray(v, dtype=float), (-1, 1)) for v in xyz_b)
+    za, zb = _onp.minimum(za - surface_z, 0.0), _onp.minimum(zb - surface_z, 0.0)
+    n = xa.shape[0]
+
+    def strength(values):
+        if values is None:
+            return _onp.zeros((1, n))
+        return _onp.reshape(_onp.asarray(values, dtype=float), (1, -1))
+
+    q, fy, fz = strength(source_flux), strength(force_y), strength(force_z)
+    smear = None if smear_length is None else 0.5 * _onp.reshape(
+        _onp.asarray(smear_length, dtype=float), (-1, 1)
+    )
+
+    def amplitude(kx, kappa, ky, chunk: int = 4096):
+        kx, kappa, ky = (_onp.reshape(_onp.asarray(v, dtype=float), (1, -1)) for v in (kx, kappa, ky))
+        m = kx.shape[1]
+        total = _onp.zeros(m, dtype=complex)
+        for start in range(0, m, chunk):
+            cut = slice(start, min(start + chunk, m))
+            kx_c, kappa_c, ky_c = kx[:, cut], kappa[:, cut], ky[:, cut]
+            both = 0.0
+            for sign in (1.0, -1.0):
+                w_a = za * kappa_c - 1j * (xa * kx_c + sign * ya * ky_c)
+                w_b = zb * kappa_c - 1j * (xb * kx_c + sign * yb * ky_c)
+                d = w_b - w_a
+                small = _onp.abs(d) < 1e-4
+                e = _onp.where(
+                    small,
+                    _onp.exp(0.5 * (w_a + w_b)),
+                    (_onp.exp(w_b) - _onp.exp(w_a)) / _onp.where(small, 1.0, d),
+                )
+                if smear is not None:
+                    e = e * _onp.sinc(smear * kx_c / _onp.pi)
+                per_flow = 1.0 / (density * velocity)
+                both = both + _onp.sum(
+                    (q.T + 1j * (kappa_c / kx_c) * per_flow * fz.T
+                     + sign * (ky_c / kx_c) * per_flow * fy.T) * e,
+                    axis=0,
+                )
+            total[cut] = 0.5 * both
+        return total.real.reshape(1, -1), total.imag.reshape(1, -1)
+
+    return amplitude

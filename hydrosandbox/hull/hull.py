@@ -1594,79 +1594,13 @@ class Hull(AeroSandboxObject):
                 re, im = re + g_re, im + g_im
             return -re, im
 
-        gx, gw = _onp.polynomial.legendre.leggauss(8)
-
-        def panels(edges):
-            half = 0.5 * _onp.diff(edges)
-            mid = 0.5 * (edges[1:] + edges[:-1])
-            return (
-                (mid[:, None] + half[:, None] * gx[None, :]).reshape(-1),
-                (half[:, None] * gw[None, :]).reshape(-1),
-            )
-
-        def taper(k):
-            a = 0.6 * k_cap
-            s_ = _onp.clip((k - a) / (k_cap - a), 0.0, 1.0)
-            return _onp.where(k >= k_cap, 0.0, _onp.cos(0.5 * _onp.pi * s_) ** 2)
-
-        ### Principal-value part: every (theta, k) node, and the pole's node per theta.
-        k_lo = 0.05 / self.length
-        n_log = 12 * level
-        k_nodes, k_weights = panels(
-            _onp.concatenate([[0.0], k_lo * (k_cap / k_lo) ** (_onp.arange(n_log + 1) / n_log)])
-        )
-        theta, theta_w = panels(_onp.linspace(0.0, _onp.pi / 2, 24 * level + 1))
-        sec, sin_t, cos_t = 1.0 / _onp.cos(theta), _onp.sin(theta), _onp.cos(theta)
-        k0 = nu * sec**2
-        pref = 2.0 * velocity * nu / _onp.pi**2
-        n_k, n_t = len(k_nodes), len(theta)
-
-        d = k_nodes[None, :] - k0[:, None]  # (theta, k)
-        live = _onp.abs(d) > 1e-9 * k0[:, None]
-        inv_d = _onp.where(live, 1.0 / _onp.where(live, d, 1.0), 0.0)
-        w_grid = (
-            theta_w[:, None] * pref * sec[:, None]
-            * (k_nodes * taper(k_nodes) * k_weights)[None, :] * inv_d
-        )
-        kx_grid = cos_t[:, None] * k_nodes[None, :]
-        ky_grid = sin_t[:, None] * k_nodes[None, :]
-        q_re, q_im = source_transform(kx_grid.reshape(-1), k_nodes, repeats=n_t)
-        w_flat = w_grid.reshape(1, -1)
-        # c = (-i q) w
-        sets = [(kx_grid.reshape(-1), ky_grid.reshape(-1), _onp.tile(k_nodes, n_t),
-                 q_im * w_flat, -q_re * w_flat)]
-
-        pole = (taper(k0) > 0.0) & (k0 < k_cap)
-        if _onp.any(pole):
-            sum_w = _onp.sum(k_weights[None, :] * inv_d, axis=1)
-            w0 = (
-                theta_w * pref * sec * k0 * taper(k0)
-                * (_onp.log(_onp.where(pole, (k_cap - k0) / k0, 1.0)) - sum_w)
-            )[pole]
-            q_re, q_im = source_transform((k0 * cos_t)[pole], k0[pole])
-            sets.append(((k0 * cos_t)[pole], (k0 * sin_t)[pole], k0[pole],
-                         q_im * w0.reshape(1, -1), -q_re * w0.reshape(1, -1)))
-
-        ### Half-residue on the dispersion curve: the radiated waves, astern.
-        theta_r = min(_onp.arccos(_onp.sqrt(min(nu / k_cap, 1.0))), _onp.pi / 2 - 1e-7)
-        rt, rw = panels(_onp.linspace(0.0, theta_r, 48 * level + 1))
-        r_sec = 1.0 / _onp.cos(rt)
-        r_k0 = nu * r_sec**2
-        w_res = (rw * (-2.0 * velocity * nu / _onp.pi) * r_sec * r_k0 * taper(r_k0)).reshape(1, -1)
-        q_re, q_im = source_transform(r_k0 * _onp.cos(rt), r_k0)
-        sets.append((r_k0 * _onp.cos(rt), r_k0 * _onp.sin(rt), r_k0, q_re * w_res, q_im * w_res))
-
-        def row(pieces):
-            return np.concatenate([np.reshape(v, (1, -1)) for v in pieces], axis=1)
-
-        return HullWaveField(
-            kx=_onp.concatenate([s_[0] for s_ in sets]),
-            ky=_onp.concatenate([s_[1] for s_ in sets]),
-            k=_onp.concatenate([s_[2] for s_ in sets]),
-            c_re=row([s_[3] for s_ in sets]),
-            c_im=row([s_[4] for s_ in sets]),
+        return _wave_field_from_transform(
+            lambda kx, k, ky, repeats: source_transform(kx, k, repeats),
             velocity=velocity,
             gravity=gravity,
+            k_lo=0.05 / self.length,
+            k_cap=k_cap,
+            level=level,
             y_hulls=[0.0] if demihull_spacing is None
             else [-0.5 * demihull_spacing, 0.5 * demihull_spacing],
         )
@@ -1962,6 +1896,126 @@ class DynamicForceTable:
             "force_up": force,
             "moment_bow_up": moment + slope * (x_ref - x_table),
         }
+
+
+def _wave_field_from_transform(transform, velocity, gravity, k_lo, k_cap, level, y_hulls):
+    """
+    The wave part of the steady flow of a wave-maker, given the transform of its
+    sources (see ``Hull.wave_field``, whose quadrature this is).
+
+    ``transform(kx, k, ky, repeats) -> (re, im)`` returns
+    ``q = iint (df/dX) exp(-k depth) exp(-i kx X)`` in boatmath's frame (X forward)
+    as ``1 x M`` rows, at the wavenumbers ``kx``, ``ky`` (length ``M``) and ``k``
+    tiled ``repeats`` times. ``y_hulls`` are the centreplanes the field is the sum
+    over.
+    """
+    nu = gravity / velocity**2
+    gx, gw = _onp.polynomial.legendre.leggauss(8)
+
+    def panels(edges):
+        half = 0.5 * _onp.diff(edges)
+        mid = 0.5 * (edges[1:] + edges[:-1])
+        return (
+            (mid[:, None] + half[:, None] * gx[None, :]).reshape(-1),
+            (half[:, None] * gw[None, :]).reshape(-1),
+        )
+
+    def taper(k):
+        a = 0.6 * k_cap
+        s_ = _onp.clip((k - a) / (k_cap - a), 0.0, 1.0)
+        return _onp.where(k >= k_cap, 0.0, _onp.cos(0.5 * _onp.pi * s_) ** 2)
+
+    ### Principal-value part: every (theta, k) node, and the pole's node per theta.
+    n_log = 12 * level
+    k_nodes, k_weights = panels(
+        _onp.concatenate([[0.0], k_lo * (k_cap / k_lo) ** (_onp.arange(n_log + 1) / n_log)])
+    )
+    theta, theta_w = panels(_onp.linspace(0.0, _onp.pi / 2, 24 * level + 1))
+    sec, sin_t, cos_t = 1.0 / _onp.cos(theta), _onp.sin(theta), _onp.cos(theta)
+    k0 = nu * sec**2
+    pref = 2.0 * velocity * nu / _onp.pi**2
+    n_k, n_t = len(k_nodes), len(theta)
+
+    d = k_nodes[None, :] - k0[:, None]  # (theta, k)
+    live = _onp.abs(d) > 1e-9 * k0[:, None]
+    inv_d = _onp.where(live, 1.0 / _onp.where(live, d, 1.0), 0.0)
+    w_grid = (
+        theta_w[:, None] * pref * sec[:, None]
+        * (k_nodes * taper(k_nodes) * k_weights)[None, :] * inv_d
+    )
+    kx_grid = cos_t[:, None] * k_nodes[None, :]
+    ky_grid = sin_t[:, None] * k_nodes[None, :]
+    q_re, q_im = transform(kx_grid.reshape(-1), k_nodes, ky_grid.reshape(-1), n_t)
+    w_flat = w_grid.reshape(1, -1)
+    # c = (-i q) w
+    sets = [(kx_grid.reshape(-1), ky_grid.reshape(-1), _onp.tile(k_nodes, n_t),
+             q_im * w_flat, -q_re * w_flat)]
+
+    pole = (taper(k0) > 0.0) & (k0 < k_cap)
+    if _onp.any(pole):
+        sum_w = _onp.sum(k_weights[None, :] * inv_d, axis=1)
+        w0 = (
+            theta_w * pref * sec * k0 * taper(k0)
+            * (_onp.log(_onp.where(pole, (k_cap - k0) / k0, 1.0)) - sum_w)
+        )[pole]
+        q_re, q_im = transform((k0 * cos_t)[pole], k0[pole], (k0 * sin_t)[pole], 1)
+        sets.append(((k0 * cos_t)[pole], (k0 * sin_t)[pole], k0[pole],
+                     q_im * w0.reshape(1, -1), -q_re * w0.reshape(1, -1)))
+
+    ### Half-residue on the dispersion curve: the radiated waves, astern.
+    theta_r = min(_onp.arccos(_onp.sqrt(min(nu / k_cap, 1.0))), _onp.pi / 2 - 1e-7)
+    rt, rw = panels(_onp.linspace(0.0, theta_r, 48 * level + 1))
+    r_sec = 1.0 / _onp.cos(rt)
+    r_k0 = nu * r_sec**2
+    w_res = (rw * (-2.0 * velocity * nu / _onp.pi) * r_sec * r_k0 * taper(r_k0)).reshape(1, -1)
+    q_re, q_im = transform(r_k0 * _onp.cos(rt), r_k0, r_k0 * _onp.sin(rt), 1)
+    sets.append((r_k0 * _onp.cos(rt), r_k0 * _onp.sin(rt), r_k0, q_re * w_res, q_im * w_res))
+
+    def row(pieces):
+        return np.concatenate([np.reshape(v, (1, -1)) for v in pieces], axis=1)
+
+    return HullWaveField(
+        kx=_onp.concatenate([s_[0] for s_ in sets]),
+        ky=_onp.concatenate([s_[1] for s_ in sets]),
+        k=_onp.concatenate([s_[2] for s_ in sets]),
+        c_re=row([s_[3] for s_ in sets]),
+        c_im=row([s_[4] for s_ in sets]),
+        velocity=velocity,
+        gravity=gravity,
+        y_hulls=y_hulls,
+    )
+
+
+def wave_field_from_source_amplitude(
+    amplitude,
+    velocity: float,
+    gravity: float = 9.80665,
+    length: float = 1.0,
+    k_cap: float = 100.0,
+    level: int = 1,
+) -> "HullWaveField":
+    """
+    The wave field (see ``Hull.wave_field``) of any wave-maker that is symmetric
+    about the centreplane ``y = 0``, from its source-flux transform
+    ``amplitude(kx, kappa, ky) -> (re, im)`` of ``sum Q exp(kappa z - i kx x)``
+    [m^3/s] (x aft): the same function ``kelvin_wave_resistance`` takes as
+    ``extra_source_amplitude``, e.g. ``Hull.wave_amplitude`` or
+    ``hydrosandbox.library.wave_resistance.element_source_amplitude``.
+    ``length`` [m] sets the longest waves resolved.
+    """
+    velocity = float(velocity)
+
+    def transform(kx, k, ky, repeats):
+        kx, ky = (_onp.reshape(v, (1, -1)) for v in (kx, ky))
+        k = _onp.tile(_onp.reshape(k, (1, -1)), (1, repeats))
+        re, im = amplitude(kx, k, ky)
+        scale = 1.0 / (2.0 * velocity)
+        return -_onp.reshape(re, (1, -1)) * scale, _onp.reshape(im, (1, -1)) * scale
+
+    return _wave_field_from_transform(
+        transform, velocity, gravity, 0.05 / length, k_cap, level, y_hulls=[0.0]
+    )
+
 
 
 class HullWaveField:
