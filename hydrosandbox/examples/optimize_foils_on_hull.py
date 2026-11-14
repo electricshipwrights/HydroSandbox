@@ -178,6 +178,9 @@ def optimize(
     max_iterations: int = 120,
     craft_options: dict | None = None,
     bounds: dict[str, tuple[float, float]] | None = None,
+    objective: str = "drag",
+    drag_cap: float | None = None,
+    damping_floor: float | None = None,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -190,6 +193,11 @@ def optimize(
     the centre of gravity). ``craft_options`` are further ``CraftBuildup`` arguments
     (e.g. ``demihull_spacing`` for a catamaran); ``bounds`` overrides entries of
     ``design_bounds``.
+
+    ``objective`` is what to optimize: ``"drag"`` (minimize it), ``"pitch_stiffness"``
+    (maximize the heave-free pitch stiffness, as ``GM_L``) or ``"pitch_damping"``
+    (maximize the foils' pitch damping). ``drag_cap`` [N], ``gml_floor`` [m] and
+    ``damping_floor`` [N m s/rad] constrain the others.
     """
     with_foils = start is not None
     x_stern = float(hull.stations[-1])
@@ -263,7 +271,10 @@ def optimize(
     craft = CraftBuildup(
         assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading), **common
     )
-    res = craft.run_with_stability() if gml_floor is not None else craft.run()
+    needs_stability = (
+        objective != "drag" or gml_floor is not None or damping_floor is not None
+    )
+    res = craft.run_with_stability() if needs_stability else craft.run()
     weight = mass * water.gravity
     q = 0.5 * water.density() * velocity**2
 
@@ -289,9 +300,20 @@ def optimize(
             constraints.append(design["x_stab"] >= design["x_main"] + 0.5)
     if gml_floor is not None:
         constraints.append(res["GM_L"] / gml_floor >= 1.0)
+    if damping_floor is not None:
+        constraints.append(res["c_pitch_foils"] / damping_floor >= 1.0)
+    if drag_cap is not None:
+        constraints.append(res["D"] / drag_cap <= 1.0)
 
     opti.subject_to(constraints)
-    opti.minimize(res["D"] / (0.1 * weight))
+    if objective == "drag":
+        opti.minimize(res["D"] / (0.1 * weight))
+    elif objective == "pitch_stiffness":
+        opti.minimize(-res["GM_L"] / hull.length)
+    elif objective == "pitch_damping":
+        opti.minimize(-res["c_pitch_foils"] / (weight * hull.length**2 / velocity))
+    else:
+        raise ValueError(f"Unknown objective {objective!r}.")
     try:
         sol = opti.solve(
             verbose=False,
