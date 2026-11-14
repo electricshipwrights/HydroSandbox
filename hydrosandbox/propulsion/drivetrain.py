@@ -168,7 +168,7 @@ def hull_propeller_interaction(
     if pivot_xz is None:
         pivot_xz_eff = (0.0, 0.0)
     else:
-        pivot_xz_eff = (float(pivot_xz[0]), float(pivot_xz[1]))
+        pivot_xz_eff = (pivot_xz[0], pivot_xz[1])
 
     r_tip = np.fmax(radius, 1e-6)
     r_hub = np.fmax(hub_ratio, 0.0) * r_tip
@@ -294,7 +294,10 @@ def hull_propeller_interaction(
         "r_nodes": r_nodes,
     }
 
-    if not any(_is_symbolic(v) for v in (disc_xyz, radius, hub_ratio, velocity, sinkage, trim)):
+    if not any(
+        _is_symbolic(v)
+        for v in (disc_xyz, radius, hub_ratio, velocity, sinkage, trim, pivot_xz_eff)
+    ):
         w_p_mat = _onp.asarray(w_p_pts, dtype=float).reshape((n_radial, n_azimuth))
         w_f_mat = _onp.asarray(w_f_pts, dtype=float).reshape((n_radial, n_azimuth))
         r_arr = _onp.asarray(r_nodes, dtype=float)
@@ -464,13 +467,19 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
         v_ship = self.op_point.velocity
         rho = float(self.water.density())
 
+        cos_shaft = np.fmax(np.cosd(self.shaft_angle_deg), 1e-6)
+
         # 1. Hull interaction (wake fraction & thrust deduction)
         interaction: dict[str, Any] | None = None
         if self.hull is not None and self.disc_xyz is not None:
             t_seed = (
                 self.thrust_total / float(self.n_shafts)
                 if self.thrust_total is not None
-                else (self.drag_bare_N / float(self.n_shafts) if self.drag_bare_N is not None else None)
+                else (
+                    self.drag_bare_N / (float(self.n_shafts) * cos_shaft)
+                    if self.drag_bare_N is not None
+                    else None
+                )
             )
             interaction = hull_propeller_interaction(
                 self.hull,
@@ -499,7 +508,7 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
         if self.thrust_total is not None:
             t_total_req = self.thrust_total
         elif self.drag_bare_N is not None:
-            t_total_req = self.drag_bare_N / np.fmax(1.0 - t_ded, 1e-6)
+            t_total_req = self.drag_bare_N / np.fmax((1.0 - t_ded) * cos_shaft, 1e-6)
         elif self.propeller_model == "bseries":
             t_total_req = None
         else:
@@ -657,7 +666,7 @@ class ElectricPropulsionBuildup(asb.ExplicitAnalysis):
 
         eta_h = (1.0 - t_ded) / np.fmax(1.0 - w, 1e-6)
         eta_drive = p_prop_total / np.fmax(p_elec_total, 1e-12)
-        p_effective = t_total_prop * (1.0 - t_ded) * v_ship
+        p_effective = t_total_prop * (1.0 - t_ded) * cos_shaft * v_ship
         eta_overall = p_effective / np.fmax(p_battery_prop, 1e-12)
 
         # 6. Component masses

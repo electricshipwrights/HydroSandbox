@@ -1,6 +1,26 @@
 import aerosandbox.numpy as np
 from aerosandbox.numpy.typing import Vectorizable
-from typing import Literal
+from typing import Callable, Literal
+
+
+def resolve_surface_segment(
+    x_a: Vectorizable,
+    z_a: Vectorizable,
+    x_b: Vectorizable,
+    z_b: Vectorizable,
+    surface_z: Vectorizable | Callable[[Vectorizable, Vectorizable], Vectorizable],
+) -> tuple[Vectorizable, Vectorizable, Vectorizable]:
+    """
+    Resolve segment endpoints ``(x_a, z_a)`` and ``(x_b, z_b)`` against either
+    a scalar geometry-axes waterplane elevation ``surface_z`` or a callable
+    ``surface_z(x_g, z_g) -> z_rel`` returning elevation relative to the
+    waterplane (negative underwater), returning ``(z_a_eff, z_b_eff, sz_eff)``
+    ready for ``smooth_submergence_fraction`` and
+    ``smooth_surface_piercing_weight``.
+    """
+    if callable(surface_z):
+        return surface_z(x_a, z_a), surface_z(x_b, z_b), 0.0
+    return z_a, z_b, surface_z
 
 
 def smooth_submergence_fraction(

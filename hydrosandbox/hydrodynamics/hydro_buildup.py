@@ -28,6 +28,7 @@ from hydrosandbox.library.free_surface import (
     free_surface_lift_slope_factor,
     froude_image_weight,
     junction_interference_drag,
+    resolve_surface_segment,
     smooth_submergence_fraction,
     smooth_surface_piercing_weight,
     spray_drag_strut,
@@ -237,13 +238,13 @@ class HydroBuildup(ExplicitAnalysis):
             return self.M_b[2]
 
     def _local_depth_and_pressure(
-        self, z_g: Vectorizable
+        self, z_g: Vectorizable, x_g: Vectorizable = 0.0
     ) -> tuple[Vectorizable, Vectorizable, Vectorizable]:
-        """Return ``(depth, p_local, p_vapor)`` at geometry elevation ``z_g``."""
+        """Return ``(depth, p_local, p_vapor)`` at geometry coordinates ``(x_g, z_g)``."""
         fluid = self.op_point.atmosphere
         surface_z = getattr(self.op_point, "surface_z", None)
         if surface_z is not None:
-            depth = surface_z - z_g
+            depth = -surface_z(x_g, z_g) if callable(surface_z) else (surface_z - z_g)
         elif hasattr(fluid, "depth"):
             depth = fluid.depth - z_g
         else:
@@ -489,10 +490,16 @@ class HydroBuildup(ExplicitAnalysis):
         fluid = self.op_point.atmosphere
         surface_z = getattr(self.op_point, "surface_z", None)
         if isinstance(self.assembly, HydrofoilAssembly) and isinstance(fluid, Water):
+            up_direction_g = (
+                [-np.sind(self.op_point.alpha), 0.0, np.cosd(self.op_point.alpha)]
+                if callable(surface_z)
+                else None
+            )
             hydrostatics = self.assembly.hydrostatic_forces(
                 water=fluid,
                 surface_z=surface_z,
                 xyz_ref=self.xyz_ref,
+                up_direction_g=up_direction_g,
             )
         else:
             hydrostatics = {
@@ -673,7 +680,13 @@ class HydroBuildup(ExplicitAnalysis):
         if surface_z and getattr(self.op_point, "surface_z", None) is not None:
             delta_h = 1e-3
             inc_op = self.op_point.copy()
-            inc_op.surface_z = self.op_point.surface_z + delta_h
+            if callable(self.op_point.surface_z):
+                orig_sz = self.op_point.surface_z
+                inc_op.surface_z = (
+                    lambda x_g, z_g, _f=orig_sz, _dh=delta_h: _f(x_g, z_g) - _dh
+                )
+            else:
+                inc_op.surface_z = self.op_point.surface_z + delta_h
             hb_inc = self.copy()
             hb_inc.op_point = inc_op
             run_inc = hb_inc.run()
@@ -723,14 +736,19 @@ class HydroBuildup(ExplicitAnalysis):
         sect_t_pierce = []
 
         for i in range(n_sects):
-            z_a = wing.xsecs[i].xyz_le[2]
-            z_b = wing.xsecs[i + 1].xyz_le[2]
+            le_a = wing.xsecs[i].xyz_le
+            le_b = wing.xsecs[i + 1].xyz_le
+            z_a = le_a[2]
+            z_b = le_b[2]
             if surface_z is not None:
+                za_eff, zb_eff, sz_eff = resolve_surface_segment(
+                    le_a[0], z_a, le_b[0], z_b, surface_z
+                )
                 f_sub, s_sub, h_sub_mid = smooth_submergence_fraction(
-                    z_a, z_b, surface_z
+                    za_eff, zb_eff, sz_eff
                 )
                 pierce_w, t_pierce = smooth_surface_piercing_weight(
-                    z_a, z_b, surface_z
+                    za_eff, zb_eff, sz_eff
                 )
             else:
                 f_sub = 1.0
@@ -999,7 +1017,9 @@ class HydroBuildup(ExplicitAnalysis):
 
             rho = fluid.density()
             q_local = 0.5 * rho * vel_mag_g**2
-            _, p_local, p_vapor = self._local_depth_and_pressure(sect_AC_raw[2])
+            _, p_local, p_vapor = self._local_depth_and_pressure(
+                sect_AC_raw[2], x_g=sect_AC_raw[0]
+            )
             sect_sigma = cavitation_number(p_local, p_vapor, q_local)
             sect_cav_margin = sect_sigma + sect_Cpmin
             sect_v_inc = cavitation_inception_speed(
@@ -1066,7 +1086,21 @@ class HydroBuildup(ExplicitAnalysis):
             ]
 
             # Record this section's lift vector and submerged quarter-chord segment
-            # for the wave-resistance integral.
+            # for the wave-resistance integral (in wind axes, where -z_w is vertical lift).
+            _, fy_w, fz_w = op_point.convert_axes(
+                sect_L * L_dir_g[0],
+                sect_L * L_dir_g[1],
+                sect_L * L_dir_g[2],
+                from_axes="geometry",
+                to_axes="wind",
+            )
+            _, uy_w, uz_w = op_point.convert_axes(
+                L_dir_g[0],
+                L_dir_g[1],
+                L_dir_g[2],
+                from_axes="geometry",
+                to_axes="wind",
+            )
             y_sign = -1.0 if mirror_across_XZ else 1.0
             t_lo = s_sub - 0.5 * f_sub
             t_hi = s_sub + 0.5 * f_sub
@@ -1084,10 +1118,10 @@ class HydroBuildup(ExplicitAnalysis):
                         * (y_sign if k == 1 else 1.0)
                         for k in range(3)
                     ],
-                    "force_y": sect_L * L_dir_g[1],
-                    "force_z": sect_L * L_dir_g[2],
-                    "u_y": L_dir_g[1],
-                    "u_z": L_dir_g[2],
+                    "force_y": fy_w,
+                    "force_z": -fz_w,
+                    "u_y": uy_w,
+                    "u_z": -uz_w,
                     "smear": 0.5 * mean_chord,
                     "span": sectional_spans[sect_id] * f_sub,
                 }
@@ -1344,14 +1378,14 @@ class HydroBuildup(ExplicitAnalysis):
             )
 
         if surface_z is not None:
-            sect_f_sub = [
-                smooth_submergence_fraction(
-                    fuselage.xsecs[i].xyz_c[2],
-                    fuselage.xsecs[i + 1].xyz_c[2],
-                    surface_z,
-                )[0]
-                for i in range(n_sects)
-            ]
+            sect_f_sub = []
+            for i in range(n_sects):
+                c_a = fuselage.xsecs[i].xyz_c
+                c_b = fuselage.xsecs[i + 1].xyz_c
+                za, zb, sz = resolve_surface_segment(
+                    c_a[0], c_a[2], c_b[0], c_b[2], surface_z
+                )
+                sect_f_sub.append(smooth_submergence_fraction(za, zb, sz)[0])
             f_sub_mean = sum(sect_f_sub) / n_sects
         else:
             sect_f_sub = [1.0] * n_sects

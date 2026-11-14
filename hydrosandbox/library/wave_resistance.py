@@ -50,7 +50,10 @@ import numpy as _onp
 import aerosandbox.numpy as np
 from aerosandbox.geometry import Fuselage, Wing
 from aerosandbox.numpy.typing import Vectorizable
-from hydrosandbox.library.free_surface import smooth_submergence_fraction
+from hydrosandbox.library.free_surface import (
+    resolve_surface_segment,
+    smooth_submergence_fraction,
+)
 
 
 def _column(values) -> Vectorizable:
@@ -233,8 +236,12 @@ def kelvin_wave_resistance(
         return 0.0
 
     # Depth-like coordinate: z relative to the free surface, clamped to z <= 0.
-    za = np.minimum(za - surface_z, 0.0)
-    zb = np.minimum(zb - surface_z, 0.0)
+    if callable(surface_z):
+        za = np.minimum(surface_z(xa, za), 0.0)
+        zb = np.minimum(surface_z(xb, zb), 0.0)
+    else:
+        za = np.minimum(za - surface_z, 0.0)
+        zb = np.minimum(zb - surface_z, 0.0)
 
     ### Quadrature (numeric nodes; sized from numeric estimates of the problem scales)
     v_num = _numeric_or_none(velocity)
@@ -256,7 +263,7 @@ def kelvin_wave_resistance(
         if any(v is None for v in numeric):
             x_nums = _onp.concatenate([_numeric_entries(raw_xa), _numeric_entries(raw_xb)])
             y_nums = _onp.concatenate([_numeric_entries(raw_ya), _numeric_entries(raw_yb)])
-            s_num = _numeric_or_none(surface_z)
+            s_num = None if callable(surface_z) else _numeric_or_none(surface_z)
             if s_num is not None and s_num.size == 1:
                 z_nums = (
                     _onp.concatenate([_numeric_entries(raw_za), _numeric_entries(raw_zb)])
@@ -447,13 +454,14 @@ def wing_thickness_wave_sources(
         tau[-1] = 0.0
         jumps.append([tau[j + 1] - tau[j] for j in range(n_chordwise)])
 
+    surface_is_callable = callable(surface_z)
     for i in range(n_xsecs - 1):
         xsec_a = wing.xsecs[i]
         xsec_b = wing.xsecs[i + 1]
 
         if surface_z is None:
             t_lo, t_hi, f_sub = 0.0, 1.0, 1.0
-        else:
+        elif not surface_is_callable:
             f_sub, s_sub, _ = smooth_submergence_fraction(
                 xsec_a.xyz_le[2], xsec_b.xyz_le[2], surface_z
             )
@@ -463,6 +471,13 @@ def wing_thickness_wave_sources(
         for j in range(n_chordwise):
             p_a = wing._compute_xyz_of_WingXSec(i, x_nondim=mids[j], z_nondim=0.0)
             p_b = wing._compute_xyz_of_WingXSec(i + 1, x_nondim=mids[j], z_nondim=0.0)
+            if surface_is_callable:
+                za, zb, sz = resolve_surface_segment(
+                    p_a[0], p_a[2], p_b[0], p_b[2], surface_z
+                )
+                f_sub, s_sub, _ = smooth_submergence_fraction(za, zb, sz)
+                t_lo = s_sub - 0.5 * f_sub
+                t_hi = s_sub + 0.5 * f_sub
             span_yz = np.sqrt((p_b[1] - p_a[1]) ** 2 + (p_b[2] - p_a[2]) ** 2 + 1e-16)
 
             c_lo = (1.0 - t_lo) * xsec_a.chord + t_lo * xsec_b.chord
@@ -514,7 +529,10 @@ def fuselage_wave_sources(
         if surface_z is None:
             f_sub = 1.0
         else:
-            f_sub, _, _ = smooth_submergence_fraction(c_a[2], c_b[2], surface_z)
+            za, zb, sz = resolve_surface_segment(
+                c_a[0], c_a[2], c_b[0], c_b[2], surface_z
+            )
+            f_sub, _, _ = smooth_submergence_fraction(za, zb, sz)
         for k in range(3):
             out["xyz_a"][k].append(c_a[k])
             out["xyz_b"][k].append(c_b[k])
