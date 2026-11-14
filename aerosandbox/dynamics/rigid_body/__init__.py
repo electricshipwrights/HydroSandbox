@@ -1,2 +1,0 @@
-from aerosandbox.dynamics.rigid_body.rigid_2D import DynamicsRigidBody2DBody
-from aerosandbox.dynamics.rigid_body.rigid_3D import DynamicsRigidBody3DBodyEuler

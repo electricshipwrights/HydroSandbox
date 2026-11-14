@@ -1,1 +1,0 @@
-from aerosandbox.dynamics.rigid_body.rigid_2D.body import DynamicsRigidBody2DBody

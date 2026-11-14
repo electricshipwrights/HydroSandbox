@@ -1,312 +1,198 @@
-# [AeroSandbox](https://peterdsharpe.github.io/AeroSandbox/) :airplane:
+# HydroSandbox
 
-by [Peter Sharpe](https://peterdsharpe.github.io) (<pds [at] mit [dot] edu>)
+> **Built on [AeroSandbox](https://github.com/peterdsharpe/AeroSandbox)**: HydroSandbox is a standalone package for differentiable hydrofoil, hull, and electric marine propulsion design optimization that builds directly on Peter Sharpe's [**AeroSandbox**](https://github.com/peterdsharpe/AeroSandbox) ([documentation](https://peterdsharpe.github.io/AeroSandbox/)). Rather than vendoring a fork, HydroSandbox installs `aerosandbox` (`>=4.2.10`) as a dependency and uses its CasADi/NumPy automatic-differentiation backend (`aerosandbox.numpy`), `Opti` IPOPT nonlinear optimization interface, parametric 3D geometry primitives (`Wing`, `Fuselage`, `Airfoil`, `KulfanAirfoil`, `MassProperties`), and [NeuralFoil](https://github.com/peterdsharpe/NeuralFoil) 2D viscous airfoil surrogates—extending them with marine physics ported from `boatmath` (`hullgeom`, `thinship`) and empirical marine propulsion models.
 
-[![Downloads](https://pepy.tech/badge/aerosandbox)](https://pepy.tech/project/aerosandbox)
-[![Monthly Downloads](https://pepy.tech/badge/aerosandbox/month)](https://pepy.tech/project/aerosandbox)
-[![Build Status](https://github.com/peterdsharpe/AeroSandbox/workflows/Tests/badge.svg)](https://github.com/peterdsharpe/AeroSandbox/actions/workflows/run-pytest.yml)
-[![PyPI](https://img.shields.io/pypi/v/aerosandbox.svg)](https://pypi.python.org/pypi/aerosandbox)
-[![Documentation Status](https://readthedocs.org/projects/aerosandbox/badge/?version=master)](https://aerosandbox.readthedocs.io/en/master/?badge=master)
-[![License: MIT](https://img.shields.io/badge/License-MIT-g.svg)](https://opensource.org/licenses/MIT)
+HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO)** of foil-assisted boats and electric marine craft in seconds on a laptop. All solvers combine smooth, CasADi-differentiable potential flow, linearized thin-ship / Kelvin–Havelock wave resistance, and semi-empirical hydrodynamic/propulsion buildups rather than mesh-based RANS/VOF Navier–Stokes CFD.
 
-**AeroSandbox is a Python package that helps you design and optimize aircraft and other engineered systems.**
+---
 
-At its heart, AeroSandbox is an optimization suite that combines the ease-of-use of [familiar NumPy syntax](aerosandbox/numpy) with the power of [modern automatic differentiation](./tutorial/10%20-%20Miscellaneous/03%20-%20Resources%20on%20Automatic%20Differentiation.md).
+## Capabilities
 
-This automatic differentiation dramatically improves optimization performance on large problems: **design problems with tens of thousands of decision variables solve in seconds on a laptop**. AeroSandbox also comes with dozens of end-to-end-differentiable aerospace physics models, allowing you to **simultaneously optimize an aircraft's aerodynamics, structures, propulsion, mission trajectory, stability, and more.** 
+### 1. Foil, Strut & Pod Hydrodynamics
+- **Fluid & Operating Environment** (`hydrosandbox.fluid`, `hydrosandbox.performance`):
+  - `Water`: UNESCO EOS-80 seawater/freshwater density, Sharqawy/ITTC 2011 dynamic viscosity, vapor pressure, hydrostatic depth pressure, speed of sound, and surface tension.
+  - `HydroOperatingPoint`: operating state with waterplane elevation `surface_z`, depth/chord Froude numbers ($Fn_h$, $Fn_c$), Weber number, Bernoulli total pressure, and local cavitation number $\sigma$.
+- **Free-Surface, Cavitation & Junction Physics** (`hydrosandbox.library`, `hydrosandbox.hydrodynamics`):
+  - Method-of-images free-surface boundary conditions (`free_surface_mode="high_froude" | "froude_blended" | "rigid_lid" | "none"`), with `froude_image_weight` smoothly transitioning across $Fn_h \approx 1$.
+  - Smooth free-surface submergence clipping and Archimedes hydrostatics (`clip_wing_to_free_surface`, `wing_submerged_volume_and_centroid`, `fuselage_submerged_volume_and_centroid`).
+  - NeuralFoil incompressible 2D section polars (`evaluate_hydrofoil_2D`, `cavitation_bucket`) coupled with inviscid $C_{p,\min}$, cavitation inception speed/margin, smooth cavitation drag increment, foil/strut ventilation margins, Hoerner strut spray drag, and T-junction interference drag.
+  - Three 3D hydrodynamic solvers: `HydroBuildup` (fast conceptual buildup built for `Opti`), `HydroVLM` (3D vortex lattice with image reflections), and `HydroLiftingLine` (nonlinear viscous 3D lifting line).
 
-Keeping AeroSandbox easy to learn and use is a top priority. *Complexity is optional* - you can use AeroSandbox's built-in physics models where helpful, or you can drop in arbitrary custom physics models of your own.
+### 2. Linearized Wave-Making & Near-Field Wave Flow
+- **Unified Far-Field Wave Spectrum** (`hydrosandbox.library.wave_resistance`):
+  - `kelvin_wave_resistance`, `wing_thickness_wave_sources`, `fuselage_wave_sources`, `element_source_amplitude`, `merge_wave_elements`, and `wave_quadrature_nodes` compute steady deep-water Kelvin/Havelock wave resistance in one combined spectrum across hulls, lifting/dihedral foils (lift dipoles + thickness sources), surface-piercing struts (Michell thin-ship sources), and submerged pods.
+  - Reports rigid-lid vortex drag (`D_induced`) alongside `D_wave` so their sum approaches the high-Froude image limit without double-counting wave drag in induced drag.
+- **Wave Elevation & Orbital Velocity** (`wave_field_from_source_amplitude` in `hydrosandbox.hull.hull`):
+  - Evaluates symmetric free-surface wave elevation $\zeta(x, y)$ and orbital velocity perturbations $(u, v, w)$ induced by any combined set of hull, foil, strut, and pod wave singularities.
 
-```
-pip install aerosandbox[full]
-```
+### 3. Hull in the Loop & Coupled Craft Balance
+- **Thin-Ship Hull Model** (`hydrosandbox.hull.hull`):
+  - Constructible from offset tables (`Hull(...)`), analytical Wigley hulls (`Hull.wigley`), triangle meshes (`Hull.from_mesh`), or `boatmath` geometry records (`Hull.from_boatmath_geometry`), supporting both monohulls and symmetric catamarans (`demihull_spacing`).
+  - Evaluates panel Archimedes hydrostatics, ITTC-57 wetted-area skin friction, Froude-tapered dry-transom hollow closure, and linearized thin-ship dynamic sinkage force & trim moment (`Hull.dynamic_force`).
+- **Two-Way Hull–Foil Coupling & Attitude Tables** (`Hull`, `CraftBuildup`):
+  - Models thin-ship hull thickness velocity at foil control points (`Hull.induced_velocity`), image-corrected foil horseshoe suction on hull bottom panels (`Hull.pressure_load`), and the hull's free-surface wave elevation and orbital velocity at downstream foils (`Hull.wave_field`).
+  - `Hull.dynamic_force_table()` (`DynamicForceTable`) and `Hull.wave_amplitude_table()` (`WaveAmplitudeTable`) precompute cubic CasADi B-spline surrogates over `(sinkage, trim)` at a target speed so IPOPT evaluates hull forces and wave spectra in microseconds without inflating symbolic expression graphs.
+- **Equilibrium & Longitudinal Stability** (`hydrosandbox.hull.craft`):
+  - `CraftBuildup` solves rigid-body vertical-force (`F_z_net == 0`) and pitching-moment (`M_y_net == 0`) equilibrium about `xyz_cg` (via `CraftBuildup.solve_equilibrium` for fixed designs or as constraints inside `asb.Opti`), accepts arbitrary `inflow_perturbation` callbacks, and provides `run_with_stability()` returning heave-free longitudinal metacentric height `GM_L = k_pitch / (m * g)` and quasi-steady foil pitch damping `c_pitch_foils`.
 
------
+### 4. Electric Marine Propulsion & Propeller–Foil Interaction
+- **Propeller & Motor Models** (`hydrosandbox.propulsion`):
+  - Smooth, differentiable Wageningen B-series polynomials (`evaluate_bseries`, `optimize_bseries_propeller`, `sweep_bseries_rpm`) with Keller & Burrill cavitation margins and Lerbs Reynolds corrections.
+  - Continuous Drela (`motor_performance_drela`) and 4-term polynomial loss (`motor_performance_loss`) electric motor models, drivetrain/battery mass regressions (`mass_motor_marine`, `mass_controller_marine`, `mass_gearbox_marine`, `mass_battery_marine`), and a vendored 159-motor catalog plus waterproof foil-assist pod motors (`MotorDatabase.vendored(include_foil_assist_pods=True)`).
+- **Coupled Wake, Suction & Propeller–Foil Flow**:
+  - `hull_propeller_interaction` computes Rankine-ovoid + boundary-layer wake fraction and Lagally point-sink thrust deduction.
+  - `hydrosandbox.propulsion.interaction` provides `actuator_disc_velocity` (sink-disc inflow + vortex-cylinder jet and swirl) and `foils_at_propeller` (foil/strut viscous wake momentum deficit + horseshoe-vortex induced velocity at the disc).
+  - `ElectricPropulsionBuildup` and closed-loop `PoweredCraftBuildup` couple drivetrain weight, CG shift, thrust line height/shaft inclination (`xyz_propeller`, `shaft_angle`), wake/thrust deduction, and endurance battery sizing back into craft equilibrium.
 
-### What can I do with AeroSandbox?
+### 5. CAD & ParaView Flow-Field Export
+- **STEP Export** (`hydrosandbox.geometry.step_export`): Zero-dependency native AP214 STEP B-Rep export for foil assemblies and craft (`export_assembly_step`, `export_craft_step`, or optional `cadquery` backend).
+- **ParaView VTK Export** (`hydrosandbox.geometry.vtk_export`): `export_craft_vtk` writes a multi-block `.vtm` dataset alongside `<prefix>_foils.vtp` (surface pressure and NeuralFoil boundary-layer diagnostics), `<prefix>_hull.vtp` (hull surface pressure), `<prefix>_surface.vtp` (combined hull + foil + pod wave elevation), and `<prefix>_bodies.vtp`.
 
-Use AeroSandbox to design and optimize entire aircraft:
+---
 
-<table>
-    <tr>
-        <td width="50%" valign="top">
-            <p align="center">
-                <a href="https://github.com/peterdsharpe/Feather-RC-Glider"><i>Feather</i> (an ultra-lightweight 1-meter-class RC motor glider)</a>
-            </p>
-            <img src="https://raw.githubusercontent.com/peterdsharpe/Feather-RC-Glider/master/CAD/feather.png" alt="Feather first page">
-        </td>
-        <td width="50%" valign="top">
-            <p align="center">
-                <a href="https://github.com/peterdsharpe/solar-seaplane-preliminary-sizing"><i>SEAWAY-Mini</i> (a solar-electric, 13' wingspan seaplane)</a>
-            </p>
-            <img src="https://raw.githubusercontent.com/peterdsharpe/solar-seaplane-preliminary-sizing/main/CAD/renders/seaway_mini_packet_Page_1.png" alt="Seaway-Mini first page">
-        </td>
-    </tr>
-</table>
+## Installation
 
-Use AeroSandbox to support real-world aircraft development programs, all the way from your very first sketch to your first-flight and beyond:
+HydroSandbox requires Python `>=3.11` and automatically installs `aerosandbox>=4.2.10`:
 
-<table>
-    <tr>
-        <td width="50%" valign="top">
-            <p align="center">
-                <a href="https://github.com/peterdsharpe/DawnDesignTool">Initial concept sketches + sizing of <i>Dawn</i> (a solar-electric airplane for climate science research) in AeroSandbox, Spring 2020</a>
-            </p>
-            <img src="./media/images/dawn1-first-sketch.png" alt="Dawn initial design">
-        </td>
-        <td width="50%" valign="top">
-            <p align="center">
-                <a href="https://youtu.be/CyTzx9UCvyo"><i>Dawn</i> (later renamed <i>SACOS</i>) in first flight, Fall 2022</a>
-            </p>
-            <p align="center"><a href="https://www.electra.aero/news/sacos-first-flight">(A massive build effort with excellent engineering and coordination by Electra.aero!)</a></p>
-            <img src="./media/images/SACOS%20First%20Flight%20Zoomed.jpg" alt="SACOS first flight">
-        </td>
-    </tr>
-</table>
-
-Use AeroSandbox to explore counterintuitive, complicated design tradeoffs, all at the earliest stages of conceptual design *where these insights make the most difference*:
-
-<table>
-	<tr>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/DawnDesignTool">Exploring how big a solar airplane needs to be to fly, as a function of seasonality and latitude</a>
-			</p>
-			<img src="https://github.com/peterdsharpe/DawnDesignTool/raw/master/docs/30kg_payload.svg" alt="Dawn seasonality latitude tradespace">
-		</td>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://www.popularmechanics.com/military/aviation/a13938789/mit-developing-mach-08-rocket-drone-for-the-air-force/">Exploring how the mission range of <i>Firefly</i>, a Mach 0.8 rocket drone, changes if we add an altitude limit, simultaneously optimizing aircraft design and trajectories</a>
-			</p>
-			<img src="./media/images/firefly-range-ceiling-trade.png" alt="Firefly range ceiling trade">
-		</td>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/transport-aircraft">Exploring how many LH2 aircraft classes an airline fleet needs to cover the market, considering off-design performance</a>
-			</p>
-			<img src="https://github.com/peterdsharpe/transport-aircraft/raw/master/figures/lh2_market_segmentation_2.svg" alt="LH2 Market Coverage">
-		</td>
-	</tr>
-</table>
-
-Use AeroSandbox as a pure aerodynamics toolkit:
-
-<table>
-	<tr>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/blob/master/tutorial/06%20-%20Aerodynamics/01%20-%20AeroSandbox%203D%20Aerodynamics%20Tools/01%20-%20Vortex%20Lattice%20Method/01%20-%20Vortex%20Lattice%20Method.ipynb">VLM simulation of a glider, aileron deflections of +-30°</a>
-			</p>
-			<img src="./media/images/vlm3_with_control_surfaces.png" alt="VLM simulation">
-		</td>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/blob/master/tutorial/06%20-%20Aerodynamics/01%20-%20AeroSandbox%203D%20Aerodynamics%20Tools/01%20-%20Vortex%20Lattice%20Method/01%20-%20Vortex%20Lattice%20Method.ipynb">Aerodynamic shape optimization of a wing planform, using an arbitrary objective and constraints</a>
-			</p>
-			<img src="./media/images/wing_optimization.png" alt="Wing optimization">
-		</td>
-		<td width="33%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/blob/master/tutorial/06%20-%20Aerodynamics/02%20-%20AeroSandbox%202D%20Aerodynamics%20Tools/02%20-%20NeuralFoil%20Optimization.ipynb">Optimize airfoil shapes with aerodynamic, structural, and manufacturing considerations</a>
-			</p>
-			<img src="./media/images/airfoil_optimization.png" alt="Airfoil optimization">
-		</td>
-	</tr>
-</table>
-
-Among many other disciplines:
-
-<table>
-	<tr>
-		<td width="50%" valign="top">
-			<p align="center">
-				Structural optimization of a composite tube spar
-			</p>
-			<img src="./media/images/beam-optimization.png" alt="Beam optimization">
-		</td>
-		<td width="50%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/blob/master/aerosandbox/library/propulsion_electric.py">Electric motor analysis for propeller matching</a>
-			</p>
-			<img src="./media/images/motor_perf.png" alt="Motor performance">
-		</td>
-	</tr>
-	<tr>
-		<td>
-			<p align="center" valign="top">
-				<a href="https://github.com/peterdsharpe/transport-aircraft">Tools to analyze unconventional propulsion (e.g., LH2)</a>
-			</p>
-			<img src="https://github.com/peterdsharpe/transport-aircraft/raw/master/figures/three_view_annotated.svg" alt="LH2 airplane three-view">
-		</td>
-		<td>
-			<p align="center" valign="top">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/tree/master/aerosandbox/library/weights">Detailed weights estimation for aircraft ranging from micro-UAVs to airliners</a>
-			</p>
-			<img src="https://github.com/peterdsharpe/transport-aircraft/raw/master/figures/mass_budget.png" alt="Mass Budget">
-		</td>
-</tr>
-</table>
-
-Easily interface AeroSandbox with all your favorite tools:
-
-<table>
-    <tr>
-        <td width="33%" valign="top">
-            <p align="center">
-                Other conceptual design tools (AVL, XFLR5, XFoil, ASWING, MSES, etc.)
-            </p>
-            <img src="./media/images/airfoil_contours.png" alt="XFoil">
-        </td> 
-          <td width="33%" valign="top">
-                <p align="center">
-                    CAD tools via STEP export (SolidWorks, Fusion 360, etc.)
-                </p>
-				<p align="center">
-				(STL, OBJ, etc. supported too)
-				</p>
-                <img src="https://github.com/peterdsharpe/solar-seaplane-preliminary-sizing/raw/main/CAD/renders/raytrace-lowres.jpg" alt="CAD">
-            </td>
-          <td width="33%" valign="top">
-			<p align="center">
-				User-provided models + code (for custom aerodynamics, structures, propulsion, or anything else - e.g., for optimizing flight through a probabilistic wind field, shown below) 
-			</p>
-			<img src="./media/images/wind_speeds_model.png" alt="Wind speed">
-		</td>
-	</tr>
-</table>
-
-Or, throw all the airplane-design-specific code out entirely, and use AeroSandbox purely as an optimization solver or as a solver for nonlinear systems of equations (or ODEs, or PDEs):
-
-<table>
-	<tr>
-		<td width="50%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/blob/master/tutorial/01%20-%20Optimization%20and%20Math/01%20-%202D%20Rosenbrock.ipynb">Optimize the 2D Rosenbrock function</a>
-			</p>
-			<img src="./media/images/optimization.png" alt="Optimization">
-		</td>
-		<td width="50%" valign="top">
-			<p align="center">
-				<a href="https://github.com/peterdsharpe/AeroSandbox/tree/master/tutorial/03%20-%20Trajectory%20Optimization%20and%20Optimal%20Control/01%20-%20Solving%20ODEs%20with%20AeroSandbox">Specify the Falkner Skan ODE (nonlinear, 3rd-order BVP) and let AeroSandbox automatically take care of the discretization, solution, and even inverse solving.</a>
-			</p>
-			<img src="./media/images/falkner-skan.png" alt="FS ODE">
-		</td>
-</tr>
-</table>
-
-And much, much more. Best of all, combine these tools arbitrarily without any loss in optimization speed and without any tedious derivative math, all thanks to AeroSandbox's end-to-end automatic-differentiability.
-
-## Getting Started
-
-### Installation
-
-In short:
-
-* `pip install aerosandbox[full]` for a complete install.
-
-* `pip install aerosandbox` for a lighter-weight installation. All optimization, numerics, and physics models are included, along with 2D plotting via matplotlib; optional dependencies for 3D visualization, CAD export, and geometry manipulation (e.g., plotly, pyvista, trimesh, cadquery) are skipped.
-
-For more installation details (e.g., if you're new to Python), [see here](./INSTALLATION.md).
-
-### Tutorials, Examples, and Documentation
-
-To get started, [check out the tutorials folder here](./tutorial/)! All tutorials are viewable in-browser, or you can open them as Jupyter notebooks by cloning this repository.
-
-For a more detailed and theory-heavy introduction to AeroSandbox, please see the [author's PhD thesis](./tutorial/sharpe-pds-phd-AeroAstro-2024-thesis.pdf) and [master's thesis](./tutorial/sharpe-pds-sm-AeroAstro-2021-thesis.pdf).
-
-For a developer-oriented description of AeroSandbox internal modules, [please see the developer README](aerosandbox/README.md).
-
-For fully-detailed API documentation, see [the documentation website](https://aerosandbox.readthedocs.io/en/master/).
-
-You can print documentation and examples for any AeroSandbox object by using the built-in `help()` function (e.g., `help(asb.Airplane)`). AeroSandbox code is also documented *extensively* in the source and contains hundreds of unit test examples, so examining the source code can also be useful.
-
-### Usage Details
-
-#### Units
-
-One final point to note: **all inputs and outputs to AeroSandbox are expressed in base SI units, or derived units thereof** (e.g., m, kg, sec, N, m/s, J, Pa). Since this unit system is [coherent](https://en.wikipedia.org/wiki/Coherence_(units_of_measurement)), an [enormous number of quantities](https://en.wikipedia.org/wiki/SI_derived_unit) can be converted without any scaling factors. This improves readability and reduces the likelihood of errors.
-
-There are only two exceptions to this SI-everywhere rule:
-1. If alternate units are used, this is noted in the variable name's suffix. For example:
-
-   * `battery_capacity` → Joules
-   * `battery_capacity_watt_hours` → Watt-hours
-   * `aircraft_endurance` → Seconds
-   * `aircraft_endurance_hours` → Hours
-
-2. Angle of attack (`alpha`, α) and sideslip angle (`beta`, β) are given in degrees due to long-standing aerospace convention. All other angles and angular rates use radians. 
- 
-Also, in case of any confusion on the units of a function's inputs and outputs, units are listed on all function docstrings.
-
-If you wish to use other units, consider using [`aerosandbox.tools.units`](./aerosandbox/tools/units.py) to convert easily.
-
-## Project Details
-
-### Contributing
-
-Please feel free to join the development of AeroSandbox - contributions are always so welcome! If you have a change you'd like to make, the easiest way to do that is by submitting a pull request.
-
-The text file [`CONTRIBUTING.md`](./CONTRIBUTING.md) has more details for developers and power users.
-
-If you've already made several additions and would like to be involved in a more long-term capacity, please message me!
-Contact information can be found next to my name near the top of this README.
-
-### Donating
-
-If you like this software, please consider donating to support development [via PayPal](https://paypal.me/peterdsharpe)
-or [GitHub Sponsors](https://github.com/sponsors/peterdsharpe/)!
-
-### Bugs
-
-Please, please report all bugs by [creating a new issue](https://github.com/peterdsharpe/AeroSandbox/issues)!
-
-### Versioning
-
-AeroSandbox loosely uses [semantic versioning](https://semver.org/), which should give you an idea of whether or not you can probably expect backward-compatibility and/or new features from any given update.
-
-For more details, see the [changelog](./CHANGELOG.md).
-
-### Citation & Commercial Use
-
-If you find AeroSandbox useful in your research, please cite the following publications:
-
-[The author's PhD thesis](./tutorial/sharpe-pds-phd-AeroAstro-2024-thesis.pdf):
-
-```bibtex
-@phdthesis{aerosandbox_phd_thesis,
-    title = {Accelerating Practical Engineering Design Optimization with Computational Graph Transformations},
-    author = {Sharpe, Peter D.},
-    school = {Massachusetts Institute of Technology}, 
-    year = {2024},
-    note = {Available at \url{https://dspace.mit.edu/handle/1721.1/157809}}
-}
+```bash
+git clone https://github.com/electricshipwrights/HydroSandbox.git
+cd HydroSandbox
+uv sync --extra full --extra test
 ```
 
-[The author's Master's thesis](./tutorial/sharpe-pds-sm-AeroAstro-2021-thesis.pdf):
+Or using `pip`:
 
-```bibtex
-@mastersthesis{aerosandbox_masters_thesis,
-    title = {AeroSandbox: A Differentiable Framework for Aircraft Design Optimization},
-    author = {Sharpe, Peter D.},
-    school = {Massachusetts Institute of Technology},
-    year = {2021},
-    note = {Available at \url{https://dspace.mit.edu/handle/1721.1/140023}}
-}
+```bash
+pip install -e ".[full,test]"
 ```
 
-Commercial users: I'm more than happy to discuss consulting work for active AeroSandbox support if this package proves helpful - use the email address in the header of this README to get in touch.
+Run only core runtime dependencies with `pip install -e .`, and run tests with:
 
-#### License
+```bash
+pytest hydrosandbox/tests -v
+```
 
-[MIT License applies, full terms here](LICENSE.txt). In short: use AeroSandbox for anything you want (commercial or non-commercial). AeroSandbox is released in hope that it will be useful but without any warranty of merchantability (either express or implied). 
+---
 
-If you use AeroSandbox, public attribution is appreciated. In particular, it's especially helpful when industry users share when and how they're using AeroSandbox, since it helps the team prioritize feature development.
+## Quick Start
 
-## Stargazers over time
+### 1. Hydrofoil Assembly Analysis
 
-[![Stargazers over time](https://starchart.cc/peterdsharpe/AeroSandbox.svg)](https://starchart.cc/peterdsharpe/AeroSandbox) 
+```python
+import aerosandbox as asb
+import hydrosandbox as hsb
 
-## Supported by
+water = hsb.Water.seawater(temperature_C=18.0)
+op = hsb.HydroOperatingPoint(water=water, velocity=12.0, alpha=2.0, surface_z=0.0)
 
-<a href="https://jb.gg/OpenSourceSupport"><img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg" alt="JetBrains logo."></a>
+foil = hsb.Foil(
+    name="Main Foil",
+    symmetric=True,
+    xsecs=[
+        asb.WingXSec(xyz_le=[0.0, 0.0, -0.6], chord=0.14, airfoil=asb.Airfoil("naca2412")),
+        asb.WingXSec(xyz_le=[0.01, 0.45, -0.6], chord=0.09, airfoil=asb.Airfoil("naca2412")),
+    ],
+)
+strut = hsb.Strut.from_dimensions(
+    root_xyz=[0.02, 0.0, -0.6], length=0.9, root_chord=0.14, tip_chord=0.11
+)
+assembly = hsb.HydrofoilAssembly(name="T-Foil", foils=[foil], struts=[strut])
 
+buildup_res = hsb.HydroBuildup(assembly=assembly, op_point=op).run_with_stability_derivatives()
+vlm_res = hsb.HydroVLM(assembly=assembly, op_point=op).run()
+ll_res = hsb.HydroLiftingLine(assembly=assembly, op_point=op).run()
+bucket = hsb.cavitation_bucket(asb.Airfoil("naca2412"), velocity=12.0, chord=0.14, depth=0.6, water=water)
+```
+
+### 2. Hull + Foils Equilibrium & Stability
+
+```python
+import hydrosandbox as hsb
+
+hull = hsb.Hull.wigley(length=10.0, beam=1.0, draft=0.625)
+res = hsb.CraftBuildup.solve_equilibrium(
+    hull=hull,
+    velocity=4.5,
+    mass=1800.0,
+    xyz_cg=[0.0, 0.0, 0.0],
+)
+print(res["trim"], res["sinkage"], res["D"], res["D_wave"])
+```
+
+### 3. Coupled Electric Propulsion
+
+```python
+import hydrosandbox as hsb
+
+op = hsb.HydroOperatingPoint(velocity=6.0)
+hull = hsb.Hull.wigley(length=10.0, beam=1.0, draft=0.625)
+db = hsb.MotorDatabase.vendored(include_foil_assist_pods=True)
+motor = db.motor("flipsky_6384_120kv_36v")
+
+buildup = hsb.ElectricPropulsionBuildup(
+    op_point=op,
+    drag_bare_N=80.0,
+    hull=hull,
+    disc_xyz=[5.2, 0.0, -0.35],
+    propeller_diameter=0.18,
+    propeller_pitch_ratio=1.2,
+    propeller_ear=0.45,
+    propeller_rpm=1500.0,
+    gearbox_ratio=2.5,
+    motor=motor,
+    endurance_hours=1.5,
+)
+res = buildup.run()
+```
+
+For full closed-loop vehicle sizing (coupled mass/CG/trim/thrust/battery iteration), use `hsb.PoweredCraftBuildup.solve(...)`.
+
+---
+
+## Optimization Examples
+
+- **Standalone Stern T-Foil MDO** ([`hydrosandbox/examples/optimize_hydrofoil_assembly.py`](hydrosandbox/examples/optimize_hydrofoil_assembly.py)): Optimizes span, root/tip chords, and incidence with cavitation/ventilation safety margins, cross-checks against `HydroVLM` and `HydroLiftingLine`, and optionally exports STEP geometry:
+  ```bash
+  python hydrosandbox/examples/optimize_hydrofoil_assembly.py --velocity 6.0 --mass 30.0
+  ```
+- **Hull-in-the-Loop Foil & Pod Optimization** ([`hydrosandbox/examples/optimize_foils_on_hull.py`](hydrosandbox/examples/optimize_foils_on_hull.py)): Minimizes total craft drag (hull friction + wave interference + foil/strut/pod drag) across monohull (`layout="centreline"`) and catamaran (`layout="pi" | "twin"`) configurations subject to attitude equilibrium, longitudinal stability floors (`GM_L` and `c_pitch_foils`), optional section thickness/camber optimization (`--optimize-section`) with solid-section root bending-stress limits (`--allowable-stress`), optional steerable/fixed pod drives (`EPROPULSION_POD_3`), STEP/VTK export, and multi-start search via `hsb.parallel_map`:
+  ```bash
+  python hydrosandbox/examples/optimize_foils_on_hull.py --velocity 4.5 --gml-fractions 0.6,0.8,1.0 --stabilizer
+  ```
+
+---
+
+## Package Layout
+
+```text
+hydrosandbox/
+├── fluid/          # Seawater/freshwater thermodynamic & transport properties (Water)
+├── geometry/       # Foil, Strut, HydroFuselage, HydrofoilAssembly, clipping, STEP & VTK export
+├── hull/           # Hull (thin-ship, hydrostatics, wave field, B-spline tables) & CraftBuildup
+├── hydrodynamics/  # HydroBuildup, HydroVLM, HydroLiftingLine, 2D polars & cavitation buckets
+├── library/        # Free-surface image factors, cavitation/ventilation, Kelvin wave resistance
+├── performance/    # HydroOperatingPoint (depth Froude, Weber, cavitation numbers)
+├── propulsion/     # B-series propellers, electric motor models/catalog, wake/foil interaction, PoweredCraftBuildup
+├── examples/       # MDO scripts for standalone T-foils and hull-coupled hydrofoil craft
+├── parallel.py     # Multi-process parallel_map worker helper (OpenBLAS-pinned per process)
+└── tests/          # Unit and analytical/boatmath parity test suite
+```
+
+---
+
+## Validation Summary
+
+Kernel and hull formulations are tested against analytical closed forms (Havelock 2D dipoles, Wigley hull Michell integral) and the Rust `boatmath` (`hullgeom`, `thinship`, `propeller`) reference outputs:
+
+| Case | Quantity | Agreement |
+|---|---|---|
+| Wigley hull, $Fn \in [0.2, 0.5]$ | Wave resistance, skin friction | 0.6%, 0.05% |
+| Wigley hull, $Fn \in [0.2, 0.5]$ | Dynamic sinkage force, trim moment | 0.3%, 0.5% |
+| Catamaran demihull (IGES, transom), free to sink & trim, $Fn \in [0.3, 0.9]$ | Sinkage, trim, total resistance | 0.2 mm, 0.06 deg, 1.5% |
+
+---
+
+## Coordinate Conventions & Modeling Limits
+
+- **Geometry axes**: `+x` aft/downstream, `+y` starboard, `+z` upward (`surface_z = 0` is the calm free surface; submergence depth is `h = surface_z - z`, positive underwater).
+- **Modeling assumptions**: Deep water, linearized free-surface wave theory (no wave breaking, spray sheets, or planing 2D+t hull lift), attached or mildly separated 2D sections represented by NeuralFoil, steady wake/actuator-disc propeller–foil interaction, and inception-margin cavitation constraints rather than multiphase sheet or supercavitation simulation. Foil wave reflection in the hull and foil waves inside the hull's own dynamic sinkage pressure field are not modeled.
