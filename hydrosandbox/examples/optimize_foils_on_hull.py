@@ -17,7 +17,8 @@ optionally, a stabilizer T-foil. Everything is one ``asb.Opti`` problem:
 
 Sweeping the floor traces the drag-versus-stability trade-off. The problem is not
 convex (wave interference oscillates with foil position), so each floor is solved
-from several starting layouts and the best feasible result kept.
+from several starting layouts and the best feasible result kept. Those solves are
+independent, and run on all cores at once (``--jobs``).
 
     python hydrosandbox/examples/optimize_foils_on_hull.py --velocity 4.5 \\
         --gml-fractions 0.6,0.8,1.0 --stabilizer --cg-range=-0.5,0.5 \\
@@ -175,6 +176,8 @@ def optimize(
     thrust_height_range: tuple[float, float] | None = None,
     trim_bounds: tuple[float, float] = (-1.0, 3.0),
     max_iterations: int = 120,
+    craft_options: dict | None = None,
+    bounds: dict[str, tuple[float, float]] | None = None,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -184,7 +187,9 @@ def optimize(
     positive], ``mass_range`` the allowed all-up mass [kg], and
     ``thrust_height_range`` the allowed height of the thrust line at the stern
     [m above the design waterline]. Each is fixed if None (thrust then acts through
-    the centre of gravity).
+    the centre of gravity). ``craft_options`` are further ``CraftBuildup`` arguments
+    (e.g. ``demihull_spacing`` for a catamaran); ``bounds`` overrides entries of
+    ``design_bounds``.
     """
     with_foils = start is not None
     x_stern = float(hull.stations[-1])
@@ -200,6 +205,7 @@ def optimize(
         wave_length_scales=(1.0, 1.5 * hull.length, 0.01),
         include_interference_breakdown=False,
     )
+    common.update(craft_options or {})
     try:
         at_start = CraftBuildup.solve_equilibrium(
             assembly=build_assembly(start, stabilizer) if with_foils else None,
@@ -216,7 +222,7 @@ def optimize(
     if with_foils:
         design = {
             name: opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
-            for name, (lo, hi) in design_bounds(hull, stabilizer).items()
+            for name, (lo, hi) in {**design_bounds(hull, stabilizer), **(bounds or {})}.items()
         }
     loading = {"x_cg": xyz_cg[0], "mass": mass, "thrust_height": None}
     if cg_range is not None:
@@ -310,7 +316,18 @@ def optimize(
         **craft_inputs(solved_loading),
         **dict(common, include_interference_breakdown=with_foils),
     ).run_with_stability()
+    # Keep the returned results plain (numbers only), so they can cross processes.
+    final = {
+        key: (scalar(value) if key not in ("sinkage", "trim") else float(value))
+        for key, value in final.items()
+        if key not in ("foil", "transom", "xyz_cg") and value is not None
+    }
     return {"design": solved, "loading": solved_loading, "results": final}
+
+
+def optimize_task(task: tuple, freedoms: dict) -> dict | None:
+    """``optimize`` with its loading freedoms as one argument, for ``parallel_map``."""
+    return optimize(*task, **freedoms)
 
 
 def describe(label: str, outcome: dict, hull: Hull) -> str:
@@ -374,6 +391,9 @@ if __name__ == "__main__":
         help="allowed thrust-line height at the stern 'lo,hi' [m above the waterline]",
     )
     parser.add_argument("--starts", type=int, default=3, help="starting layouts per floor (1-3)")
+    parser.add_argument(
+        "--jobs", type=int, default=None, help="worker processes (default: all cores)"
+    )
     args = parser.parse_args()
 
     water = hsb.Water.seawater()
@@ -422,39 +442,44 @@ if __name__ == "__main__":
     floors: list[float | None] = [None] + [
         float(f) * gml_bare for f in args.gml_fractions.split(",") if f
     ]
+    # Every (floor, starting layout) pair, and each floor's bare-hull baseline, is an
+    # independent solve: run them all at once.
+    tasks, labels = [], []
+    for floor in floors:
+        if any_freedom:
+            tasks.append((hull, args.velocity, mass, xyz_cg, floor, None, False, water))
+            labels.append((floor, "bare"))
+        for start in starting_layouts(hull, args.stabilizer)[: args.starts]:
+            tasks.append(
+                (hull, args.velocity, mass, xyz_cg, floor, start, args.stabilizer, water)
+            )
+            labels.append((floor, "foils"))
+    t0 = time.time()
+    outcomes = hsb.parallel_map(
+        optimize_task, [(task, freedoms) for task in tasks], jobs=args.jobs
+    )
+    print(f"{len(tasks)} optimizations in {time.time() - t0:.0f} s\n")
+
     for floor in floors:
         label = "No stability floor" if floor is None else f"GM_L >= {floor:.1f} m"
-        print(f"--- {label} ---", flush=True)
-
-        if any_freedom:
-            t0 = time.time()
-            outcome = optimize(
-                hull, args.velocity, mass, xyz_cg, floor, None, False, water, **freedoms
-            )
-            if outcome is None:
-                print(f"Bare hull, loading optimized: did not converge  [{time.time() - t0:.0f} s]")
-            else:
-                print(
-                    describe("Bare hull, loading optimized", outcome, hull)
-                    + f"  [{time.time() - t0:.0f} s]",
-                    flush=True,
-                )
-
-        best = None
-        t0 = time.time()
-        for start in starting_layouts(hull, args.stabilizer)[: args.starts]:
-            outcome = optimize(
-                hull, args.velocity, mass, xyz_cg, floor, start, args.stabilizer, water,
-                **freedoms,
-            )
-            if outcome is None:
-                continue
-            feasible = floor is None or scalar(outcome["results"]["GM_L"]) >= 0.98 * floor
-            if feasible and (
-                best is None or scalar(outcome["results"]["D"]) < scalar(best["results"]["D"])
-            ):
-                best = outcome
-        if best is None:
-            print(f"With foils: no feasible design found  [{time.time() - t0:.0f} s]\n", flush=True)
+        print(f"--- {label} ---")
+        mine = [o for o, (f, _) in zip(outcomes, labels) if f == floor]
+        kinds = [k for (f, k) in labels if f == floor]
+        for outcome, kind in zip(mine, kinds):
+            if kind == "bare":
+                if outcome is None:
+                    print("Bare hull, loading optimized: did not converge")
+                else:
+                    print(describe("Bare hull, loading optimized", outcome, hull))
+        candidates = [
+            o
+            for o, kind in zip(mine, kinds)
+            if kind == "foils"
+            and o is not None
+            and (floor is None or o["results"]["GM_L"] >= 0.98 * floor)
+        ]
+        if not candidates:
+            print("With foils: no feasible design found\n")
         else:
-            print(describe("With foils", best, hull) + f"  [{time.time() - t0:.0f} s]\n", flush=True)
+            best = min(candidates, key=lambda o: o["results"]["D"])
+            print(describe("With foils", best, hull) + "\n")

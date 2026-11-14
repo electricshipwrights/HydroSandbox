@@ -63,6 +63,8 @@ res = hsb.PoweredCraftBuildup.solve(
 res["trim"], res["D"], res["P_battery"], res["mass_battery_sized"], res["xyz_cg"]
 ```
 
+Each solve is single-threaded, so independent solves (the starting points of a multi-start optimization, the points of a sweep) are the unit of parallelism: `hsb.parallel_map(function, tasks, jobs=None)` runs them in separate processes on all cores, and the optimization example uses it (`--jobs`).
+
 Validation against boatmath's own Rust output:
 
 | Case | Quantity | Agreement |
