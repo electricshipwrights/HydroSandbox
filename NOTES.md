@@ -34,6 +34,20 @@ Findings (pre-existing Hull behaviour, not changed):
 - Rw on the test family at Fn 0.2 is not grid-converged: 164 / 189 / 207 N at
   41 / 81 / 161 stations.
 
+Cal 20 / NP-ish study (2026-11-14, `local/camber_blend_study.py`, results in
+`local/camber_blend_study.json`; inputs ~/Cal 20.json, ~/NPish ... v2.json):
+- Both scaled to LOA 6.11 m, sections promoted on-curve, mass fixed at the Cal 20
+  canoe body's 1224 kg, CG at each blend's level-at-rest LCB, 21 exact blends x
+  2.0 / 2.75 / 3.25 m/s.
+- Thin-ship is out of its validity range here (L/B ~2.7-3): a Wigley of the same
+  L and displacement gives the same magnitudes (233 N at 2 m/s, 3.1 kN at 3.25),
+  several times a real Cal 20's. Treat as a ranking at best; there are also jumps
+  in D(t) at 2.75 m/s (t 0.55-0.60, 0.70-0.75) not yet explained.
+- Interpolant check on the test family: optimizer from t=0.1 found 0.067 (exact
+  optimum ~0.2, 2% worse); from t=0.8 a spurious minimum at 0.735. For 1-D blends
+  a scan of exact blends is the reliable answer.
+- Next candidate: a DSYHS (Delft yacht series) regression on swept hydrostatics.
+
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
   through the node interpolant. Freeing individual control points (beyond blend
