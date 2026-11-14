@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hydrosandbox"
+version = "0.1.0"
+description = "Differentiable hydrofoil, hull, and electric marine propulsion design optimization built on AeroSandbox."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Electric Shipwrights" },
+]
+keywords = [
+    "hydrofoils",
+    "hydrodynamics",
+    "naval-architecture",
+    "thin-ship",
+    "wave-resistance",
+    "marine-propulsion",
+    "mdo",
+    "optimization",
+    "automatic differentiation",
+    "aerosandbox",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "aerosandbox>=4.2.10",
+    "casadi>=3.7.2",
+    "dill>=0.4.0",
+    "matplotlib>=3.10.7",
+    "neuralfoil>=0.3.0,<0.4.0",
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
+    "tqdm>=4.67.1",
+]
+
+[project.optional-dependencies]
+full = [
+    "cadquery>=2.6.1",
+    "plotly>=6.4.0",
+    "pyvista>=0.46.4",
+    "shapely>=2.1.2",
+    "trimesh>=4.9.0",
+]
+test = [
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "shapely>=2.1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/electricshipwrights/HydroSandbox"
+Source = "https://github.com/electricshipwrights/HydroSandbox"
+"Bug Reports" = "https://github.com/electricshipwrights/HydroSandbox/issues"
+"Upstream AeroSandbox" = "https://github.com/peterdsharpe/AeroSandbox"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hydrosandbox"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/hydrosandbox",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE.txt",
+]
+
+[dependency-groups]
+dev = [
+    "cadquery>=2.6.1",
+    "ipykernel>=7.1.0",
+    "ipython>=8.37.0",
+    "plotly>=6.4.0",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pyvista>=0.46.4",
+    "shapely>=2.1.2",
+    "trimesh>=4.9.0",
+]
+
+[tool.ruff]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]

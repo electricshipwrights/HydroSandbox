@@ -1,4 +1,4 @@
-"""HydroSandbox: a Python package for design optimization of lifting hydrofoil assemblies."""
+"""HydroSandbox: differentiable hydrofoil, hull, and electric marine propulsion design optimization built on AeroSandbox."""
 
 import os as _os
 from pathlib import Path
@@ -94,9 +94,9 @@ _hsb_root = Path(__file__).parent
 try:
     from importlib.metadata import version
 
-    __version__ = version("AeroSandbox")
+    __version__ = version("hydrosandbox")
 except Exception:
-    __version__ = "unknown"
+    __version__ = "0.1.0"
 
 
 def run_tests() -> int:
