@@ -58,6 +58,7 @@ from hydrosandbox.library import (
     wave_quadrature_nodes,
     wing_thickness_wave_sources,
 )
+from hydrosandbox.parallel import parallel_map
 from hydrosandbox.performance import HydroOperatingPoint
 from hydrosandbox.propulsion import (
     BSeriesInputs,
@@ -181,6 +182,7 @@ __all__ = [
     "FuselageXSec",
     "ControlSurface",
     "MassProperties",
+    "parallel_map",
     "run_tests",
     "__version__",
 ]

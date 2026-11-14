@@ -74,6 +74,14 @@ Done:
   attitude -> RPM -> masses (~45 s on a 61x41 hull); residuals for Opti.
   `CraftBuildup` gained `point_masses` and `shaft_angle`.
 
+- Catamarans: `CraftBuildup(demihull_spacing=...)`. Checked against boatmath on
+  the NACRA cat (`~/nacra.igs`, 2.2 m spacing, 520 kg): Rt within 1.3%, sinkage
+  0.3 mm, trim 0.05 deg, Fn 0.2-0.9, hull-hull interference included.
+- `hsb.parallel_map` runs independent solves on all cores (the box has 24);
+  `examples/optimize_foils_on_hull.py --jobs`.
+- `local/` (git-excluded) holds the NACRA case: boatmath records and reference
+  results, `nacra_check.py`, `nacra_baseline.py`, `nacra_cg_sweep.py`.
+
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
   fixed-loading case on the hummingbird hull; the full study (GM_L floors, CG and
