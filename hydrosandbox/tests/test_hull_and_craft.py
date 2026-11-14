@@ -167,12 +167,18 @@ def _t_foil(x_foil: float) -> hsb.HydrofoilAssembly:
 
 def test_bare_hull_floats_at_its_design_waterline():
     water, hull, mass = _small_craft()
-    res = CraftBuildup.solve_equilibrium(
-        hull=hull, velocity=0.3, mass=mass, xyz_cg=[0.0, 0.0, 0.1], water=water
-    )
+    common = dict(hull=hull, velocity=0.3, mass=mass, xyz_cg=[0.0, 0.0, 0.1], water=water)
+    res = CraftBuildup.solve_equilibrium(include_hull_dynamics=False, **common)
     assert res["sinkage"] == pytest.approx(0.0, abs=1e-4)
     assert res["trim"] == pytest.approx(0.0, abs=1e-3)
     assert scalar(res["buoyancy_hull"]) == pytest.approx(mass * G, rel=1e-6)
+
+    # With its own pressure field the hull squats, by about 0.02 Fn^2 L at low speed
+    # (Havelock; boatmath's Wigley coefficient is 0.021).
+    squat = CraftBuildup.solve_equilibrium(**common)
+    froude = 0.3 / onp.sqrt(G * hull.length)
+    assert squat["sinkage"] / hull.length / froude**2 == pytest.approx(0.02, rel=0.5)
+    assert scalar(squat["F_z_hull_dynamic"]) < 0.0
 
 
 def test_foil_lifts_the_hull_and_its_position_sets_trim_and_interference():
@@ -206,3 +212,114 @@ def test_foil_lifts_the_hull_and_its_position_sets_trim_and_interference():
         )
         assert total == pytest.approx(scalar(res["D_wave"]), rel=1e-9)
     assert abs(scalar(mid["D_wave_interference"]) - scalar(aft["D_wave_interference"])) > 5.0
+
+
+# Output of a boatmath example calling `thinship::sectional::dynamic_force` on the
+# same Wigley hull in sea water (rho = 1025.9), about midships (commit 2d4b3ac):
+# Froude number -> (force_up [N], moment_bow_up [N m]).
+BOATMATH_WIGLEY_DYNAMIC = {
+    0.20: (-610.7129, 22.3468),
+    0.30: (-1508.8475, 188.6157),
+    0.40: (-3451.4538, 4270.7062),
+    0.50: (-4132.9551, 10672.1180),
+}
+
+
+@pytest.mark.parametrize("froude", sorted(BOATMATH_WIGLEY_DYNAMIC))
+def test_wigley_dynamic_sinkage_force_and_trim_moment_match_boatmath(froude):
+    hull = Hull.wigley(10.0, 1.0, 0.625)
+    u = froude * onp.sqrt(G * 10.0)
+    dynamic = hull.dynamic_force(u, 1025.9)
+    want_force, want_moment = BOATMATH_WIGLEY_DYNAMIC[froude]
+    assert scalar(dynamic["force_up"]) == pytest.approx(want_force, rel=1e-2)
+    assert scalar(dynamic["moment_bow_up"]) == pytest.approx(want_moment, rel=1.5e-2)
+    # Fore-aft symmetric hull: the local part of the moment vanishes; trim is all wave.
+    assert abs(scalar(dynamic["moment_local"])) < 1e-6 * abs(want_moment)
+    # Moving the reference 1 m forward adds the (downward) force's moment, bow-up.
+    forward = hull.dynamic_force(u, 1025.9, x_ref=-1.0)
+    assert scalar(forward["moment_bow_up"]) == pytest.approx(
+        scalar(dynamic["moment_bow_up"]) - scalar(dynamic["force_up"]), rel=1e-6
+    )
+
+
+def _transom_hull() -> Hull:
+    """A Wigley forebody cut off at 70% of its length: an immersed transom."""
+    full = Hull.wigley(6.0, 0.8, 0.3, freeboard=0.3, n_stations=41, n_levels=17)
+    keep = int(0.7 * len(full.stations))
+    return Hull(full.stations[:keep], full.levels, full.half_breadths[:keep])
+
+
+def test_station_contracted_amplitude_equals_per_cell_sources():
+    hull = _transom_hull()
+    attitude = dict(sinkage=0.02, trim=1.5, pivot_xz=(0.5, 0.1))
+    u, scales = 3.5, (1.0, 9.0, 0.02)
+    per_cell = kelvin_wave_resistance(
+        velocity=u, density=1000.0, length_scales=scales,
+        **hull.wave_sources(u, **attitude),
+    )
+    contracted = kelvin_wave_resistance(
+        xyz_a=([], [], []), xyz_b=([], [], []), velocity=u, density=1000.0,
+        length_scales=scales, extra_source_amplitude=hull.wave_amplitude(u, **attitude),
+    )
+    # Identical but for the trimmed cells' fore-aft lean, which the contraction drops.
+    assert scalar(contracted) == pytest.approx(scalar(per_cell), rel=2e-2)
+
+
+def test_transom_hollow_stays_level_when_the_hull_trims():
+    """
+    The closing hollow carries the transom's immersed section straight aft: its
+    sources must not dive with a bow-up trim.
+    """
+    hull = _transom_hull()
+    strips = hull._strips(4.0, G, sinkage=0.0, trim=3.0, pivot_xz=(0.0, 0.0))
+    transom = strips["transom"]
+    assert scalar(transom["hollow_length"]) > 0.5
+    z_lo = onp.asarray(strips["z_lo_hollow"]).reshape(strips["n_hollow"], -1)
+    assert onp.allclose(z_lo, onp.asarray(transom["z_lo"]).reshape(1, -1))
+    assert onp.all(onp.diff(onp.ravel(strips["x_hollow"])) > 0)
+
+
+def test_symbolic_attitude_reproduces_numeric_and_solves_in_opti():
+    import casadi as cas
+
+    hull = _transom_hull()
+    u, rho, pivot = 3.5, 1025.0, (0.5, 0.1)
+    s, t = cas.MX.sym("sinkage"), cas.MX.sym("trim")
+    at = (0.015, 1.2)
+
+    def evaluate(expr):
+        return float(cas.Function("f", [s, t], [expr])(*at))
+
+    numeric = hull.dynamic_force(u, rho, G, at[0], at[1], pivot)
+    symbolic = hull.dynamic_force(u, rho, G, s, t, pivot)
+    for key in ("force_up", "moment_local", "moment_wave"):
+        assert evaluate(symbolic[key]) == pytest.approx(scalar(numeric[key]), rel=1e-9)
+
+    # Equilibrium as two Opti constraints agrees with the Newton solve.
+    water = hsb.Water.seawater()
+    statics = hull.hydrostatics()
+    mass = 0.9 * scalar(statics["volume"]) * water.density()
+    common = dict(
+        hull=hull, velocity=2.5, mass=mass, water=water,
+        xyz_cg=[scalar(statics["x_cb"]), 0.0, 0.1],  # over the centre of buoyancy
+        include_interference_breakdown=False,
+    )
+    newton = CraftBuildup.solve_equilibrium(**common)
+
+    opti = asb.Opti()
+    # (started near the Newton attitude, as a design loop would be)
+    sinkage = opti.variable(
+        init_guess=newton["sinkage"] + 0.003, lower_bound=-0.2, upper_bound=0.2
+    )
+    trim = opti.variable(
+        init_guess=newton["trim"] + 0.3, lower_bound=-15.0, upper_bound=15.0
+    )
+    res = CraftBuildup(sinkage=sinkage, trim=trim, **common).run()
+    weight = mass * G
+    opti.subject_to(
+        [res["F_z_net"] / weight == 0, res["M_y_net"] / (weight * hull.length) == 0]
+    )
+    opti.minimize(0)
+    sol = opti.solve(verbose=False, options={"ipopt.hessian_approximation": "limited-memory"})
+    assert sol(sinkage) == pytest.approx(newton["sinkage"], abs=2e-4)
+    assert sol(trim) == pytest.approx(newton["trim"], abs=2e-2)

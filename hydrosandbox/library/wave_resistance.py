@@ -149,6 +149,7 @@ def kelvin_wave_resistance(
     reference_velocity: float | None = None,
     phase_per_panel: float = 2.0,
     nodes_per_panel: int = 6,
+    extra_source_amplitude=None,
 ) -> Vectorizable:
     """
     Compute the steady deep-water wave resistance [N] of a set of straight line
@@ -176,6 +177,11 @@ def kelvin_wave_resistance(
         are symbolic (CasADi) and this is not given, defaults to ``(2, 2, 0.05)``.
     reference_velocity : Numeric speed used to size the quadrature when ``velocity``
         is symbolic.
+    extra_source_amplitude : Optional callable ``(kx, kappa) -> (re, im)`` giving, at
+        the quadrature's wavenumbers (1 x M rows), the source-flux transform
+        ``sum Q exp(kappa z - i kx x)`` of a further wave-maker on the centreplane
+        ``y = 0`` (e.g. ``Hull.wave_amplitude``). It is added to both half-systems,
+        so it interferes with the elements. With it, ``length_scales`` is required.
 
     Returns
     -------
@@ -184,8 +190,10 @@ def kelvin_wave_resistance(
     xa, ya, za = (_column(v) for v in xyz_a)
     xb, yb, zb = (_column(v) for v in xyz_b)
     n_elements = xa.shape[0]
-    if n_elements == 0:
+    if n_elements == 0 and extra_source_amplitude is None:
         return 0.0
+    if extra_source_amplitude is not None and length_scales is None:
+        raise ValueError("`length_scales` is required with `extra_source_amplitude`.")
 
     def strengths(values):
         if values is None:
@@ -195,7 +203,14 @@ def kelvin_wave_resistance(
     q_row = strengths(source_flux)
     fy_row = strengths(force_y)
     fz_row = strengths(force_z)
-    if q_row is None and fy_row is None and fz_row is None:
+    if n_elements == 0:
+        q_row = fy_row = fz_row = None
+    if (
+        q_row is None
+        and fy_row is None
+        and fz_row is None
+        and extra_source_amplitude is None
+    ):
         return 0.0
 
     # Depth-like coordinate: z relative to the free surface, clamped to z <= 0.
@@ -260,23 +275,32 @@ def kelvin_wave_resistance(
     def outer(col, row):
         return col @ row
 
+    if extra_source_amplitude is not None:
+        extra_re, extra_im = extra_source_amplitude(kx, kappa)
+        extra_re = np.reshape(extra_re, (1, -1))
+        extra_im = np.reshape(extra_im, (1, -1))
+    else:
+        extra_re = extra_im = 0.0
+    has_elements = q_row is not None or fy_row is not None or fz_row is not None
+
     ### Streamwise smearing: uniform over `smear_length` -> sinc(kx * c / 2)
-    if smear_length is not None:
+    if smear_length is not None and has_elements:
         arg = outer(0.5 * _column(smear_length), kx)
         arg_safe = np.where(np.fabs(arg) < 1e-6, 1.0, arg)
         smear = np.where(np.fabs(arg) < 1e-6, 1.0, np.sin(arg_safe) / arg_safe)
     else:
         smear = 1.0
 
-    re_a = outer(za, kappa)
-    re_b = outer(zb, kappa)
-    d_re = re_b - re_a
-    px_a = outer(xa, kx)
-    px_b = outer(xb, kx)
-    py_a = outer(ya, ky)
-    py_b = outer(yb, ky)
-    exp_a = np.exp(re_a)
-    exp_b = np.exp(re_b)
+    if has_elements:
+        re_a = outer(za, kappa)
+        re_b = outer(zb, kappa)
+        d_re = re_b - re_a
+        px_a = outer(xa, kx)
+        px_b = outer(xb, kx)
+        py_a = outer(ya, ky)
+        py_b = outer(yb, ky)
+        exp_a = np.exp(re_a)
+        exp_b = np.exp(re_b)
 
     def segment_transform(sign: float):
         """
@@ -305,9 +329,10 @@ def kelvin_wave_resistance(
 
     integrand = 0.0
     for sign in (1.0, -1.0):
-        e_re, e_im = segment_transform(sign)
-        b_re = 0.0
-        b_im = 0.0
+        b_re = extra_re
+        b_im = extra_im
+        if has_elements:
+            e_re, e_im = segment_transform(sign)
         if q_row is not None:
             b_re = b_re + q_row @ e_re
             b_im = b_im + q_row @ e_im

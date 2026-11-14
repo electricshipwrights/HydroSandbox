@@ -24,24 +24,31 @@ Done:
   - Validated: Wigley closed form (0.13%), 2D vortex (<0.5%), infinite-Froude
     image limit (0.02% kernel, 0.4% through VLM/LL).
 
-- Hull in the loop (`hydrosandbox/hull/`): first stage of porting boatmath
-  (`hullgeom`, `thinship`) to differentiable Python.
-  - `Hull`: offsets table (from numbers, mesh, or boatmath hull-record geometry),
-    hydrostatics / ITTC-57 / thin-ship sources / transom closure at any
-    sinkage and trim. Matches boatmath's Rust output on Wigley (Rw 0.6%, Rv 0.05%;
-    reference numbers from `cargo run -p thinship --example wigley_curve`, built
-    in a `rust:1-slim` container since there is no Rust toolchain on this box).
+- Hull in the loop (`hydrosandbox/hull/`): port of boatmath (`hullgeom`,
+  `thinship`) to differentiable Python.
+  - `Hull`: offsets table (from numbers, mesh, or boatmath hull-record geometry);
+    hydrostatics, ITTC-57, thin-ship sources, transom closure, and the dynamic
+    sinkage force / trim moment (`thinship::squat`) at any sinkage and trim.
   - `CraftBuildup`: hull + foil assembly as one rigid craft; shared wave
-    spectrum (interference), F_z / M_y residuals for sinkage and trim.
+    spectrum (interference); `solve_equilibrium` (Newton, 5-15 s) or Opti
+    constraints (limited-memory Hessian; start from the Newton attitude).
+  - Validated against boatmath's Rust output. Wigley: Rw 0.6%, Rv 0.05%,
+    dynamic force 0.3%, moment 0.5%. Real hull (`~/hummingbird.igs`, cut by
+    `boatmath hull`, free attitude, Fn 0.3-0.9): sinkage 0.2 mm, trim 0.06 deg,
+    Rt 1.5%. References came from a `rust:1-slim` container (no Rust toolchain
+    on this box); the built CLI and outputs were in the session scratchpad and
+    are not kept. The IGES and its hull record are not committed.
+  - Bugs found on the way, now tested: the transom hollow must stay level
+    (not pitch with trim); transom depth uses the widest *immersed* breadth;
+    CasADi reshape is column-major.
 
 Left (hull port):
-- Hull's own dynamic sinkage/trim/lift (boatmath `squat`, `nearfield`, 2D+t
-  `lift`) not ported: attitude sees hydrostatics, foils and thrust line only.
-- Slow: ~15-35 s per equilibrium solve (800 hull cells in the wave integral).
-  Pre-integrating depth per station, as boatmath does, is the obvious speedup.
-- No real hull tested (no CAD fixtures on this machine); only Wigley shapes.
-- Transom closure ported but validated only for ordering, not against boatmath.
-- Hull near field at the foil, and foil pressure on the hull, not modelled.
+- boatmath's 2D+t planing `lift` and `nearfield` (hull flow at the foil) not ported.
+- The foil's waves do not enter the hull's dynamic force, nor the hull's the foil's inflow.
+- Default 61x41 offsets give ~2-5% on a shallow real hull; finer grids converge
+  to boatmath (121x161: <1% Rw, <2% force).
+- IPOPT needs a good start for the attitude variables; a cold start can report
+  infeasible.
 
 Left:
 - Free-surface effect on *lift* is still the image approximation (kappa); a
