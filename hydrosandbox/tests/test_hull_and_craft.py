@@ -926,3 +926,22 @@ def test_craft_step_export_writes_hull_surfaces_and_foil_solids(tmp_path):
     assert onp.max(onp.abs([p["ctrl"][..., 1] for p in patches])) == pytest.approx(b, rel=1e-9)
     hull_only = hsb.export_craft_step(tmp_path / "hull.step", drawn)
     assert hull_only.read_text().count("B_SPLINE_SURFACE_WITH_KNOTS") == 2
+
+
+def test_craft_step_export_marks_the_centre_of_gravity_in_red(tmp_path):
+    import re
+
+    hull = Hull.wigley(5.0, 0.8, 0.25, freeboard=0.3, n_stations=11, n_levels=7)
+    text = hsb.export_craft_step(
+        tmp_path / "marked.step", hull, _t_foil(1.5), xyz_cg=[0.4, 0.0, 0.1],
+        cg_marker_radius=0.05,
+    ).read_text()
+    assert "MANIFOLD_SOLID_BREP('Centre of gravity'" in text
+    # A 50 mm sphere centred on the CG (the file is in millimetres), coloured red.
+    assert re.search(r"SPHERICAL_SURFACE\('',#\d+,50\.\)", text)
+    assert "CARTESIAN_POINT('',(400.,0.,100.))" in text
+    assert "COLOUR_RGB('',1.,0.,0.)" in text
+    assert text.count("STYLED_ITEM") == 1
+    # Without a CG, no marker and no styling.
+    plain = hsb.export_craft_step(tmp_path / "plain.step", hull, _t_foil(1.5)).read_text()
+    assert "SPHERICAL_SURFACE" not in plain and "STYLED_ITEM" not in plain
