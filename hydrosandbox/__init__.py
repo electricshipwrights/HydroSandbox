@@ -14,7 +14,7 @@ from aerosandbox import (
     Wing,
     WingXSec,
 )
-from hydrosandbox import fluid, geometry, hull, hydrodynamics, library, performance
+from hydrosandbox import fluid, geometry, hull, hydrodynamics, library, performance, propulsion
 from hydrosandbox.fluid import Water
 from hydrosandbox.geometry import (
     Foil,
@@ -52,6 +52,25 @@ from hydrosandbox.library import (
     ventilation_margin_strut,
 )
 from hydrosandbox.performance import HydroOperatingPoint
+from hydrosandbox.propulsion import (
+    BSeriesInputs,
+    CatalogMotor,
+    ElectricPropulsionBuildup,
+    MotorDatabase,
+    TopOperatingPoint,
+    evaluate_bseries,
+    hull_propeller_interaction,
+    mass_battery_marine,
+    mass_controller_marine,
+    mass_gearbox_marine,
+    mass_motor_marine,
+    match_motors_to_curve,
+    motor_performance_drela,
+    motor_performance_loss,
+    optimize_bseries_propeller,
+    propeller_actuator_disk_power,
+    sweep_bseries_rpm,
+)
 
 _hsb_root = Path(__file__).parent
 
@@ -85,6 +104,7 @@ __all__ = [
     "hydrodynamics",
     "library",
     "performance",
+    "propulsion",
     "numpy",
     "Water",
     "HydroOperatingPoint",
@@ -118,6 +138,23 @@ __all__ = [
     "cavitation_drag_increment",
     "ventilation_margin_lifting_foil",
     "ventilation_margin_strut",
+    "evaluate_bseries",
+    "propeller_actuator_disk_power",
+    "BSeriesInputs",
+    "TopOperatingPoint",
+    "sweep_bseries_rpm",
+    "optimize_bseries_propeller",
+    "motor_performance_drela",
+    "motor_performance_loss",
+    "mass_motor_marine",
+    "mass_controller_marine",
+    "mass_gearbox_marine",
+    "mass_battery_marine",
+    "CatalogMotor",
+    "MotorDatabase",
+    "match_motors_to_curve",
+    "hull_propeller_interaction",
+    "ElectricPropulsionBuildup",
     "Opti",
     "OptiSol",
     "Airfoil",
