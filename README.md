@@ -1,6 +1,6 @@
 # HydroSandbox
 
-> **Built on [AeroSandbox](https://github.com/peterdsharpe/AeroSandbox)**: HydroSandbox is a standalone package for differentiable hydrofoil, hull, and electric marine propulsion design optimization that builds directly on Peter Sharpe's [**AeroSandbox**](https://github.com/peterdsharpe/AeroSandbox) ([documentation](https://peterdsharpe.github.io/AeroSandbox/)). Rather than vendoring a fork, HydroSandbox installs `aerosandbox` (`>=4.2.10`) as a dependency and uses its CasADi/NumPy automatic-differentiation backend (`aerosandbox.numpy`), `Opti` IPOPT nonlinear optimization interface, parametric 3D geometry primitives (`Wing`, `Fuselage`, `Airfoil`, `KulfanAirfoil`, `MassProperties`), and [NeuralFoil](https://github.com/peterdsharpe/NeuralFoil) 2D viscous airfoil surrogates—extending them with marine physics ported from `boatmath` (`hullgeom`, `thinship`) and empirical marine propulsion models.
+> **Built on [AeroSandbox](https://github.com/peterdsharpe/AeroSandbox)**: HydroSandbox is a standalone package for differentiable hydrofoil, hull, and electric marine propulsion design optimization that builds directly on Peter Sharpe's [**AeroSandbox**](https://github.com/peterdsharpe/AeroSandbox) ([documentation](https://peterdsharpe.github.io/AeroSandbox/)). Rather than vendoring a fork, HydroSandbox installs `aerosandbox` (`>=4.2.10`) as a dependency and uses its CasADi/NumPy automatic-differentiation backend (`aerosandbox.numpy`), `Opti` IPOPT nonlinear optimization interface, parametric 3D geometry primitives (`Wing`, `Fuselage`, `Airfoil`, `KulfanAirfoil`, `MassProperties`), and [NeuralFoil](https://github.com/peterdsharpe/NeuralFoil) 2D viscous airfoil surrogates—extending them with free-surface hydrodynamics, thin-ship hull and Kelvin–Havelock wave-making physics, and empirical marine propulsion models.
 
 HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO)** of foil-assisted boats and electric marine craft on a workstation: a foil-only analysis takes seconds, a hull-in-the-loop optimization with stability takes minutes and a few GB of memory per solve. All solvers combine smooth, CasADi-differentiable potential flow, linearized thin-ship / Kelvin–Havelock wave resistance, and semi-empirical hydrodynamic/propulsion buildups rather than mesh-based RANS/VOF Navier–Stokes CFD.
 
@@ -27,7 +27,7 @@ HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO
 
 ### 3. Hull in the Loop & Coupled Craft Balance
 - **Thin-Ship Hull Model** (`hydrosandbox.hull.hull`):
-  - Constructible from offset tables (`Hull(...)`), analytical Wigley hulls (`Hull.wigley`), triangle meshes (`Hull.from_mesh`), or `boatmath` geometry records (`Hull.from_boatmath_geometry`), supporting both monohulls and symmetric catamarans (`demihull_spacing`).
+  - Constructible from offset tables (`Hull(...)`), analytical Wigley hulls (`Hull.wigley`), or triangle meshes (`Hull.from_mesh`), supporting both monohulls and symmetric catamarans (`demihull_spacing`).
   - Evaluates panel Archimedes hydrostatics, ITTC-57 wetted-area skin friction, Froude-tapered dry-transom hollow closure, and linearized thin-ship dynamic sinkage force & trim moment (`Hull.dynamic_force`).
 - **Two-Way Hull–Foil Coupling & Attitude Tables** (`Hull`, `CraftBuildup`):
   - Models thin-ship hull thickness velocity at foil control points (`Hull.induced_velocity`), image-corrected foil horseshoe suction on hull bottom panels (`Hull.pressure_load`), and the hull's free-surface wave elevation and orbital velocity at downstream foils (`Hull.wave_field`).
@@ -175,14 +175,14 @@ hydrosandbox/
 ├── propulsion/     # B-series propellers, electric motor models/catalog, wake/foil interaction, PoweredCraftBuildup
 ├── examples/       # MDO scripts for standalone T-foils and hull-coupled hydrofoil craft
 ├── parallel.py     # Multi-process parallel_map worker helper (OpenBLAS-pinned per process)
-└── tests/          # Unit and analytical/boatmath parity test suite
+└── tests/          # Unit and analytical benchmark test suite
 ```
 
 ---
 
 ## Validation Summary
 
-Kernel and hull formulations are tested against analytical closed forms (Havelock 2D dipoles, Wigley hull Michell integral) and the Rust `boatmath` (`hullgeom`, `thinship`, `propeller`) reference outputs:
+Kernel and hull formulations are tested against analytical closed forms (Havelock 2D dipoles, Wigley hull Michell integral) and independent thin-ship and B-series reference implementations:
 
 | Case | Quantity | Agreement |
 |---|---|---|
