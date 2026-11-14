@@ -14,6 +14,20 @@
   - [`HydroLiftingLine`](hydrodynamics/lifting_line.py): Nonlinear viscous 3D lifting-line solver coupling horseshoe downwash with incompressible NeuralFoil section polars (`mach=0.0`) and `Cpmin_0` cavitation diagnostics.
   - [`evaluate_hydrofoil_2D`](hydrodynamics/hydro_2D.py) & [`cavitation_bucket`](hydrodynamics/hydro_2D.py): 2D section polar evaluation and cavitation-free speed buckets.
 
+## Wave-Making Drag
+
+All three 3D solvers include steady wave-making drag by default (`include_wave_drag=True`, active whenever `op_point.surface_z` is set and `free_surface_mode != "none"`), using linear far-field theory in [`library/wave_resistance.py`](library/wave_resistance.py):
+
+- **Thickness** of struts, foils and pods radiates as sources. For a surface-piercing strut this is Michell's thin-ship integral.
+- **Lift and side force** radiate as vertical and horizontal pressure dipoles at the depth of the loading.
+- Everything is superposed in one free-wave spectrum, so interference (foil with stabilizer, strut with foil) is included.
+
+The formulation and conventions follow the `thinship` crate of the `boatmath` project, and the kernel is validated against the same closed forms (the Wigley hull's Michell integral, Havelock's 2D results).
+
+Results report `D_induced` as the trailing-vortex drag with a **rigid-lid** image and `D_wave` as the wave resistance. Their sum is the drag due to lift; as `Fr -> infinity` it recovers the classical `phi = 0` image-method value, so `D_wave` is not an extra term on top of a high-Froude induced drag. The chosen `free_surface_mode` still sets how the free surface affects *lift*.
+
+Limits: deep water, linear theory (no breaking or spray sheets, loading not closer than about half a chord to the surface), and the free surface's effect on lift is still the image approximation rather than the full finite-Froude near field.
+
 ## Coordinate & Sign Conventions
 
 - **Geometry axes (`_g`)**: `+x_g` aft/downstream, `+y_g` starboard/right, `+z_g` **upward** (so buoyancy acts in `+z_g`).

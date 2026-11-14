@@ -17,6 +17,13 @@ from hydrosandbox.library.cavitation import (
     ventilation_margin_lifting_foil,
     ventilation_margin_strut,
 )
+from hydrosandbox.library.wave_resistance import (
+    fuselage_wave_sources,
+    kelvin_wave_resistance,
+    merge_wave_elements,
+    wave_quadrature_nodes,
+    wing_thickness_wave_sources,
+)
 
 __all__ = [
     "smooth_submergence_fraction",
@@ -34,4 +41,9 @@ __all__ = [
     "cavitation_drag_increment",
     "ventilation_margin_lifting_foil",
     "ventilation_margin_strut",
+    "kelvin_wave_resistance",
+    "wave_quadrature_nodes",
+    "wing_thickness_wave_sources",
+    "fuselage_wave_sources",
+    "merge_wave_elements",
 ]
