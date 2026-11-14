@@ -8,6 +8,7 @@ from hydrosandbox.hydrodynamics.hydro_2D import (
     evaluate_hydrofoil_2D,
     cavitation_bucket,
 )
+from hydrosandbox.hydrodynamics.wave_drag import horseshoe_lattice_wave_drag
 
 __all__ = [
     "calculate_induced_velocity_horseshoe_hydro",
@@ -16,4 +17,5 @@ __all__ = [
     "HydroBuildup",
     "evaluate_hydrofoil_2D",
     "cavitation_bucket",
+    "horseshoe_lattice_wave_drag",
 ]

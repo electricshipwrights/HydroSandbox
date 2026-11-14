@@ -73,6 +73,19 @@ def _numeric_or_none(values) -> _onp.ndarray | None:
         return None
 
 
+def _numeric_entries(values) -> _onp.ndarray:
+    """Extract any plain numeric scalar entries from a possibly mixed symbolic/numeric sequence."""
+    if isinstance(values, (list, tuple)):
+        nums = []
+        for v in values:
+            arr = _numeric_or_none(v)
+            if arr is not None:
+                nums.append(arr)
+        return _onp.concatenate(nums) if nums else _onp.zeros(0, dtype=float)
+    arr = _numeric_or_none(values)
+    return arr if arr is not None else _onp.zeros(0, dtype=float)
+
+
 def wave_quadrature_nodes(
     nu: float,
     y_extent: float,
@@ -172,15 +185,18 @@ def kelvin_wave_resistance(
     velocity : Speed through the water [m/s].
     density : Water density [kg/m^3].
     length_scales : ``(y_extent, x_extent, min_depth)`` [m] used only to size the
-        quadrature panels. Inferred from the elements when they are numeric; if they
-        are symbolic (CasADi) and this is not given, defaults to ``(2, 2, 0.05)``.
+        quadrature panels. Inferred from numeric coordinates when available (even in
+        partially symbolic ``Opti`` graphs), falling back to ``(1.0, 0.5, 0.15)`` for
+        any missing dimension.
     reference_velocity : Numeric speed used to size the quadrature when ``velocity``
-        is symbolic.
+        is symbolic (defaults to ``5.0`` m/s if omitted).
 
     Returns
     -------
     Wave resistance ``R_w`` [N] (scalar; a CasADi expression if inputs are symbolic).
     """
+    raw_xa, raw_ya, raw_za = xyz_a
+    raw_xb, raw_yb, raw_zb = xyz_b
     xa, ya, za = (_column(v) for v in xyz_a)
     xb, yb, zb = (_column(v) for v in xyz_b)
     n_elements = xa.shape[0]
@@ -205,12 +221,7 @@ def kelvin_wave_resistance(
     ### Quadrature (numeric nodes; sized from numeric estimates of the problem scales)
     v_num = _numeric_or_none(velocity)
     if v_num is None:
-        if reference_velocity is None:
-            raise ValueError(
-                "`velocity` is symbolic; pass a numeric `reference_velocity` so the "
-                "wave-resistance quadrature can be sized."
-            )
-        v_ref = float(reference_velocity)
+        v_ref = float(reference_velocity) if reference_velocity is not None else 5.0
     else:
         v_ref = float(v_num[0])
     if v_ref <= 0:
@@ -219,7 +230,33 @@ def kelvin_wave_resistance(
     if length_scales is None:
         numeric = [_numeric_or_none(v) for v in (xa, ya, za, xb, yb, zb)]
         if any(v is None for v in numeric):
-            length_scales = (2.0, 2.0, 0.05)
+            x_nums = _onp.concatenate([_numeric_entries(raw_xa), _numeric_entries(raw_xb)])
+            y_nums = _onp.concatenate([_numeric_entries(raw_ya), _numeric_entries(raw_yb)])
+            s_num = _numeric_or_none(surface_z)
+            if s_num is not None and s_num.size == 1:
+                z_nums = (
+                    _onp.concatenate([_numeric_entries(raw_za), _numeric_entries(raw_zb)])
+                    - float(s_num[0])
+                )
+            else:
+                z_nums = _onp.zeros(0, dtype=float)
+            y_ext = (
+                float(_onp.ptp(y_nums))
+                if y_nums.size >= 2 and _onp.ptp(y_nums) > 1e-3
+                else 1.0
+            )
+            x_ext = (
+                float(_onp.ptp(x_nums))
+                if x_nums.size >= 2 and _onp.ptp(x_nums) > 1e-3
+                else 0.5
+            )
+            if z_nums.size >= 1:
+                d_pos = -_onp.minimum(z_nums, 0.0)
+                d_nonzero = d_pos[d_pos > 1e-3]
+                min_d = float(_onp.min(d_nonzero)) if d_nonzero.size > 0 else 0.15
+            else:
+                min_d = 0.15
+            length_scales = (y_ext, x_ext, min_d)
         else:
             xa_n, ya_n, za_n, xb_n, yb_n, zb_n = numeric
             x_all = _onp.concatenate([xa_n, xb_n])
@@ -394,14 +431,12 @@ def wing_thickness_wave_sources(
             p_b = wing._compute_xyz_of_WingXSec(i + 1, x_nondim=mids[j], z_nondim=0.0)
             span_yz = np.sqrt((p_b[1] - p_a[1]) ** 2 + (p_b[2] - p_a[2]) ** 2 + 1e-16)
 
-            flux = (
-                velocity
-                * span_yz
-                * f_sub
-                * 0.5
-                * (xsec_a.chord * jumps[i][j] + xsec_b.chord * jumps[i + 1][j])
-            )
-            smear = widths[j] * 0.5 * (xsec_a.chord + xsec_b.chord)
+            c_lo = (1.0 - t_lo) * xsec_a.chord + t_lo * xsec_b.chord
+            c_hi = (1.0 - t_hi) * xsec_a.chord + t_hi * xsec_b.chord
+            j_lo = (1.0 - t_lo) * jumps[i][j] + t_lo * jumps[i + 1][j]
+            j_hi = (1.0 - t_hi) * jumps[i][j] + t_hi * jumps[i + 1][j]
+            flux = velocity * span_yz * f_sub * 0.5 * (c_lo * j_lo + c_hi * j_hi)
+            smear = widths[j] * 0.5 * (c_lo + c_hi)
 
             start = [(1.0 - t_lo) * p_a[k] + t_lo * p_b[k] for k in range(3)]
             end = [(1.0 - t_hi) * p_a[k] + t_hi * p_b[k] for k in range(3)]
