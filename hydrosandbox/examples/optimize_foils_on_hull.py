@@ -455,8 +455,17 @@ if __name__ == "__main__":
             )
             labels.append((floor, "foils"))
     t0 = time.time()
+    task_labels = [
+        ("no floor" if floor is None else f"GM_L >= {floor:.1f} m")
+        + (", bare hull" if kind == "bare" else f", foils, start {i}")
+        for i, (floor, kind) in enumerate(labels)
+    ]
     outcomes = hsb.parallel_map(
-        optimize_task, [(task, freedoms) for task in tasks], jobs=args.jobs
+        optimize_task,
+        [(task, freedoms) for task in tasks],
+        jobs=args.jobs,
+        progress=True,
+        labels=task_labels,
     )
     print(f"{len(tasks)} optimizations in {time.time() - t0:.0f} s\n")
 

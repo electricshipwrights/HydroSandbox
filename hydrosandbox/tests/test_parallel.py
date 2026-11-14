@@ -24,3 +24,20 @@ def test_parallel_map_reraises_and_restores_the_thread_settings():
     with pytest.raises(TypeError):
         parallel_map(pow, [(2, 3), ("a", 2)], jobs=2)
     assert os.environ.get("OMP_NUM_THREADS") == before
+
+
+def test_parallel_map_reports_progress(capsys):
+    seen = []
+    results = parallel_map(
+        math.sqrt, [4.0, 9.0, 16.0], jobs=2,
+        progress=lambda n_done, n_total, index, result, seconds: seen.append(
+            (n_done, n_total, index, result)
+        ),
+    )
+    assert results == [2.0, 3.0, 4.0]
+    assert [s[0] for s in seen] == [1, 2, 3] and all(s[1] == 3 for s in seen)
+    assert sorted((s[2], s[3]) for s in seen) == [(0, 2.0), (1, 3.0), (2, 4.0)]
+
+    parallel_map(math.sqrt, [4.0, 9.0], jobs=1, progress=True, labels=["first", "second"])
+    err = capsys.readouterr().err
+    assert "[1/2] done: first" in err and "[2/2] done: second" in err
