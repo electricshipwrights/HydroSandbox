@@ -79,11 +79,12 @@ Source = "https://github.com/peterdsharpe/AeroSandbox"
 "Bug Reports" = "https://github.com/peterdsharpe/AeroSandbox/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aerosandbox"]
+packages = ["aerosandbox", "hydrosandbox"]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "/aerosandbox",
+    "/hydrosandbox",
     "/pyproject.toml",
     "/README.md",
     "/LICENSE.txt",
