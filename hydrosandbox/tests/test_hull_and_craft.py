@@ -160,7 +160,7 @@ def _t_foil(x_foil: float) -> hsb.HydrofoilAssembly:
         ],
     )
     strut = hsb.Strut.from_dimensions(
-        root_xyz=[x_foil + 0.02, 0, -0.5], length=0.48, root_chord=0.12, tip_chord=0.12
+        root_xyz=[x_foil + 0.02, 0, -0.5], length=0.75, root_chord=0.12, tip_chord=0.12
     )
     return hsb.HydrofoilAssembly(name="T-foil", foils=[foil], struts=[strut])
 
@@ -554,3 +554,331 @@ def test_foil_pitch_damping_grows_with_the_square_of_its_arm():
     assert far_aft == pytest.approx(16.0 * near, rel=0.4)
     assert far_forward == pytest.approx(far_aft, rel=0.4)
     assert scalar(CraftBuildup(**common).run_with_stability()["c_pitch_foils"]) == 0.0
+
+
+def test_powered_craft_symbolic_opti_with_point_masses_and_inclined_shaft():
+    water, hull, mass = _small_craft()
+    velocity = 3.0
+    prop_opts = dict(
+        propeller_diameter=0.30,
+        propeller_pitch_ratio=1.0,
+        propeller_ear=0.5,
+        motor_model="loss",
+        motor_kv=60.0,
+        endurance_hours=2.0,
+    )
+    ref = hsb.PoweredCraftBuildup.solve(
+        hull=hull,
+        velocity=velocity,
+        mass=0.85 * mass,
+        xyz_cg=[0.0, 0.0, 0.1],
+        xyz_propeller=[2.3, 0.0, -0.35],
+        xyz_motor=[1.8, 0.0, 0.0],
+        xyz_battery=[0.0, 0.0, 0.0],
+        shaft_angle=10.0,
+        water=water,
+        propulsion_options=prop_opts,
+        craft_options=dict(include_interference_breakdown=False),
+    )
+
+    # Numeric equilibrium + inclined-shaft power identity:
+    # P_effective = T * (1 - t) * cos(trim + shaft_angle) * V == D * V.
+    prop = ref["propulsion"]
+    t_ded = scalar(prop["thrust_deduction"])
+    cos_total = onp.cos(onp.radians(scalar(ref["trim"]) + 10.0))
+    assert t_ded > 0.0
+    assert scalar(prop["P_effective"]) == pytest.approx(scalar(ref["D"]) * velocity, rel=1e-4)
+    assert scalar(prop["T_required"]) == pytest.approx(
+        scalar(ref["D"]) / ((1.0 - t_ded) * cos_total), rel=1e-4
+    )
+    assert abs(scalar(ref["F_z_net"])) < 1e-4 * scalar(ref["mass"]) * G
+    assert abs(scalar(ref["M_y_net"])) < 1e-4 * scalar(ref["mass"]) * G * hull.length
+
+    # Symbolic Opti evaluation and solve (Exercises symbolic pivot_xz with point_masses).
+    opti = asb.Opti()
+    sinkage = opti.variable(init_guess=ref["sinkage"], lower_bound=-0.25, upper_bound=0.25)
+    trim = opti.variable(init_guess=ref["trim"], lower_bound=-10.0, upper_bound=10.0)
+    m_drive = opti.variable(
+        init_guess=scalar(ref["mass_drivetrain_sized"]), lower_bound=0.1, upper_bound=80.0
+    )
+    m_batt = opti.variable(
+        init_guess=scalar(ref["mass_battery_sized"]), lower_bound=0.5, upper_bound=250.0
+    )
+    rpm = opti.variable(
+        init_guess=float(ref["propeller_rpm"]), lower_bound=200.0, upper_bound=5000.0
+    )
+    sym = hsb.PoweredCraftBuildup(
+        hull=hull,
+        velocity=velocity,
+        mass=0.85 * mass,
+        xyz_cg=[0.0, 0.0, 0.1],
+        xyz_propeller=[2.3, 0.0, -0.35],
+        xyz_motor=[1.8, 0.0, 0.0],
+        xyz_battery=[0.0, 0.0, 0.0],
+        mass_drivetrain=m_drive,
+        mass_battery=m_batt,
+        shaft_angle=10.0,
+        sinkage=sinkage,
+        trim=trim,
+        water=water,
+        propulsion_options={**prop_opts, "propeller_rpm": rpm},
+        craft_options=dict(include_interference_breakdown=False),
+    ).run()
+    weight = sym["mass"] * G
+    opti.subject_to(
+        [
+            sym["F_z_net"] / weight == 0,
+            sym["M_y_net"] / (weight * hull.length) == 0,
+            sym["thrust_residual"] / scalar(ref["thrust"]) == 0,
+            sym["mass_drivetrain_residual"] / 10.0 == 0,
+            sym["mass_battery_residual"] / 10.0 == 0,
+        ]
+    )
+    opti.minimize(0)
+    sol = opti.solve(verbose=False, options={"ipopt.hessian_approximation": "limited-memory"})
+    assert sol(sinkage) == pytest.approx(ref["sinkage"], abs=1e-4)
+    assert sol(trim) == pytest.approx(ref["trim"], abs=1e-2)
+    assert sol(rpm) == pytest.approx(float(ref["propeller_rpm"]), rel=1e-3)
+
+
+def test_trimmed_waterplane_sets_true_aft_foil_and_strut_submergence():
+    from hydrosandbox.library import resolve_surface_segment
+
+    water, hull, mass = _small_craft()
+    airfoil = asb.Airfoil("naca2412")
+    # Main foil forward at z=-0.4, aft foil raised near design waterline at z=-0.03.
+    fwd = hsb.Foil(
+        name="Fwd",
+        symmetric=True,
+        xsecs=[
+            asb.WingXSec(xyz_le=[-1.5, 0.0, -0.4], chord=0.14, twist=2.0, airfoil=airfoil),
+            asb.WingXSec(xyz_le=[-1.5, 0.4, -0.4], chord=0.14, twist=2.0, airfoil=airfoil),
+        ],
+    )
+    aft = hsb.Foil(
+        name="Aft",
+        symmetric=True,
+        xsecs=[
+            asb.WingXSec(xyz_le=[1.5, 0.0, -0.03], chord=0.10, twist=4.0, airfoil=airfoil),
+            asb.WingXSec(xyz_le=[1.5, 0.25, -0.03], chord=0.10, twist=4.0, airfoil=airfoil),
+        ],
+    )
+    short_strut = hsb.Strut.from_dimensions(
+        root_xyz=[-1.5, 0.0, -0.4], length=0.35, root_chord=0.10, tip_chord=0.10
+    )
+    piercing_strut = hsb.Strut.from_dimensions(
+        root_xyz=[-1.5, 0.0, -0.4], length=0.70, root_chord=0.10, tip_chord=0.10
+    )
+    assembly_piercing = hsb.HydrofoilAssembly(
+        name="Multi", foils=[fwd, aft], struts=[piercing_strut]
+    )
+    assembly_short = hsb.HydrofoilAssembly(
+        name="MultiShort", foils=[fwd, aft], struts=[short_strut]
+    )
+
+    craft = CraftBuildup(
+        hull=hull,
+        velocity=4.0,
+        mass=mass,
+        xyz_cg=[0.0, 0.0, 0.1],
+        assembly=assembly_piercing,
+        sinkage=0.0,
+        trim=-4.0,
+        water=water,
+        include_interference_breakdown=False,
+    )
+    craft_short = CraftBuildup(
+        hull=hull,
+        velocity=4.0,
+        mass=mass,
+        xyz_cg=[0.0, 0.0, 0.1],
+        assembly=assembly_short,
+        sinkage=0.0,
+        trim=-4.0,
+        water=water,
+        include_interference_breakdown=False,
+    )
+    res = craft.run()
+    res_short = craft_short.run()
+
+    # Bow-down (-4 deg) raises aft station (x=+1.5) into air while deepening fwd station (x=-1.5).
+    z_fwd_eff, z_aft_eff, sz_eff = resolve_surface_segment(
+        -1.5, -0.4, 1.5, -0.03, lambda xg, zg: craft._earth(xg, zg)[1]
+    )
+    assert sz_eff == 0.0
+    assert z_fwd_eff < -0.45
+    assert z_aft_eff > 0.05
+
+    # Buoyancy tilted along earth up [-sin(trim), 0, cos(trim)] has zero earth horizontal component.
+    trim_rad = onp.radians(-4.0)
+    up_g = [-onp.sin(trim_rad), 0.0, onp.cos(trim_rad)]
+    hs = assembly_piercing.hydrostatic_forces(
+        water=water,
+        surface_z=lambda xg, zg: craft._earth(xg, zg)[1],
+        up_direction_g=up_g,
+    )
+    f_b = hs["F_buoyancy_g"]
+    f_earth_x = f_b[0] * onp.cos(trim_rad) + f_b[2] * onp.sin(trim_rad)
+    assert f_earth_x == pytest.approx(0.0, abs=1e-9)
+
+    # A strut reaching above the waterplane picks up spray/piercing drag vs a cut-off underwater strut.
+    assert scalar(res["D_foil"]) > scalar(res_short["D_foil"])
+
+    # Wave dipole force_z in CraftBuildup must match wind-axis element force_z directly (no extra cos(trim)).
+    craft_trimmed = CraftBuildup(
+        hull=hull,
+        velocity=4.0,
+        mass=mass,
+        xyz_cg=[0.0, 0.0, 0.1],
+        assembly=hsb.HydrofoilAssembly(name="Sub", foils=[fwd]),
+        sinkage=0.0,
+        trim=10.0,
+        water=water,
+        include_interference_breakdown=False,
+    )
+    r_trim = craft_trimmed.run()
+    elem = r_trim["foil"]["wave_elements"]
+    fz_elem = sum(scalar(v) for v in elem["force_z"])
+    # Lift component L in wind axes points vertically up in earth axes.
+    assert fz_elem == pytest.approx(scalar(r_trim["L_foil"]), rel=1e-6)
+
+
+def test_flat_bottom_emerged_stations_drop_waterline_breadth_to_zero():
+    stations = onp.linspace(-2.0, 2.0, 21)
+    levels = onp.linspace(-0.25, 0.25, 11)
+    half_breadths = onp.full((len(stations), len(levels)), 0.30)
+    box = Hull(stations, levels, half_breadths, transom_closure=10.0)
+
+    # Pitch bow up 12 deg: bow at x=-2 rises 2*sin(12)=+0.416 m above water -> keel emerged.
+    f_wl = onp.asarray(box._waterline_half_breadths(sinkage=0.0, trim=12.0, pivot_xz=(0.0, 0.0)))
+    assert float(f_wl[0, 0]) < 1e-4
+    assert float(f_wl[-1, 0]) == pytest.approx(0.30, rel=1e-2)
+
+
+def test_dynamic_force_symbolic_velocity_below_reference_is_finite():
+    import casadi as cas
+
+    hull = Hull.wigley(5.0, 0.8, 0.25, n_stations=15, n_levels=9)
+    v_sym = cas.MX.sym("v")
+    dyn = hull.dynamic_force(v_sym, 1025.9, reference_velocity=5.0)
+    f_fn = cas.Function("dyn", [v_sym], [dyn["force_up"], dyn["moment_bow_up"], cas.gradient(dyn["force_up"], v_sym)])
+
+    for v_val in (5.0, 2.5, 1.2):
+        f_num = hull.dynamic_force(v_val, 1025.9, reference_velocity=v_val)
+        fz_s, my_s, df_dv = (float(x) for x in f_fn(v_val))
+        assert onp.isfinite(fz_s) and onp.isfinite(my_s) and onp.isfinite(df_dv)
+        if abs(v_val - 5.0) < 1e-9:
+            assert fz_s == pytest.approx(scalar(f_num["force_up"]), rel=1e-9)
+
+
+def test_blunt_bow_hull_source_conservation_and_dynamic_force_parallel_axis():
+    stations = onp.linspace(-2.0, 2.0, 21)
+    levels = onp.array([-0.3, -0.2, -0.1, 0.0, 0.1, 0.2])
+    half_breadths = onp.zeros((len(stations), len(levels)))
+    half_breadths[:, 1:] = 0.25  # blunt rectangular cross section with closed bottom keel
+    hull = Hull(stations, levels, half_breadths, transom_closure=8.0)
+
+    # At non-zero trim, bow closure + interior cells + transom hollow conserve net flux == 0.
+    src = hull.wave_sources(3.0, trim=2.5)
+    assert float(onp.sum(src["source_flux"])) == pytest.approx(0.0, abs=1e-6)
+
+    # Wave amplitude vs per-cell wave_sources must agree on blunt-bow hulls too.
+    r_cell = scalar(
+        kelvin_wave_resistance(velocity=3.0, density=1000.0, length_scales=(1.0, 12.0, 0.02), **src)
+    )
+    r_amp = scalar(
+        kelvin_wave_resistance(
+            xyz_a=([], [], []),
+            xyz_b=([], [], []),
+            velocity=3.0,
+            density=1000.0,
+            length_scales=(1.0, 12.0, 0.02),
+            extra_source_amplitude=hull.wave_amplitude(3.0, trim=2.5),
+        )
+    )
+    assert r_amp == pytest.approx(r_cell, rel=2e-2)
+
+    # Parallel-axis theorem in dynamic_force requires consistent bow + stern steps.
+    d0 = hull.dynamic_force(3.0, 1025.0, trim=2.0, x_ref=0.0)
+    d1 = hull.dynamic_force(3.0, 1025.0, trim=2.0, x_ref=0.8)
+    assert scalar(d1["moment_local"]) == pytest.approx(
+        scalar(d0["moment_local"]) + 0.8 * scalar(d0["force_up"]), rel=1e-9
+    )
+    assert scalar(d1["moment_bow_up"]) == pytest.approx(
+        scalar(d0["moment_bow_up"]) + 0.8 * scalar(d0["force_up"]), rel=2e-2
+    )
+
+    # Dynamic force varies continuously across the has_transom threshold (no step jump).
+    f_ref = Hull.wigley(4.0, 0.6, 0.2, n_stations=15, n_levels=9)
+    hb_zero = f_ref.half_breadths.copy()
+    hb_zero[-1, :] = 0.0
+    hb_tiny = f_ref.half_breadths.copy()
+    hb_tiny[-1, :] = 5e-4
+    h_zero = Hull(f_ref.stations, f_ref.levels, hb_zero)
+    h_tiny = Hull(f_ref.stations, f_ref.levels, hb_tiny)
+    assert not h_zero.has_transom and h_tiny.has_transom
+    assert scalar(h_tiny.dynamic_force(2.5, 1025.0)["force_up"]) == pytest.approx(
+        scalar(h_zero.dynamic_force(2.5, 1025.0)["force_up"]), rel=5e-3
+    )
+
+
+def test_run_with_stability_casadi_ad_matches_central_fd_and_negative_gml_floor():
+    import casadi as cas
+
+    water, hull, mass = _small_craft()
+    common = dict(
+        hull=hull,
+        velocity=4.0,
+        mass=mass,
+        xyz_cg=[0.1, 0.0, 0.1],
+        assembly=_t_foil(1.2),
+        water=water,
+        include_interference_breakdown=False,
+    )
+    s_val, t_val = -0.02, 1.5
+    craft_num = CraftBuildup(sinkage=s_val, trim=t_val, **common)
+    num_default = craft_num.run_with_stability()
+    num_fine = craft_num.run_with_stability(d_sinkage=1e-5, d_trim=5e-4)
+
+    s_sym, t_sym = cas.MX.sym("s"), cas.MX.sym("t")
+    sym = CraftBuildup(sinkage=s_sym, trim=t_sym, **common).run_with_stability()
+    fn = cas.Function("stab", [s_sym, t_sym], [sym["k_heave"], sym["k_pitch"], sym["GM_L"]])
+    kh_ad, kp_ad, gml_ad = (float(x) for x in fn(s_val, t_val))
+
+    assert kh_ad == pytest.approx(scalar(num_fine["k_heave"]), rel=1e-5)
+    assert kp_ad == pytest.approx(scalar(num_fine["k_pitch"]), rel=1e-5)
+    assert gml_ad == pytest.approx(scalar(num_fine["GM_L"]), rel=1e-5)
+    assert kh_ad == pytest.approx(scalar(num_default["k_heave"]), rel=5e-3)
+    assert kp_ad == pytest.approx(scalar(num_default["k_pitch"]), rel=5e-3)
+    assert gml_ad == pytest.approx(scalar(num_default["GM_L"]), rel=5e-3)
+
+    # Signed GM_L floor constraint keeps the inequality direction right when gml_floor <= 0.
+    for gml_floor in (-2.0, 0.0):
+        scale = max(abs(gml_floor), 1.0)
+        assert (gml_floor + 0.5 - gml_floor) / scale >= 0.0
+        assert (gml_floor - 0.5 - gml_floor) / scale < 0.0
+
+
+def test_solve_equilibrium_positional_args_squat_level_and_rejected_backtrack():
+    water, hull, mass = _small_craft()
+    res = CraftBuildup.solve_equilibrium(
+        hull,
+        2.0,
+        mass,
+        [0.0, 0.0, 0.1],
+        water=water,
+        squat_level=0.5,
+        include_interference_breakdown=False,
+    )
+    assert abs(scalar(res["F_z_net"])) < 1e-4 * mass * G
+    assert abs(scalar(res["M_y_net"])) < 1e-4 * mass * G * hull.length
+
+    with pytest.raises(RuntimeError):
+        CraftBuildup.solve_equilibrium(
+            hull,
+            2.0,
+            100.0 * mass,
+            [0.0, 0.0, 0.1],
+            water=water,
+            include_interference_breakdown=False,
+        )

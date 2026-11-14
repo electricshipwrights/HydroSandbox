@@ -5,7 +5,10 @@ from aerosandbox.geometry.fuselage import Fuselage
 from aerosandbox.geometry.wing import Wing, WingXSec
 import aerosandbox.numpy as np
 from aerosandbox.numpy.typing import Vectorizable
-from hydrosandbox.library.free_surface import smooth_submergence_fraction
+from hydrosandbox.library.free_surface import (
+    resolve_surface_segment,
+    smooth_submergence_fraction,
+)
 
 
 def wing_submerged_area(
@@ -25,9 +28,10 @@ def wing_submerged_area(
 
     total = 0.0
     for i, sect_area in enumerate(sectional_areas):
-        z_a = wing.xsecs[i].xyz_le[2]
-        z_b = wing.xsecs[i + 1].xyz_le[2]
-        f_sub, _, _ = smooth_submergence_fraction(z_a, z_b, surface_z)
+        le_a = wing.xsecs[i].xyz_le
+        le_b = wing.xsecs[i + 1].xyz_le
+        za, zb, sz = resolve_surface_segment(le_a[0], le_a[2], le_b[0], le_b[2], surface_z)
+        f_sub, _, _ = smooth_submergence_fraction(za, zb, sz)
         total = total + sect_area * f_sub
 
     return 2.0 * total if wing.symmetric else total
@@ -60,11 +64,12 @@ def wing_submerged_volume_and_centroid(
             f_sub = 1.0
             s_sub = 0.5
         else:
-            f_sub, s_sub, _ = smooth_submergence_fraction(
-                wing.xsecs[i].xyz_le[2],
-                wing.xsecs[i + 1].xyz_le[2],
-                surface_z,
+            le_a = wing.xsecs[i].xyz_le
+            le_b = wing.xsecs[i + 1].xyz_le
+            za, zb, sz = resolve_surface_segment(
+                le_a[0], le_a[2], le_b[0], le_b[2], surface_z
             )
+            f_sub, s_sub, _ = smooth_submergence_fraction(za, zb, sz)
 
         v_sub = v_sect * f_sub
         c_sub = [(1.0 - s_sub) * c_a[k] + s_sub * c_b[k] for k in range(3)]
@@ -106,11 +111,10 @@ def fuselage_submerged_volume_and_centroid(
             f_sub = 1.0
             s_sub = 0.5
         else:
-            f_sub, s_sub, _ = smooth_submergence_fraction(
-                c_a[2],
-                c_b[2],
-                surface_z,
+            za, zb, sz = resolve_surface_segment(
+                c_a[0], c_a[2], c_b[0], c_b[2], surface_z
             )
+            f_sub, s_sub, _ = smooth_submergence_fraction(za, zb, sz)
         v_sub = v_sect * f_sub
         c_sub = [(1.0 - s_sub) * c_a[k] + s_sub * c_b[k] for k in range(3)]
         v_total = v_total + v_sub
