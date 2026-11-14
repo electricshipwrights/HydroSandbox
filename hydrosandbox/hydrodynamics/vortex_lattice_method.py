@@ -13,6 +13,7 @@ from hydrosandbox.hydrodynamics.singularities import (
 from hydrosandbox.library.cavitation import (
     cavitation_inception_speed,
     cavitation_number,
+    estimate_Cpmin_inviscid,
 )
 from hydrosandbox.library.free_surface import froude_image_weight
 
@@ -150,14 +151,6 @@ class HydroVLM(ExplicitAnalysis):
         front_right_vertices = []
         is_trailing_edge = []
         panel_t_over_c = []
-        tc_cache: dict[int, float] = {}
-
-        def _get_tc(af) -> float:
-            key = id(af)
-            if key not in tc_cache:
-                tc_cache[key] = float(af.max_thickness())
-            return tc_cache[key]
-
         for wing in active_assembly.wings:
             if len(wing.xsecs) < 2:
                 continue
@@ -184,12 +177,10 @@ class HydroVLM(ExplicitAnalysis):
                 (np.arange(len(faces)) + 1) % self.chordwise_resolution == 0
             )
 
-            sec_tc = np.array(
-                [
-                    0.5 * (_get_tc(xa.airfoil) + _get_tc(xb.airfoil))
-                    for xa, xb in zip(wing.xsecs[:-1], wing.xsecs[1:])
-                ]
+            xsec_tcs = np.array(
+                [float(xsec.airfoil.max_thickness()) for xsec in wing.xsecs]
             )
+            sec_tc = 0.5 * (xsec_tcs[:-1] + xsec_tcs[1:])
             tc_half = np.repeat(sec_tc, self.chordwise_resolution)
             if wing.symmetric:
                 panel_t_over_c.append(np.concatenate([tc_half, tc_half]))
@@ -401,11 +392,23 @@ class HydroVLM(ExplicitAnalysis):
         panel_Delta_Cp = np.sum(forces_geometry * normal_directions, axis=1) / (
             q * areas
         )
-        panel_Cpmin = (
-            1.0
-            - (1.0 + 1.20 * panel_t_over_c + 0.8 * panel_t_over_c**2) ** 2
-            - 0.50 * np.abs(panel_Delta_Cp)
+        # Suction-peak estimate from the chordwise-integrated section lift coefficient
+        # of each spanwise strip. (Using the raw leading-edge panel loading instead
+        # would be mesh-dependent: thin-surface Delta_Cp is singular at the leading
+        # edge, so it grows without bound as the chordwise mesh is refined.)
+        n_c = self.chordwise_resolution
+        strip_normal_force = np.sum(
+            np.reshape(np.sum(forces_geometry * normal_directions, axis=1), (-1, n_c)),
+            axis=1,
         )
+        strip_area = np.sum(np.reshape(areas, (-1, n_c)), axis=1)
+        strip_Cl = strip_normal_force / (q * strip_area)
+        panel_Cl_section = np.repeat(strip_Cl, n_c)
+        panel_Cpmin = estimate_Cpmin_inviscid(
+            Cl_local=panel_Cl_section,
+            thickness_to_chord=panel_t_over_c,
+        )
+        self.strip_Cl = strip_Cl
         self.panel_Delta_Cp = panel_Delta_Cp
         self.panel_Cpmin = panel_Cpmin
 
