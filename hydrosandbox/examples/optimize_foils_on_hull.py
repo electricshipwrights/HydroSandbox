@@ -50,6 +50,62 @@ def scalar(value) -> float:
     return float(onp.ravel(value)[0])
 
 
+_SECTION_BASE = {}
+
+# Second moment of area of a solid foil section about its chord line, as a fraction
+# of chord * thickness^3 (from the NACA 4-digit thickness form).
+SECTION_INERTIA_FACTOR = 0.0395
+
+
+def foil_section(thickness: float, camber: float) -> asb.KulfanAirfoil:
+    """
+    A foil section of given maximum thickness and maximum camber (both as fractions
+    of chord): the NACA 2412's thickness form and camber line, each scaled. Either
+    may be an optimization variable.
+    """
+    if not _SECTION_BASE:
+        base = asb.KulfanAirfoil("naca2412")
+        x = onp.linspace(0.0, 1.0, 401)
+        _SECTION_BASE.update(
+            thickness_weights=0.5 * (base.upper_weights - base.lower_weights),
+            camber_weights=0.5 * (base.upper_weights + base.lower_weights),
+            leading_edge_weight=base.leading_edge_weight,
+            TE_thickness=base.TE_thickness,
+            thickness=float(onp.max(base.local_thickness(x))),
+            camber=float(onp.max(base.local_camber(x))),
+        )
+    b = _SECTION_BASE
+    kt, kc = thickness / b["thickness"], camber / b["camber"]
+    return asb.KulfanAirfoil(
+        name="section",
+        upper_weights=kc * b["camber_weights"] + kt * b["thickness_weights"],
+        lower_weights=kc * b["camber_weights"] - kt * b["thickness_weights"],
+        leading_edge_weight=kc * b["leading_edge_weight"],
+        TE_thickness=kt * b["TE_thickness"],
+    )
+
+
+def root_bending_stress(
+    design: dict, layout: str, demihull_spacing: float | None, pressure: float
+):
+    """
+    Bending stress [Pa] at the main foil's most loaded section, were it solid and
+    loaded everywhere at ``pressure`` [Pa] (dynamic pressure times a limit lift
+    coefficient), the load spread in proportion to chord.
+
+    A foil on one strut is a cantilever each side of it. The hull-to-hull foil of
+    ``layout="pi"`` is taken as simply supported on its two struts (they are too
+    slender to clamp it), so its worst section is at midspan.
+    """
+    root_chord, taper = design["root_chord_main"], design["taper_main"]
+    half_span = 0.5 * demihull_spacing if layout == "pi" else design["half_span_main"]
+    half_load = pressure * half_span * 0.5 * (1.0 + taper) * root_chord
+    centroid = half_span * (1.0 + 2.0 * taper) / (3.0 * (1.0 + taper))  # from the root
+    moment = half_load * (half_span - centroid if layout == "pi" else centroid)
+    thickness = design.get("thickness_main", 0.12) * root_chord
+    return moment / (2.0 * SECTION_INERTIA_FACTOR * root_chord * thickness**2)
+
+
 def build_assembly(
     design: dict,
     stabilizer: bool,
@@ -72,7 +128,12 @@ def build_assembly(
 
     In both, each strut runs from the foil up to that hull's keel.
     """
-    main_airfoil = asb.Airfoil("naca2412")
+    if "thickness_main" in design or "camber_main" in design:
+        main_airfoil = foil_section(
+            design.get("thickness_main", 0.12), design.get("camber_main", 0.02)
+        )
+    else:
+        main_airfoil = asb.Airfoil("naca2412")
     strut_airfoil = asb.Airfoil("naca0012")
 
     if layout in ("pi", "twin"):
@@ -271,6 +332,9 @@ def optimize(
     drag_cap: float | None = None,
     damping_floor: float | None = None,
     use_hull_tables: bool = True,
+    optimize_section: bool = False,
+    allowable_stress: float | None = None,
+    structural_lift_coefficient: float = 1.0,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -291,6 +355,12 @@ def optimize(
     ``damping_floor`` [N m s/rad] constrain the others. Pass ``use_hull_tables=False``
     to disable automatic attitude tabulation of the hull's dynamic force and wave
     amplitude.
+
+    ``optimize_section=True`` adds the main foil's section thickness and camber
+    (``thickness_main``, ``camber_main``, fractions of chord; see ``foil_section``)
+    to the design variables. ``allowable_stress`` [Pa] then limits the bending stress
+    of the main foil, as a solid section loaded at ``structural_lift_coefficient``
+    (see ``root_bending_stress``); without it, nothing rewards thickness.
     """
     with_foils = start is not None
     x_stern = float(hull.stations[-1])
@@ -362,6 +432,15 @@ def optimize(
             }.items()
             if name in design_bounds(hull, stabilizer, layout)
         }
+        if optimize_section:
+            for name, default, limits in (
+                ("thickness_main", 0.12, (0.06, 0.18)),
+                ("camber_main", 0.02, (0.0, 0.06)),
+            ):
+                lo, hi = (bounds or {}).get(name, limits)
+                design[name] = opti.variable(
+                    init_guess=start.get(name, default), lower_bound=lo, upper_bound=hi
+                )
     loading = {"x_cg": xyz_cg[0], "mass": mass, "thrust_height": None}
     if cg_range is not None:
         loading["x_cg"] = opti.variable(
@@ -439,6 +518,17 @@ def optimize(
                 constraints += [lift_coefficient <= 0.7, lift_coefficient >= -0.5]
         if stabilizer:
             constraints.append(design["x_stab"] >= design["x_main"] + 0.5)
+        if allowable_stress is not None:
+            constraints.append(
+                root_bending_stress(
+                    design,
+                    layout,
+                    common.get("demihull_spacing"),
+                    structural_lift_coefficient * q,
+                )
+                / allowable_stress
+                <= 1.0
+            )
     if gml_floor is not None:
         # (scaled so a zero or negative floor is also well-posed)
         gml_scale = max(abs(float(gml_floor)), 1.0)
@@ -488,6 +578,15 @@ def optimize(
         for key, value in final.items()
         if key not in ("foil", "transom", "xyz_cg") and value is not None
     }
+    if with_foils:
+        final["root_bending_stress"] = float(
+            root_bending_stress(
+                solved,
+                layout,
+                common.get("demihull_spacing"),
+                structural_lift_coefficient * 0.5 * water.density() * velocity**2,
+            )
+        )
     return {"design": solved, "loading": solved_loading, "results": final}
 
 

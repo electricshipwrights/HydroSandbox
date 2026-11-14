@@ -1330,3 +1330,55 @@ def test_run_with_stability_hull_reuse_and_optional_pitch_damping():
     gml_a, gml_b, c_pitch = (float(x) for x in fn(-0.01, 1.2))
     assert gml_a == pytest.approx(gml_b, rel=1e-12)
     assert c_pitch == pytest.approx(scalar(with_damp["c_pitch_foils"]), rel=1e-9)
+
+
+def test_foil_section_variables_and_bending_stress():
+    """The example's section family and its bending-stress estimate."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(hsb.__file__).parent / "examples"))
+    import casadi as cas
+    from optimize_foils_on_hull import build_assembly, foil_section, root_bending_stress
+
+    x = onp.linspace(0.0, 1.0, 401)
+    # The family passes through the NACA 2412 and scales as asked.
+    reference = asb.KulfanAirfoil("naca2412")
+    same = foil_section(0.12, float(onp.max(reference.local_camber(x))))
+    assert onp.allclose(same.upper_weights, reference.upper_weights, atol=2e-3)
+    assert onp.allclose(same.lower_weights, reference.lower_weights, atol=2e-3)
+    for thickness, camber in ((0.08, 0.0), (0.15, 0.04)):
+        section = foil_section(thickness, camber)
+        assert onp.max(section.local_thickness(x)) == pytest.approx(thickness, rel=1e-3)
+        assert onp.max(section.local_camber(x)) == pytest.approx(camber, abs=1e-4)
+    # More camber lifts more at a given angle; it stays usable symbolically.
+    lift = [
+        float(foil_section(0.12, c).get_aero_from_neuralfoil(alpha=1.0, Re=1e6)["CL"][0])
+        for c in (0.0, 0.02, 0.04)
+    ]
+    assert lift[0] < lift[1] < lift[2]
+    opti = asb.Opti()
+    symbolic = foil_section(opti.variable(0.12), opti.variable(0.02))
+    assert isinstance(symbolic.get_aero_from_neuralfoil(alpha=1.0, Re=1e6)["CD"], cas.MX)
+
+    # Rectangular cantilever, by hand: M = p c s^2 / 2, Z = 2 k c t^2.
+    design = dict(root_chord_main=0.2, taper_main=1.0, half_span_main=0.8, thickness_main=0.10)
+    pressure = 18000.0
+    by_hand = (pressure * 0.2 * 0.8**2 / 2) / (2 * 0.0395 * 0.2 * 0.02**2)
+    assert root_bending_stress(design, "centreline", None, pressure) == pytest.approx(by_hand)
+    # The same half-span simply supported at its tips carries the same midspan moment.
+    assert root_bending_stress(design, "pi", 1.6, pressure) == pytest.approx(by_hand)
+    # Thicker section, lower stress, as the square.
+    thicker = dict(design, thickness_main=0.20)
+    assert root_bending_stress(thicker, "centreline", None, pressure) == pytest.approx(by_hand / 4)
+    # The section inertia factor is that of the thickness form.
+    t = foil_section(0.12, 0.0).local_thickness(x)
+    assert onp.trapezoid(t**3 / 12, x) / 0.12**3 == pytest.approx(0.0395, rel=0.01)
+
+    # The assembly takes the section from the design when it is there.
+    design = dict(
+        x_main=3.0, depth_main=0.4, half_span_main=0.5, root_chord_main=0.15, taper_main=0.7,
+        incidence_main=1.0, thickness_main=0.09, camber_main=0.03,
+    )
+    foil = build_assembly(design, False).foils[0]
+    assert float(foil.xsecs[0].airfoil.max_thickness()) == pytest.approx(0.09, rel=0.01)
