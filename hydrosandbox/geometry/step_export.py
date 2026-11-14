@@ -573,6 +573,9 @@ def _add_wing_solid(
 
     for i, xsec in enumerate(wing.xsecs):
         af = xsec.airfoil
+        if hasattr(af, "to_airfoil"):
+            # A KulfanAirfoil: sample it as coordinates.
+            af = af.to_airfoil()
         if af.TE_thickness() < minimum_airfoil_TE_thickness:
             af = af.set_TE_thickness(thickness=minimum_airfoil_TE_thickness)
 

@@ -124,6 +124,12 @@ EPROPULSION_POD_3 = dict(
     body_diameter=0.101,
     leg_chord=0.117,
     leg_section="naca0030",
+    # Least depth of water over the blade tips [m], against drawing air (the
+    # hull's stern wave trough is some 0.07 m of it); and the least fore-aft gap
+    # between a propeller and a foil strut in line with it, in diameters. Both
+    # are judgement, standing in for ventilation, which is not modelled.
+    min_tip_immersion=0.20,
+    min_strut_gap=1.0,
 )
 
 
@@ -159,6 +165,72 @@ def pod_components(pods: dict, x, depth, hull: Hull, demihull_spacing: float | N
     return bodies, leg
 
 
+def propeller_components(pods: dict, x_disc: float, depth: float, demihull_spacing: float | None):
+    """
+    The propellers as geometry, for drawing only (not for analysis): each blade a
+    twisted surface of constant pitch from hub to tip, with a hub fairing. Numeric
+    inputs. Twin propellers are drawn counter-rotating, blades vertical.
+
+    The blade outline and sections are generic (the maker's are not published):
+    the area is the pods' blade-area ratio, the pitch their propeller's.
+    """
+    radius = 0.5 * pods["propeller_diameter"]
+    hub = 0.2 * radius
+    blades = pods["blades"]
+    fractions = onp.array([0.2, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0])
+    outline = onp.array([0.62, 0.80, 0.96, 1.00, 0.92, 0.70, 0.30])
+    mean_chord = pods["blade_area_ratio"] * onp.pi * radius**2 / (blades * (radius - hub))
+    span_fraction = (fractions - fractions[0]) / (fractions[-1] - fractions[0])
+    chords = outline * mean_chord / onp.trapezoid(outline, span_fraction)
+    sides = [(0.0, 1.0)] if demihull_spacing is None else [(0.5 * demihull_spacing, 1.0), (-0.5 * demihull_spacing, -1.0)]
+    wings, hubs = [], []
+    for y_disc, hand in sides:
+        for k in range(blades):
+            angle = 2.0 * onp.pi * k / blades
+            radial = onp.array([0.0, onp.sin(angle), onp.cos(angle)])
+            tangent = hand * onp.cross([1.0, 0.0, 0.0], radial)
+
+            pitch_angles = onp.arctan2(pods["propeller_pitch"], 2.0 * onp.pi * fractions * radius)
+            # Each section's chord runs downstream and back against the rotation.
+            # The leading edge is a straight radial line (ahead of the blade's axis
+            # by half the widest section), each section centred fore and aft.
+            lead = 0.5 * onp.max(chords * onp.cos(pitch_angles))
+
+            def blade(twist_sign):
+                xsecs = []
+                for f, chord, pitch_angle, s_f in zip(fractions, chords, pitch_angles, span_fraction):
+                    at = (
+                        onp.array([x_disc, y_disc, -depth]) + f * radius * radial + lead * tangent
+                        - 0.5 * chord * onp.sin(pitch_angle) * onp.array([1.0, 0.0, 0.0])
+                    )
+                    xsecs.append(
+                        asb.WingXSec(
+                            xyz_le=list(at), chord=chord,
+                            twist=twist_sign * (90.0 - onp.degrees(pitch_angle)),
+                            airfoil=asb.Airfoil(f"naca24{int(round(10 - 6 * s_f)):02d}"),
+                        )
+                    )
+                return hsb.Strut(name="Propeller blade", symmetric=False, xsecs=xsecs)
+
+            def alignment(wing):
+                """How well the mid-blade chord points where it should."""
+                chord_direction = onp.array([float(v) for v in wing._compute_frame_of_WingXSec(3)[0]])
+                wanted = onp.sin(pitch_angles[3]) * onp.array([1.0, 0.0, 0.0]) - onp.cos(pitch_angles[3]) * tangent
+                return float(onp.dot(chord_direction, wanted))
+
+            wings.append(max((blade(1.0), blade(-1.0)), key=alignment))
+        hubs.append(
+            hsb.HydroFuselage(
+                name="Propeller hub",
+                xsecs=[
+                    asb.FuselageXSec(xyz_c=[x_disc + dx, y_disc, -depth], radius=r * hub)
+                    for dx, r in ((-0.03, 1.0), (0.02, 1.0), (0.05, 0.7), (0.07, 0.15))
+                ],
+            )
+        )
+    return wings, hubs
+
+
 def build_assembly(
     design: dict,
     stabilizer: bool,
@@ -167,23 +239,49 @@ def build_assembly(
     hull: Hull | None = None,
     demihull_spacing: float | None = None,
     pods: dict | None = None,
+    span_panels: int = 4,
+    draw_propellers: bool = False,
 ) -> hsb.HydrofoilAssembly:
     """
     The foils, from design variables (none, if the design has no ``x_main``), and
     the drive pods if ``pods`` describes them (see ``pod_components``; the design
-    then holds ``x_pod`` and ``depth_pod``).
+    then holds ``x_pod`` and ``depth_pod``). With pods, each panel of the lifting
+    foils is cut into ``span_panels`` spanwise. ``draw_propellers`` adds the
+    propellers' blades and hubs to a numeric design, for export only.
     """
     foils, struts = (
         _foil_components(design, stabilizer, strut_freeboard, layout, hull, demihull_spacing)
         if "x_main" in design
         else ([], [])
     )
+    if pods is not None and span_panels > 1:
+        # Finer spanwise sections on the lifting foils, so that the local flow of
+        # a propeller reaches the part of the span that is near it.
+        def between(a, b, t):
+            return asb.WingXSec(
+                xyz_le=[(1.0 - t) * a.xyz_le[k] + t * b.xyz_le[k] for k in range(3)],
+                chord=(1.0 - t) * a.chord + t * b.chord,
+                twist=(1.0 - t) * a.twist + t * b.twist,
+                airfoil=a.airfoil,
+            )
+
+        for foil in foils:
+            xsecs = [foil.xsecs[0]]
+            for a, b in zip(foil.xsecs[:-1], foil.xsecs[1:]):
+                xsecs += [between(a, b, k / span_panels) for k in range(1, span_panels)] + [b]
+            foil.xsecs = xsecs
     bodies = []
     if pods is not None:
         bodies, leg = pod_components(
             pods, design["x_pod"], design["depth_pod"], hull, demihull_spacing
         )
         struts = struts + [leg]
+        if draw_propellers:
+            # (for drawing a solved design; not for analysis)
+            blades, hubs = propeller_components(
+                pods, design["x_pod"] + pods["body_length"], design["depth_pod"], demihull_spacing
+            )
+            struts, bodies = struts + blades, bodies + hubs
     return hsb.HydrofoilAssembly(
         name="Lift-assist foils", foils=foils, struts=struts, fuselages=bodies
     )
@@ -420,6 +518,7 @@ def optimize(
     structural_lift_coefficient: float = 1.0,
     pods: dict | None = None,
     pod_start: tuple[float, float] | None = None,
+    propeller_interaction: bool = True,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -454,6 +553,14 @@ def optimize(
     and sits at the pods; the thrust acts there; their bodies and legs add drag and
     waves; and the propellers (Wageningen B-series, open water: no wake or thrust
     deduction) must give the thrust within the motors' power and speed.
+
+    With ``propeller_interaction`` the propellers and foils also act on each other
+    (``hydrosandbox.propulsion.interaction``): each propeller's inflow, jet and swirl
+    reach the foils and struts as a change in their local flow (twin propellers
+    counter-rotating), and the foils' viscous wakes and the flow their lift induces
+    reach the propellers as a wake fraction and an inflow angle. The blade tips are
+    kept ``min_tip_immersion`` under the still surface, and a propeller in line
+    with a foil strut ``min_strut_gap`` diameters clear of it fore and aft.
     """
     with_foils = start is not None
     with_assembly = with_foils or pods is not None
@@ -571,12 +678,21 @@ def optimize(
         x_bow, radius = float(hull.stations[0]), 0.5 * pods["propeller_diameter"]
         pod_bounds = {
             "x_pod": (x_bow + 0.30 * hull.length, x_stern - pods["body_length"]),
-            "depth_pod": (radius + 0.10, 0.60),
+            "depth_pod": (radius + pods.get("min_tip_immersion", 0.10), 0.60),
         }
         for name, limits in pod_bounds.items():
             lo, hi = (bounds or {}).get(name, limits)
             design[name] = opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
         rpm = pods["max_rpm"] * opti.variable(init_guess=0.92, lower_bound=0.2, upper_bound=1.0)
+    interacting = pods is not None and propeller_interaction
+    wake_fraction = inflow_angle = 0.0
+    if interacting:
+        # What the foils do to the propellers' inflow, as variables tied below to
+        # what the solved flow implies (the two depend on each other).
+        wake_fraction = 0.1 * opti.variable(init_guess=0.0, lower_bound=-3.0, upper_bound=5.0)
+        inflow_angle = opti.variable(
+            init_guess=float(at_start["trim"]), lower_bound=-15.0, upper_bound=15.0
+        )
     loading = {"x_cg": xyz_cg[0], "mass": mass, "thrust_height": None}
     if cg_range is not None:
         loading["x_cg"] = opti.variable(
@@ -602,9 +718,70 @@ def optimize(
         upper_bound=trim_bounds[1],
     )
 
+    def propellers(shaft_rpm, depth, wake=0.0, angle=0.0):
+        from hydrosandbox.propulsion.bseries import evaluate_bseries
+
+        return evaluate_bseries(
+            shaft_rpm,
+            pods["propeller_diameter"],
+            pods["propeller_pitch"] / pods["propeller_diameter"],
+            pods["blade_area_ratio"],
+            n_blades=pods["blades"],
+            v_ship=velocity,
+            wake_fraction=wake,
+            shaft_angle_deg=angle,
+            depth=depth,
+            water=water,
+        )
+
+    spacing = common.get("demihull_spacing")
+    disc_sides = [0.0] if spacing is None else [0.5 * spacing, -0.5 * spacing]
+
+    def disc_centre(placement, y=None):
+        return [
+            placement["x_pod"] + pods["body_length"],
+            disc_sides[0] if y is None else y,
+            -placement["depth_pod"],
+        ]
+
+    def propeller_inflow(placement, at):
+        """The propellers' induced flow at a point, as ``CraftBuildup`` takes it."""
+        from hydrosandbox.propulsion.interaction import actuator_disc_velocity
+
+        def flow(x, y, z):
+            total = [0.0, 0.0, 0.0]
+            for y_disc in disc_sides:
+                part = actuator_disc_velocity(
+                    x, y, z, disc_centre(placement, y_disc), 0.5 * pods["propeller_diameter"],
+                    at["thrust"], velocity, water.density(), torque=at["torque"],
+                    rotation=1.0 if y_disc >= 0 else -1.0,
+                )
+                total = [total[k] + part[k] for k in range(3)]
+            return total
+
+        return flow
+
+    def at_propeller(craft_assembly, foil_results, placement):
+        """The foils' effect on a propeller's inflow (the pods' own legs excluded)."""
+        from hydrosandbox.propulsion.interaction import foils_at_propeller
+
+        pairs = [
+            (wing, component)
+            for wing, component in zip(craft_assembly.wings, foil_results["wing_hydro_components"])
+            if wing.name != "Pod legs"
+        ]
+        return foils_at_propeller(
+            [w for w, _ in pairs], [c for _, c in pairs], disc_centre(placement),
+            0.5 * pods["propeller_diameter"], velocity, water.density(),
+        )
+
+    propeller = None
+    if pods is not None:
+        propeller = propellers(rpm, design["depth_pod"], wake_fraction, inflow_angle)
     assembly = build_assembly(design, stabilizer, **layout_options) if with_assembly else None
     craft = CraftBuildup(
-        assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading, design), **common
+        assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading, design), **common,
+        inflow_perturbation=propeller_inflow(design, propeller) if interacting else None,
     )
     needs_damping = objective == "pitch_damping" or damping_floor is not None
     needs_stability = objective != "drag" or gml_floor is not None or needs_damping
@@ -620,22 +797,7 @@ def optimize(
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
     ]
-    def propellers(shaft_rpm, depth):
-        from hydrosandbox.propulsion.bseries import evaluate_bseries
-
-        return evaluate_bseries(
-            shaft_rpm,
-            pods["propeller_diameter"],
-            pods["propeller_pitch"] / pods["propeller_diameter"],
-            pods["blade_area_ratio"],
-            n_blades=pods["blades"],
-            v_ship=velocity,
-            depth=depth,
-            water=water,
-        )
-
     if pods is not None:
-        propeller = propellers(rpm, design["depth_pod"])
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
             n_pods * propeller["thrust"] / (0.1 * weight) == res["thrust"] / (0.1 * weight),
@@ -646,6 +808,21 @@ def optimize(
             + 0.5 * pods["propeller_diameter"]
             + 0.02,
         ]
+        if interacting:
+            seen = at_propeller(assembly, res["foil"], design)
+            constraints += [
+                wake_fraction / 0.1 == seen["wake_fraction"] / 0.1,
+                inflow_angle == trim + seen["inflow_angle"],
+            ]
+        if with_foils and layout in ("pi", "twin"):
+            # A foil strut stands in line with each propeller: keep them apart.
+            root, tip = design["root_chord_main"], design["taper_main"] * design["root_chord_main"]
+            strut_chord = 0.8 * (tip if layout == "pi" else root)
+            x_strut = design["x_main"] + (
+                0.25 * (root - tip) + 0.5 * tip if layout == "pi" else 0.5 * root
+            )
+            gap = pods.get("min_strut_gap", 1.0) * pods["propeller_diameter"] + 0.5 * strut_chord
+            constraints.append(((disc_centre(design)[0] - x_strut) / gap) ** 2 >= 1.0)
     if with_foils:
         foil = res["foil"]
         constraints += [
@@ -723,7 +900,20 @@ def optimize(
         trim=float(sol(trim)),
         **craft_inputs(solved_loading, solved),
         **dict(exact_common, include_interference_breakdown=with_assembly),
+        inflow_perturbation=(
+            propeller_inflow(
+                solved,
+                propellers(float(sol(rpm)), solved["depth_pod"], float(sol(wake_fraction)), float(sol(inflow_angle))),
+            )
+            if interacting
+            else None
+        ),
     ).run_with_stability()
+    seen = None
+    if interacting:
+        seen = at_propeller(
+            build_assembly(solved, stabilizer, **layout_options), final["foil"], solved
+        )
     x_cg_overall = scalar(final["xyz_cg"][0])
     # Keep the returned results plain (numbers only), so they can cross processes.
     final = {
@@ -742,7 +932,11 @@ def optimize(
         )
     final["x_cg_overall"] = x_cg_overall
     if pods is not None:
-        at = propellers(float(sol(rpm)), solved["depth_pod"])
+        wake_solved = scalar(seen["wake_fraction"]) if interacting else 0.0
+        angle_solved = float(sol(trim)) + scalar(seen["inflow_angle"]) if interacting else 0.0
+        at = propellers(float(sol(rpm)), solved["depth_pod"], wake_solved, angle_solved)
+        area = onp.pi * (0.5 * pods["propeller_diameter"]) ** 2
+        loading_coefficient = scalar(at["thrust"]) / (0.5 * water.density() * velocity**2 * area)
         final.update(
             rpm=float(sol(rpm)),
             pods=n_pods,
@@ -750,7 +944,14 @@ def optimize(
             shaft_power_each=scalar(at["P_shaft"]),
             input_power_each=scalar(at["P_shaft"]) / pods["motor_efficiency"],
             propeller_efficiency=scalar(at["eta_0"]),
+            propeller_jet_speedup=float(onp.sqrt(1.0 + loading_coefficient) - 1.0),
         )
+        if interacting:
+            final.update(
+                wake_fraction=wake_solved,
+                wake_fraction_viscous=scalar(seen["wake_fraction_viscous"]),
+                propeller_inflow_angle=angle_solved,
+            )
     return {"design": solved, "loading": solved_loading, "results": final}
 
 

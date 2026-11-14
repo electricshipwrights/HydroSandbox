@@ -133,6 +133,38 @@ Done:
   stiffness cases' CG are on limits too. pi stiffness rests on one start (run
   before the merge). 95%/90% drag caps not run.
 
+- Example `optimize()` additions (2026-11-14), all in `examples/optimize_foils_on_hull.py`:
+  - `optimize_section=True`: main foil thickness and camber as variables (a
+    two-parameter family through the NACA 2412, `foil_section`), with
+    `allowable_stress` on the solid-section bending stress at CL 1.0
+    (`root_bending_stress`). 150 MPa and solid construction are placeholders.
+  - `pods=EPROPULSION_POD_3`: pod drives (17 kg, 3 kW in, 10.2 x 6.7 in two-blade
+    propeller to 2300 rpm; blade-area ratio and leg section assumed). Position,
+    depth and rpm are variables; B-series propeller must give the thrust.
+  - `propeller_interaction` (default on with pods): actuator-disc flow on the
+    foils, foil wake fraction and inflow angle at the propellers
+    (`propulsion/interaction.py`); blade tips >= 0.20 m under the surface and one
+    diameter fore-aft from an in-line strut, both judgement standing in for
+    ventilation. Steady interaction is tiny on the NACRA (wake fraction within
+    +-0.1%); the clearance rules are what move the designs.
+  - `build_assembly(draw_propellers=True)`: generic blades and hubs for STEP only.
+- `export_craft_vtk` (`geometry/vtk_export.py`): foil pressure + strip-wise
+  NeuralFoil boundary layer, hull pressure, free-surface elevation of hull +
+  foils + pods (`wave_field_from_source_amplitude`, `element_source_amplitude`).
+  Known defects, not yet fixed (Avi stopped that step): the free surface is noisy
+  at the default `k_cap` (16 mm rms ahead of the boat; `k_cap=12, level=2` gives
+  0.3 mm), and `edge_velocity_ratio` is negative on lower surfaces. No test yet.
+- NACRA studies at 6 m/s (all in `local/`): section free `layouts_6ms_section.txt`;
+  twin at 0.5 m span `layouts_6ms_twin_span0.5.txt`; pods without interaction
+  `layouts_6ms_pods_no_interaction.txt`; pods with interaction `layouts_6ms_pods.txt`
+  (ended early: an out-of-memory kill when a second run was started on top; the
+  ten finished solves are in the results JSONL). Twin + pods gave a degenerate
+  design from forward starts; rerun from aft starts: `layouts_6ms_pods_twin_aft.txt`.
+  With pods and interaction a solve needs ~5-6 GB: keep to 4 workers and never
+  start a second study alongside.
+- Branch `standalone-hydrosandbox` (worktree): the package extracted to depend on
+  published `aerosandbox>=4.2.10`; reviewed and merged up to date 2026-11-14.
+
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
   fixed-loading case on the hummingbird hull; the full study (GM_L floors, CG and

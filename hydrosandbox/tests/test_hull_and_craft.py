@@ -1382,3 +1382,41 @@ def test_foil_section_variables_and_bending_stress():
     )
     foil = build_assembly(design, False).foils[0]
     assert float(foil.xsecs[0].airfoil.max_thickness()) == pytest.approx(0.09, rel=0.01)
+
+
+def test_step_export_of_optimizer_sections_pods_and_propellers(tmp_path):
+    """A design with a free-form section, pods and drawn propellers exports to STEP."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(hsb.__file__).parent / "examples"))
+    from optimize_foils_on_hull import EPROPULSION_POD_3, build_assembly, propeller_components
+
+    hull = Hull.wigley(length=5.0, beam=0.4, draft=0.3)
+    spacing = 2.0
+    design = dict(
+        x_main=1.5, depth_main=0.6, root_chord_main=0.25, taper_main=0.5, incidence_main=1.0,
+        thickness_main=0.09, camber_main=0.01, x_pod=1.9, depth_pod=0.4,
+    )
+    assembly = build_assembly(
+        design, False, layout="pi", hull=hull, demihull_spacing=spacing,
+        pods=EPROPULSION_POD_3, span_panels=1, draw_propellers=True,
+    )
+    names = [w.name for w in assembly.wings]
+    assert names.count("Propeller blade") == 4 and len(assembly.fuselages) == 4
+    # Each blade runs from the hub to the tip radius, its mid-blade chord at the
+    # propeller's pitch angle to the plane of rotation, and the two sides mirror.
+    blades, _ = propeller_components(EPROPULSION_POD_3, 2.2, 0.4, spacing)
+    radius = 0.5 * EPROPULSION_POD_3["propeller_diameter"]
+    up = blades[0]
+    assert float(up.xsecs[-1].xyz_le[2]) - float(up.xsecs[0].xyz_le[2]) == pytest.approx(0.8 * radius)
+    chord_direction = onp.array([float(v) for v in up._compute_frame_of_WingXSec(3)[0]])
+    pitch_angle = onp.arctan2(EPROPULSION_POD_3["propeller_pitch"], 2 * onp.pi * 0.6 * radius)
+    assert chord_direction[0] == pytest.approx(onp.sin(pitch_angle), abs=1e-6)
+    assert abs(chord_direction[2]) < 1e-9
+    mirrored = onp.array([float(v) for v in blades[2]._compute_frame_of_WingXSec(3)[0]])
+    assert mirrored == pytest.approx(chord_direction * [1, -1, 1], abs=1e-9)
+
+    out = hsb.export_craft_step(str(tmp_path / "craft.step"), hull, assembly, demihull_spacing=spacing)
+    text = Path(out).read_text()
+    assert text.count("MANIFOLD_SOLID_BREP") >= 11  # foil, 2 struts, 2 legs, 4 blades, pods and hubs
