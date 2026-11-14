@@ -206,3 +206,12 @@ def test_scaled_and_family_length():
     v_full = float(Hull.from_camber(skiff).hydrostatics()["volume"])
     v_half = float(Hull.from_camber(half).hydrostatics()["volume"])
     assert v_half == pytest.approx(v_full / 8, rel=0.01)
+
+
+def test_beam_factor_squeezes_breadth():
+    skiff = load("skiff")
+    narrow = skiff.scaled(1.0, 0.5)
+    assert narrow.loa == pytest.approx(skiff.loa)
+    v_full = float(Hull.from_camber(skiff).hydrostatics()["volume"])
+    v_narrow = float(Hull.from_camber(narrow).hydrostatics()["volume"])
+    assert v_narrow == pytest.approx(0.5 * v_full, rel=0.03)
