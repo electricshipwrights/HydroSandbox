@@ -434,3 +434,40 @@ def test_powered_craft_closes_attitude_thrust_and_drive_masses():
     # Moving the battery aft moves the centre of gravity aft and trims bow-up.
     assert scalar(aft["xyz_cg"][0]) > scalar(amidships["xyz_cg"][0]) + 0.01
     assert aft["trim"] > amidships["trim"]
+
+
+def test_catamaran_limits_coincident_hulls_quadruple_and_distant_hulls_double():
+    """
+    Two demihulls: at zero spacing their sources coincide (amplitudes double, so
+    wave resistance and the dynamic force quadruple); far apart they do not
+    interact (both double). In between, the spacing sets the interference.
+    """
+    hull = Hull.wigley(8.0, 0.8, 0.5, n_stations=31, n_levels=13)
+    u, rho = 2.5, 1025.9
+
+    def wave(spacing):
+        return scalar(
+            kelvin_wave_resistance(
+                xyz_a=([], [], []), xyz_b=([], [], []), velocity=u, density=rho,
+                length_scales=(max(spacing or 0.0, 1.0) + 1.0, 12.0, 0.02),
+                extra_source_amplitude=hull.wave_amplitude(u, demihull_spacing=spacing),
+            )
+        )
+
+    def force(spacing):
+        return scalar(hull.dynamic_force(u, rho, demihull_spacing=spacing)["force_up"])
+
+    assert wave(1e-9) == pytest.approx(4.0 * wave(None), rel=1e-6)
+    assert wave(60.0) == pytest.approx(2.0 * wave(None), rel=2e-2)
+    assert force(1e-9) == pytest.approx(4.0 * force(None), rel=1e-6)
+    assert force(40.0) == pytest.approx(2.0 * force(None), rel=2e-2)
+    assert abs(wave(2.4) / (2.0 * wave(None)) - 1.0) > 0.05
+
+    # The craft model: a catamaran at twice the mass floats where one hull does.
+    water, small_hull, mass = _small_craft()
+    common = dict(hull=small_hull, velocity=0.3, xyz_cg=[0.0, 0.0, 0.1], water=water,
+                  include_hull_dynamics=False, include_interference_breakdown=False)
+    mono = CraftBuildup.solve_equilibrium(mass=mass, **common)
+    cat = CraftBuildup.solve_equilibrium(mass=2.0 * mass, demihull_spacing=2.0, **common)
+    assert cat["sinkage"] == pytest.approx(mono["sinkage"], abs=1e-5)
+    assert scalar(cat["buoyancy_hull"]) == pytest.approx(2.0 * scalar(mono["buoyancy_hull"]), rel=1e-6)

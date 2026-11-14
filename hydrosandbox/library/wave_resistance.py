@@ -192,11 +192,13 @@ def kelvin_wave_resistance(
     reference_velocity : Numeric speed used to size the quadrature when ``velocity``
         is symbolic. Required then: the node layout depends on speed, so there
         is no safe default.
-    extra_source_amplitude : Optional callable ``(kx, kappa) -> (re, im)`` giving, at
-        the quadrature's wavenumbers (1 x M rows), the source-flux transform
-        ``sum Q exp(kappa z - i kx x)`` of a further wave-maker on the centreplane
-        ``y = 0`` (e.g. ``Hull.wave_amplitude``). It is added to both half-systems,
-        so it interferes with the elements. With it, ``length_scales`` is required.
+    extra_source_amplitude : Optional callable ``(kx, kappa, ky) -> (re, im)``
+        giving, at the quadrature's wavenumbers (1 x M rows), the source-flux
+        transform ``sum Q exp(kappa z - i kx x)`` of a further wave-maker that is
+        symmetric about the centreplane ``y = 0``: a hull on it, or a pair of
+        demihulls either side of it (e.g. ``Hull.wave_amplitude``). It is added to
+        both half-systems, so it interferes with the elements. With it,
+        ``length_scales`` is required.
 
     Returns
     -------
@@ -320,7 +322,7 @@ def kelvin_wave_resistance(
         return col @ row
 
     if extra_source_amplitude is not None:
-        extra_re, extra_im = extra_source_amplitude(kx, kappa)
+        extra_re, extra_im = extra_source_amplitude(kx, kappa, ky)
         extra_re = np.reshape(extra_re, (1, -1))
         extra_im = np.reshape(extra_im, (1, -1))
     else:

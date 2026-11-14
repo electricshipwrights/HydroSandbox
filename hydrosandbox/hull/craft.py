@@ -80,6 +80,7 @@ class CraftBuildup(ExplicitAnalysis):
         free_surface_mode: Literal[
             "high_froude", "froude_blended", "rigid_lid"
         ] = "high_froude",
+        demihull_spacing: float | None = None,
         include_transom_drag: bool = False,
         include_hull_dynamics: bool = True,
         include_interference_breakdown: bool = True,
@@ -110,6 +111,12 @@ class CraftBuildup(ExplicitAnalysis):
         shaft_angle : Inclination of the thrust line to the hull's x-axis [deg],
             positive for a shaft running down and aft (thrust then has an upward
             component). The thrust is sized so its horizontal part equals the drag.
+        demihull_spacing : If given [m], the craft is a catamaran: ``hull`` is one
+            demihull, and there are two, centred this far apart either side of the
+            craft's centreline ``y = 0``. Buoyancy, friction and transom drag
+            double; the two hulls' waves interfere with each other (and with the
+            foils'); and each hull's dynamic force includes the other's pressure
+            field. ``mass`` is the whole craft's.
         include_transom_drag : Add the hydrostatic thrust a dry transom loses
             (``rho g`` times the transom's first moment, scaled by its dryness), as
             boatmath's ``study --transom-drag``.
@@ -148,6 +155,7 @@ class CraftBuildup(ExplicitAnalysis):
         self.xyz_thrust = xyz_thrust
         self.model_size = model_size
         self.free_surface_mode = free_surface_mode
+        self.demihull_spacing = demihull_spacing
         self.include_transom_drag = include_transom_drag
         self.include_hull_dynamics = include_hull_dynamics
         self.include_interference_breakdown = include_interference_breakdown
@@ -180,7 +188,9 @@ class CraftBuildup(ExplicitAnalysis):
         scales = self.wave_length_scales
         if scales is None:
             level_spacing = float(_onp.min(_onp.diff(self.hull.levels)))
-            beam = 2.0 * float(_onp.max(self.hull.half_breadths))
+            beam = 2.0 * float(_onp.max(self.hull.half_breadths)) + (
+                self.demihull_spacing or 0.0
+            )
             scales = (
                 max(beam, 1.0),
                 1.5 * self.hull.length,
@@ -227,7 +237,10 @@ class CraftBuildup(ExplicitAnalysis):
             return (z_e - z_cg_earth) * f_x - (x_e - x_cg) * f_z
 
         ### Hull
-        statics = hull.hydrostatics(self.sinkage, trim, pivot)
+        n_hulls = 1 if self.demihull_spacing is None else 2
+        statics = dict(hull.hydrostatics(self.sinkage, trim, pivot))
+        statics["volume"] = n_hulls * statics["volume"]
+        statics["wetted_surface"] = n_hulls * statics["wetted_surface"]
         buoyancy_hull = rho * g * statics["volume"]
         D_hull_viscous = hull.viscous_resistance(
             velocity,
@@ -238,11 +251,13 @@ class CraftBuildup(ExplicitAnalysis):
         )
         transom = hull.transom(velocity, g, self.sinkage, trim, pivot)
         D_transom = (
-            rho * g * transom["depth_moment"] * transom["dryness"]
+            n_hulls * rho * g * transom["depth_moment"] * transom["dryness"]
             if self.include_transom_drag
             else 0.0
         )
-        hull_amplitude = hull.wave_amplitude(velocity, g, self.sinkage, trim, pivot)
+        hull_amplitude = hull.wave_amplitude(
+            velocity, g, self.sinkage, trim, pivot, demihull_spacing=self.demihull_spacing
+        )
 
         F_z = -self.mass * g + buoyancy_hull
         M_y = moment_about_cg(statics["x_cb"], statics["z_cb"], 0.0, buoyancy_hull)
@@ -258,6 +273,7 @@ class CraftBuildup(ExplicitAnalysis):
                 pivot,
                 x_ref=x_cg,
                 reference_velocity=self.wave_reference_velocity,
+                demihull_spacing=self.demihull_spacing,
             )
             F_z = F_z + dynamic["force_up"]
             M_y = M_y + dynamic["moment_bow_up"]
