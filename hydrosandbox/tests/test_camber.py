@@ -215,3 +215,30 @@ def test_beam_factor_squeezes_breadth():
     v_full = float(Hull.from_camber(skiff).hydrostatics()["volume"])
     v_narrow = float(Hull.from_camber(narrow).hydrostatics()["volume"])
     assert v_narrow == pytest.approx(0.5 * v_full, rel=0.03)
+
+
+def test_surface_patches_follow_the_sweep():
+    """CAD patches reproduce the swept surface between the samples they interpolate."""
+    from scipy.interpolate import BSpline
+
+    sw = SweptHull(load("skiff"))
+    patches = sw.surface_patches(n_columns=61, both_sides=False)
+    assert patches[-1]["degree"] == (1, 1)  # the transom
+    breaks = sw.smooth_intervals()
+    span, S, R = breaks[-1] - breaks[0], sw.loft.S, 8
+    k, worst = 0, 0.0
+    for u_a, u_b in zip(breaks[:-1], breaks[1:]):
+        n = max(6, int(round(61 * (u_b - u_a) / span)))
+        sf = onp.linspace(0, 1, 2 * n - 1)
+        us = (u_a + 1e-9 * span) + (u_b - u_a - 2e-9 * span) * 0.5 * (1 - onp.cos(onp.pi * sf))
+        fine = sw.to_hull_axes(onp.stack([sw.swept_section(float(u), 2 * R)["pts"] for u in us]))
+        ks = onp.array([sw.loft.at(float(u))[1] for u in us[::2]])
+        cuts = [0] + [i * R for i in range(1, S - 1) if ks[:, i].max() > 0.05] + [(S - 1) * R]
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            p = patches[k]
+            k += 1
+            along = BSpline(onp.array(p["knots_u"]), p["ctrl"], p["degree"][0], axis=0)(sf)
+            surf = BSpline(onp.array(p["knots_v"]), along, p["degree"][1], axis=1)(onp.linspace(0, 1, 2 * (b - a) + 1))
+            worst = max(worst, float(onp.linalg.norm(surf - fine[:, 2 * a : 2 * b + 1], axis=-1).max()))
+    assert k == len(patches) - 1
+    assert worst < 0.002 * load("skiff").loa * load("skiff").unit_m

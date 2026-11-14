@@ -210,7 +210,16 @@ class SweptHull:
                 lo = m
         return hi
 
-    def surface_grid(self, n_columns: int = 121, R: int = 8) -> _onp.ndarray:
+    def column_us(self, n_columns: int, spacing: str = "uniform") -> _onp.ndarray:
+        """``u`` of the sampled columns between the aft and forward limits."""
+        u0, u1 = self.aft_limit(), self.forward_limit()
+        pad = 1e-6 * (u1 - u0)
+        s = _onp.linspace(0.0, 1.0, n_columns)
+        if spacing == "cosine":
+            s = 0.5 * (1.0 - _onp.cos(_onp.pi * s))
+        return u0 + pad + (u1 - u0 - 2 * pad) * s
+
+    def surface_grid(self, n_columns: int = 121, R: int = 8, spacing: str = "uniform") -> _onp.ndarray:
         """
         The trimmed starboard half-surface as a ``(n_columns, (S - 1) R + 1, 3)``
         grid of world points (document frame and unit), sheer to keel.
@@ -219,10 +228,10 @@ class SweptHull:
         over all of ``[0, 1]``, so every column has a section and the grid's
         topology never changes as the authored numbers move; the end columns are
         pulled a hair inside the limits, where the section has just vanished.
+        ``spacing="cosine"`` clusters them toward the ends, where the sections
+        change fastest (the transom sweeping through them, the forefoot).
         """
-        u0, u1 = self.aft_limit(), self.forward_limit()
-        pad = 1e-6 * (u1 - u0)
-        us = _onp.linspace(u0 + pad, u1 - pad, n_columns)
+        us = self.column_us(n_columns, spacing)
         rows = []
         for u in us:
             s = self.swept_section(float(u), R)
@@ -254,6 +263,125 @@ class SweptHull:
         s = ha / (ha - hb) if ha != hb else 0.0
         point = _onp.array([xa + s * (xb - xa), 0.0, za + s * (zb - za)])
         return float(self.to_hull_axes(point)[0])
+
+    def _column_signature(self, u: float, R: int):
+        """
+        What shapes the trimmed column at ``u`` besides its smooth geometry: which
+        trim ends it at the bottom, whether the sheer trim cuts its top, and which
+        station knots survive the trims. The
+        regularized grid is smooth in ``u`` wherever this stays the same.
+        """
+        frame, sec = self.frame(u), self.section(u)
+        span = self.kept_span(frame, sec)
+        if span is None:
+            return None
+        bottom = self.station_world(frame, sec.at(span[1]))
+        trims = (
+            float(self.trim_z(bottom[0])) - bottom[2],
+            bottom[1],
+            bottom[0] - float(self.x_transom(bottom[2])),
+        )
+        S = sec.vmax + 1
+        anchors = _anchors(S, *span)
+        pinned = tuple(abs(a - i) < 1e-9 for i, a in enumerate(anchors))
+        ends_on = int(_onp.argmin(trims)) if span[1] < sec.vmax - 1e-9 else -1
+        top_cut = span[0] > 1e-9
+        return ends_on, top_cut, pinned
+
+    def smooth_intervals(self, R: int = 8, n_scan: int = 400) -> list[float]:
+        """
+        Breakpoints in ``u``, from the aft to the forward limit, between which the
+        trimmed sheet is smooth (see ``_column_signature``), each located by bisection.
+        """
+        us = self.column_us(n_scan)
+        sigs = [self._column_signature(float(u), R) for u in us]
+        breaks = [float(us[0])]
+        for i in range(1, len(us)):
+            lo, s_lo = float(us[i - 1]), sigs[i - 1]
+            # Several changes can fall between two scan points: find them in turn.
+            while s_lo != sigs[i]:
+                a, b = lo, float(us[i])
+                for _ in range(48):
+                    mid = 0.5 * (a + b)
+                    if self._column_signature(mid, R) == s_lo:
+                        a = mid
+                    else:
+                        b = mid
+                breaks.append(0.5 * (a + b))
+                lo, s_lo = b, self._column_signature(b, R)
+        breaks.append(float(us[-1]))
+        return breaks
+
+    def surface_patches(
+        self, n_columns: int = 81, R: int = 8, crease_threshold: float = 0.05, both_sides: bool = True
+    ) -> list[dict]:
+        """
+        The trimmed hull as B-spline patches in ``Hull``'s axes (metres, ``x`` aft),
+        for CAD export, after camber's own STEP export: the swept sheet sampled on
+        the regularized grid and interpolated by cubic B-splines. Patches are split
+        along the hull wherever a trim starts or stops cutting a column a different
+        way (``smooth_intervals``: e.g. behind a raked transom, where sections end on
+        the transom rather than the keel), and around it along the station knots that
+        carry a knuckle (stronger than ``crease_threshold`` anywhere), so chines stay
+        sharp. The transom is a ruled face from its starboard edge to the centreline.
+        ``n_columns`` columns in all are shared out between the intervals (cosine-
+        clustered in each). With ``both_sides`` the port side is the mirror image.
+        Each patch is a dict of ``degree``, ``knots_u``, ``knots_v`` and an
+        ``(n_u, n_v, 3)`` control net ``ctrl``.
+        """
+        from scipy.interpolate import make_interp_spline
+
+        breaks = self.smooth_intervals(R)
+        span = breaks[-1] - breaks[0]
+        S = self.loft.S
+
+        def interpolate(points):
+            """Tensor-product cubic interpolation (not-a-knot) of an (n_u, n_v, 3) grid."""
+            n_u, n_v, _ = points.shape
+            k_u, k_v = min(3, n_u - 1), min(3, n_v - 1)
+            along_u = make_interp_spline(_onp.linspace(0.0, 1.0, n_u), points, k=k_u, axis=0)
+            along_v = make_interp_spline(_onp.linspace(0.0, 1.0, n_v), along_u.c, k=k_v, axis=1)
+            return {
+                "degree": (k_u, k_v),
+                "knots_u": [float(t) for t in along_u.t],
+                "knots_v": [float(t) for t in along_v.t],
+                # (SciPy puts the interpolated axis first in the coefficients.)
+                "ctrl": _onp.moveaxis(_onp.asarray(along_v.c, dtype=float), 0, 1),
+            }
+
+        patches, transom_edge = [], []
+        for u_a, u_b in zip(breaks[:-1], breaks[1:]):
+            n = max(6, int(round(n_columns * (u_b - u_a) / span)))
+            s = 0.5 * (1.0 - _onp.cos(_onp.pi * _onp.linspace(0.0, 1.0, n)))
+            pad = 1e-9 * span
+            us = (u_a + pad) + (u_b - u_a - 2 * pad) * s
+            doc_grid = _onp.stack([self.swept_section(float(u), R)["pts"] for u in us])
+            grid = self.to_hull_axes(doc_grid)
+            ks = _onp.array([self.loft.at(float(u))[1] for u in us])
+            creases = [i * R for i in range(1, S - 1) if ks[:, i].max() > crease_threshold]
+            cuts = [0] + creases + [grid.shape[1] - 1]
+            patches += [interpolate(grid[:, a : b + 1]) for a, b in zip(cuts[:-1], cuts[1:])]
+            bottoms = doc_grid[:, -1, :]
+            on_plane = _onp.abs(bottoms[:, 0] - self.x_transom(bottoms[:, 2])) < 1e-6 * self.hull.loa
+            transom_edge += [p for p, on in zip(grid[:, -1, :], on_plane) if on]
+
+        if len(transom_edge) >= 2:
+            edge = _onp.array(transom_edge)
+            # One column per interval boundary is sampled twice; keep distinct points.
+            keep = _onp.concatenate([[True], _onp.linalg.norm(_onp.diff(edge, axis=0), axis=1) > 1e-9])
+            edge = edge[keep]
+            n = len(edge)
+            patches.append(
+                {
+                    "degree": (1, 1),
+                    "knots_u": [0.0] + list(_onp.linspace(0.0, 1.0, n)) + [1.0],
+                    "knots_v": [0.0, 0.0, 1.0, 1.0],
+                    "ctrl": _onp.stack([edge, edge * _onp.array([1.0, 0.0, 1.0])], axis=1),
+                }
+            )
+        if both_sides:
+            patches += [dict(p, ctrl=p["ctrl"] * _onp.array([1.0, -1.0, 1.0])) for p in patches]
+        return patches
 
     def hull_mesh(self, n_columns: int = 121, R: int = 8) -> tuple[_onp.ndarray, _onp.ndarray]:
         """The trimmed starboard surface as a triangle mesh in ``Hull``'s axes (vertices, triangles)."""

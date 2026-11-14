@@ -460,10 +460,18 @@ class Hull(AeroSandboxObject):
         centreplane, z up), each a dict of ``degree``, ``knots_u``, ``knots_v`` and
         an ``(n_u, n_v, 3)`` control net ``ctrl``.
 
-        A hull read from B-spline geometry returns the designer's own surfaces. Any
-        other hull returns its offsets table as two bilinear patches, one per side.
+        A hull read from B-spline geometry returns the designer's own surfaces, and
+        one read from a camber document B-splines fitted through its sweep (see
+        ``SweptHull.surface_patches``). Any other hull returns its offsets table as
+        two bilinear patches, one per side.
         """
         if getattr(self, "source_patches", None):
+            return self.source_patches
+        if getattr(self, "camber_document", None) is not None:
+            # A camber hull: B-splines through its sweep, computed on first use.
+            from hydrosandbox.hull.camber import SweptHull
+
+            self.source_patches = SweptHull(self.camber_document).surface_patches()
             return self.source_patches
         n_x, n_z = self.half_breadths.shape
         patches = []
