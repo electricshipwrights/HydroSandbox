@@ -120,10 +120,18 @@ Done:
   (`_hull_state`, now also holding the stations and wave field the interaction
   needs), chunked wave integral, `optimize(use_hull_tables=True)`,
   `run_with_stability(include_pitch_damping=...)`, BLAS threads pinned in
-  `parallel_map`. 93 tests pass. The `local/` study scripts do not use the
-  tables yet; per-solve memory after the merge not yet measured.
-- Layout study with the wave field (6 m/s, drag <= bare, CG -0.6..+1.0):
-  `local/layouts_6ms.txt`.
+  `parallel_map`. 93 tests pass. The `local/` study scripts get the
+  wave table by default (`use_hull_tables=True`). Measured on the four twin
+  solves: peak 3.1 GB per process (was ~5 GB), 9 min for all four (was over an
+  hour), and the twin stiffness case now converges.
+- Layout study with the wave field (6 m/s, drag <= bare 392 N, CG -0.6..+1.0;
+  `local/layouts_6ms.txt`, twin rerun after the merge in
+  `local/layouts_6ms_twin_rerun.txt`). GM_L [m] / foil damping [kN m s/rad]:
+  centreline 30.0/11.6 (max stiffness), 25.7/14.7 (max damping);
+  pi 36.3/15.0, 30.4/19.2; twin 19.0/10.5, 18.5/12.0. Bare GM_L 14.6.
+  Every design has the foil at the 95%-of-length limit; centreline span and the
+  stiffness cases' CG are on limits too. pi stiffness rests on one start (run
+  before the merge). 95%/90% drag caps not run.
 
 Left (hull port):
 - `examples/optimize_foils_on_hull.py` has been run only for the no-floor,
