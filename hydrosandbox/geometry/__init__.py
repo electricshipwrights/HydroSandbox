@@ -7,7 +7,7 @@ from hydrosandbox.geometry.components import (
     fuselage_submerged_volume_and_centroid,
 )
 from hydrosandbox.geometry.assembly import HydrofoilAssembly
-from hydrosandbox.geometry.step_export import export_assembly_step
+from hydrosandbox.geometry.step_export import export_assembly_step, export_craft_step
 
 __all__ = [
     "Foil",
@@ -18,4 +18,5 @@ __all__ = [
     "wing_submerged_volume_and_centroid",
     "fuselage_submerged_volume_and_centroid",
     "export_assembly_step",
+    "export_craft_step",
 ]

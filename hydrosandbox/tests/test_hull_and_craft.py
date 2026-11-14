@@ -882,3 +882,47 @@ def test_solve_equilibrium_positional_args_squat_level_and_rejected_backtrack():
             water=water,
             include_interference_breakdown=False,
         )
+
+
+def test_craft_step_export_writes_hull_surfaces_and_foil_solids(tmp_path):
+    hull = Hull.wigley(5.0, 0.8, 0.25, freeboard=0.3, n_stations=11, n_levels=7)
+    assembly = _t_foil(1.5)
+
+    # A catamaran: two demihull shells (the offsets table as bilinear patches, one
+    # per side of each hull) beside the foil and strut solids.
+    path = hsb.export_craft_step(tmp_path / "cat.step", hull, assembly, demihull_spacing=2.0)
+    text = path.read_text()
+    assert text.startswith("ISO-10303-21;") and text.rstrip().endswith("END-ISO-10303-21;")
+    assert text.count("MANIFOLD_SOLID_BREP") == 2
+    assert text.count("SHELL_BASED_SURFACE_MODEL") == 2
+    assert text.count("OPEN_SHELL") == 2
+    assert text.count("B_SPLINE_SURFACE_WITH_KNOTS") >= 4
+    assert "MANIFOLD_SURFACE_SHAPE_REPRESENTATION" in text
+    assert "ADVANCED_BREP_SHAPE_REPRESENTATION" in text
+    # Every entity reference resolves.
+    import re
+
+    defined = set(re.findall(r"^#(\d+)=", text, flags=re.M))
+    used = set(re.findall(r"#(\d+)", text))
+    assert used <= defined
+
+    # A hull read from B-spline geometry keeps the designer's patches, about its
+    # own centreplane and with x running aft.
+    l, b, t = 10.0, 1.0, 0.625
+    ctrl = [
+        [x, 3.0 + (b / 2) * yu * yv, z]
+        for x, yu in zip([-l / 2, 0.0, l / 2], [0.0, 2.0, 0.0])
+        for z, yv in zip([0.0, -t / 2, -t], [1.0, 1.0, 0.0])
+    ]
+    mirrored = [[x, 6.0 - y, z] for x, y, z in ctrl]
+    patch = lambda c: {"degree": [2, 2], "n_ctrl": [3, 3], "knots_u": [0, 0, 0, 1, 1, 1],
+                       "knots_v": [0, 0, 0, 1, 1, 1], "ctrl": c, "trim_uv": None}
+    drawn = Hull.from_boatmath_geometry(
+        {"kind": "nurbs", "hulls": [{"patches": [patch(ctrl), patch(mirrored)]}]}
+    )
+    patches = drawn.surface_patches()
+    assert len(patches) == 2 and patches[0]["ctrl"].shape == (3, 3, 3)
+    assert drawn.source_centerplane_y == pytest.approx(3.0, abs=1e-6)
+    assert onp.max(onp.abs([p["ctrl"][..., 1] for p in patches])) == pytest.approx(b, rel=1e-9)
+    hull_only = hsb.export_craft_step(tmp_path / "hull.step", drawn)
+    assert hull_only.read_text().count("B_SPLINE_SURFACE_WITH_KNOTS") == 2
