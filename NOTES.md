@@ -59,6 +59,25 @@ cg_level_at_rest=True)`, blend_t free, starts t=0.1 and 0.8, ~160 s each, 3
 workers): t* = 0.034 / 0.37 / 0.406 at Fn 0.30 / 0.45 / 0.60, exact-blend drag
 within 0.2 N of the scan's best at every speed from both starts.
 
+Pi foil + blend on the same cat (`local/camber_cat_foils.py` / `.json`, 36
+solves, 3 starting layouts, free blend from t=0.4 plus fixed exact blends t =
+0/0.2/0.4/0.6/1.0, trim bounds -2..4 deg, no GM_L floor, peak ~6.4 GB):
+- Fn 0.45: t* = 0.48, D 197 N (wave 49, viscous 126, foil 21), foil carries 16%
+  of weight. Fixed t: 249 / 211 / 196 / 205 / 285 N at t = 0 / .2 / .4 / .6 / 1.
+- Fn 0.60: t* = 0.42, D 347 N (wave 112, viscous 211, foil 23), 15% lift.
+  Fixed: 399 / 360 / 347 / 355 / failed (t=1, all starts).
+- All 3 starts agree for the free blend. Two fixed-t runs from layout 2 found a
+  worse local optimum (foil forward, -3 deg incidence, ~100 N worse).
+- Blend optimum barely moves with foils (0.37->0.48, 0.41->0.42), and the free
+  run's t matches the fixed-t scan's best within its resolution.
+- Every solution has trim at the 4 deg bound and the main foil at its aft bound
+  (x_bow + 0.95 L): the foil is used as a trim tab. Bare hull forced to fixed
+  trim (`local/camber_cat_trimcheck.py`, t=0.4, vertical balance only): D falls
+  monotonically 357/323/282/248/246 N at 0..4 deg (Fn 0.45), 503->370 N (Fn 0.6).
+  So of the 292->197 N gain at Fn 0.45, ~45 N is trim alone and ~50 N comes
+  from the foil (unloading plus wave interference: wave 109 -> 49 N). Thin-ship
+  at 4 deg trim on a 6 m hull is a stretch; treat the trim gain as optimistic.
+
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
   through the node interpolant. Freeing individual control points (beyond blend
