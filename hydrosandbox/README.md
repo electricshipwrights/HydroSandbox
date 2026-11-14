@@ -79,6 +79,34 @@ ll_res = hsb.HydroLiftingLine(assembly=assembly, op_point=op).run()
 bucket = hsb.cavitation_bucket(asb.Airfoil("naca2412"), velocity=12.0, chord=0.14, depth=0.6, water=water)
 ```
 
+## Electric Propulsion
+
+`hydrosandbox.propulsion` pairs smooth, CasADi-differentiable Wageningen B-series propeller models (Keller & Burrill cavitation, Reynolds & Gutsche oblique-flow corrections), Drela 3-parameter and 4-term polynomial loss electric motor models, a vendored 159-motor catalog (plus small waterproof foil-assist pod motors), thin-ship Rankine wake + Lagally thrust deduction (`hull_propeller_interaction`), and coupled `ElectricPropulsionBuildup` analyses:
+
+```python
+import hydrosandbox as hsb
+
+op = hsb.HydroOperatingPoint(velocity=6.0)
+hull = hsb.Hull.wigley(length=10.0, beam=1.0, draft=0.625)
+db = hsb.MotorDatabase.vendored(include_foil_assist_pods=True)
+motor = db.motor("flipsky_6384_120kv_36v")
+
+buildup = hsb.ElectricPropulsionBuildup(
+    op_point=op,
+    drag_bare_N=80.0,
+    hull=hull,
+    disc_xyz=[5.2, 0.0, -0.35],
+    propeller_diameter=0.18,
+    propeller_pitch_ratio=1.2,
+    propeller_ear=0.45,
+    propeller_rpm=1500.0,
+    gearbox_ratio=2.5,
+    motor=motor,
+    endurance_hours=1.5,
+)
+res = buildup.run()
+```
+
 ## Example Optimization & Tests
 
 Run the coupled T-foil MDO example:
