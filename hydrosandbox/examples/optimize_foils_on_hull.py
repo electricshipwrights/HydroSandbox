@@ -38,6 +38,7 @@ the bow) describing its load.
 
 import argparse
 import json
+import os
 import time
 import numpy as onp
 import aerosandbox as asb
@@ -106,6 +107,58 @@ def root_bending_stress(
     return moment / (2.0 * SECTION_INERTIA_FACTOR * root_chord * thickness**2)
 
 
+# ePropulsion Pod Drive 3.0 Evo: 3 kW input at 48 V, 17 kg, 570 N static thrust
+# (manufacturer's parts database); its Navy 3.0 propeller, 10.2 x 6.7 in, two blades,
+# to 2300 rpm. Lower-unit sizes are those of the Navy 3.0 Evo outboard, which shares
+# it. The blade-area ratio and the leg's section are assumed.
+EPROPULSION_POD_3 = dict(
+    mass=17.0,
+    propeller_diameter=0.259,
+    propeller_pitch=0.170,
+    blades=2,
+    blade_area_ratio=0.30,
+    max_rpm=2300.0,
+    max_input_power=3000.0,
+    motor_efficiency=0.88,
+    body_length=0.30,
+    body_diameter=0.101,
+    leg_chord=0.117,
+    leg_section="naca0030",
+)
+
+
+def pod_components(pods: dict, x, depth, hull: Hull, demihull_spacing: float | None):
+    """
+    The drive pods as geometry: a body of revolution with its nose at ``x``, its axis
+    ``depth`` below the waterline, and a leg from it up to the keel. One under each
+    demihull of a catamaran, otherwise one on the centreline.
+    """
+    length, radius = pods["body_length"], 0.5 * pods["body_diameter"]
+    shape = ((0.0, 0.0), (0.12, 0.75), (0.30, 1.0), (0.75, 1.0), (1.0, 0.55))
+    sides = [0.0] if demihull_spacing is None else [0.5 * demihull_spacing, -0.5 * demihull_spacing]
+    bodies = [
+        hsb.HydroFuselage(
+            name="Drive pod",
+            xsecs=[
+                asb.FuselageXSec(xyz_c=[x + f * length, y, -depth], radius=r * radius)
+                for f, r in shape
+            ],
+        )
+        for y in sides
+    ]
+    x_leg = x + 0.5 * length - 0.5 * pods["leg_chord"]
+    leg_airfoil = asb.Airfoil(pods["leg_section"])
+    leg = hsb.Strut(
+        name="Pod legs",
+        symmetric=demihull_spacing is not None,
+        xsecs=[
+            asb.WingXSec(xyz_le=[x_leg, sides[0], z], chord=pods["leg_chord"], airfoil=leg_airfoil)
+            for z in (-depth + radius, hull.keel_height(x + 0.5 * length))
+        ],
+    )
+    return bodies, leg
+
+
 def build_assembly(
     design: dict,
     stabilizer: bool,
@@ -113,9 +166,39 @@ def build_assembly(
     layout: str = "centreline",
     hull: Hull | None = None,
     demihull_spacing: float | None = None,
+    pods: dict | None = None,
 ) -> hsb.HydrofoilAssembly:
     """
-    The foils, from design variables.
+    The foils, from design variables (none, if the design has no ``x_main``), and
+    the drive pods if ``pods`` describes them (see ``pod_components``; the design
+    then holds ``x_pod`` and ``depth_pod``).
+    """
+    foils, struts = (
+        _foil_components(design, stabilizer, strut_freeboard, layout, hull, demihull_spacing)
+        if "x_main" in design
+        else ([], [])
+    )
+    bodies = []
+    if pods is not None:
+        bodies, leg = pod_components(
+            pods, design["x_pod"], design["depth_pod"], hull, demihull_spacing
+        )
+        struts = struts + [leg]
+    return hsb.HydrofoilAssembly(
+        name="Lift-assist foils", foils=foils, struts=struts, fuselages=bodies
+    )
+
+
+def _foil_components(
+    design: dict,
+    stabilizer: bool,
+    strut_freeboard: float,
+    layout: str,
+    hull: Hull | None,
+    demihull_spacing: float | None,
+):
+    """
+    The foils and their struts.
 
     ``layout="centreline"``: a main T-foil on the craft's centreline, its strut
     running up through the waterline (and, optionally, a stabilizer T-foil).
@@ -188,7 +271,7 @@ def build_assembly(
                 ],
             )
         ]
-        return hsb.HydrofoilAssembly(name="Lift-assist foils", foils=foils, struts=struts)
+        return foils, struts
 
     def t_foil(name, x, depth, half_span, root_chord, tip_chord, incidence, airfoil, role):
         foil = hsb.Foil(
@@ -243,7 +326,7 @@ def build_assembly(
         )
         foils.append(stab)
         struts.append(stab_strut)
-    return hsb.HydrofoilAssembly(name="Lift-assist foils", foils=foils, struts=struts)
+    return foils, struts
 
 
 def design_bounds(
@@ -335,6 +418,8 @@ def optimize(
     optimize_section: bool = False,
     allowable_stress: float | None = None,
     structural_lift_coefficient: float = 1.0,
+    pods: dict | None = None,
+    pod_start: tuple[float, float] | None = None,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -361,8 +446,26 @@ def optimize(
     to the design variables. ``allowable_stress`` [Pa] then limits the bending stress
     of the main foil, as a solid section loaded at ``structural_lift_coefficient``
     (see ``root_bending_stress``); without it, nothing rewards thickness.
+
+    ``pods`` (e.g. ``EPROPULSION_POD_3``) drives the craft with pod drives: one under
+    each demihull, or one on the centreline. Their fore-aft position and depth
+    (``x_pod``, ``depth_pod``) and shaft speed (``rpm``) become variables;
+    ``pod_start`` gives the first two to start from. Their mass is part of ``mass``
+    and sits at the pods; the thrust acts there; their bodies and legs add drag and
+    waves; and the propellers (Wageningen B-series, open water: no wake or thrust
+    deduction) must give the thrust within the motors' power and speed.
     """
     with_foils = start is not None
+    with_assembly = with_foils or pods is not None
+    n_pods = 0 if pods is None else (1 if (craft_options or {}).get("demihull_spacing") is None else 2)
+    if pods is not None:
+        if thrust_height_range is not None:
+            raise ValueError("With pods the thrust acts at the pods; omit thrust_height_range.")
+        x_pod_start, depth_pod_start = pod_start or (
+            float(hull.stations[0]) + 0.85 * hull.length,
+            0.35,
+        )
+        start = dict(start or {}, x_pod=x_pod_start, depth_pod=depth_pod_start)
     x_stern = float(hull.stations[-1])
     thrust_start = (
         None
@@ -409,14 +512,36 @@ def optimize(
                 jobs=1,
             )
     layout_options = dict(
-        layout=layout, hull=hull, demihull_spacing=common.get("demihull_spacing")
+        layout=layout, hull=hull, demihull_spacing=common.get("demihull_spacing"), pods=pods
     )
+
+    def craft_inputs(values: dict, placement: dict) -> dict:
+        """Mass, centre of gravity and thrust point for a loading and a design."""
+        if pods is None:
+            return dict(
+                mass=values["mass"],
+                xyz_cg=[values["x_cg"], 0.0, xyz_cg[2]],
+                xyz_thrust=(
+                    None
+                    if values["thrust_height"] is None
+                    else [x_stern, 0.0, values["thrust_height"]]
+                ),
+            )
+        at_pods = [placement["x_pod"] + 0.5 * pods["body_length"], 0.0, -placement["depth_pod"]]
+        return dict(
+            mass=values["mass"] - n_pods * pods["mass"],
+            xyz_cg=[values["x_cg"], 0.0, xyz_cg[2]],
+            point_masses=[(n_pods * pods["mass"], at_pods)],
+            xyz_thrust=[placement["x_pod"] + pods["body_length"], 0.0, -placement["depth_pod"]],
+        )
+
     try:
         at_start = CraftBuildup.solve_equilibrium(
-            assembly=build_assembly(start, stabilizer, **layout_options) if with_foils else None,
-            mass=mass,
-            xyz_cg=xyz_cg,
-            xyz_thrust=thrust_start,
+            assembly=build_assembly(start, stabilizer, **layout_options) if with_assembly else None,
+            **craft_inputs(
+                {"mass": mass, "x_cg": xyz_cg[0], "thrust_height": None if thrust_start is None else thrust_start[2]},
+                start or {},
+            ),
             **common,
         )
     except RuntimeError:
@@ -441,6 +566,17 @@ def optimize(
                 design[name] = opti.variable(
                     init_guess=start.get(name, default), lower_bound=lo, upper_bound=hi
                 )
+    rpm = None
+    if pods is not None:
+        x_bow, radius = float(hull.stations[0]), 0.5 * pods["propeller_diameter"]
+        pod_bounds = {
+            "x_pod": (x_bow + 0.30 * hull.length, x_stern - pods["body_length"]),
+            "depth_pod": (radius + 0.10, 0.60),
+        }
+        for name, limits in pod_bounds.items():
+            lo, hi = (bounds or {}).get(name, limits)
+            design[name] = opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
+        rpm = pods["max_rpm"] * opti.variable(init_guess=0.92, lower_bound=0.2, upper_bound=1.0)
     loading = {"x_cg": xyz_cg[0], "mass": mass, "thrust_height": None}
     if cg_range is not None:
         loading["x_cg"] = opti.variable(
@@ -459,16 +595,6 @@ def optimize(
             upper_bound=thrust_height_range[1],
         )
 
-    def craft_inputs(values: dict) -> dict:
-        return dict(
-            mass=values["mass"],
-            xyz_cg=[values["x_cg"], 0.0, xyz_cg[2]],
-            xyz_thrust=(
-                None
-                if values["thrust_height"] is None
-                else [x_stern, 0.0, values["thrust_height"]]
-            ),
-        )
     sinkage = opti.variable(init_guess=at_start["sinkage"], lower_bound=-0.4, upper_bound=0.2)
     trim = opti.variable(
         init_guess=float(onp.clip(at_start["trim"], *trim_bounds)),
@@ -476,9 +602,9 @@ def optimize(
         upper_bound=trim_bounds[1],
     )
 
-    assembly = build_assembly(design, stabilizer, **layout_options) if with_foils else None
+    assembly = build_assembly(design, stabilizer, **layout_options) if with_assembly else None
     craft = CraftBuildup(
-        assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading), **common
+        assembly=assembly, sinkage=sinkage, trim=trim, **craft_inputs(loading, design), **common
     )
     needs_damping = objective == "pitch_damping" or damping_floor is not None
     needs_stability = objective != "drag" or gml_floor is not None or needs_damping
@@ -494,6 +620,32 @@ def optimize(
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
     ]
+    def propellers(shaft_rpm, depth):
+        from hydrosandbox.propulsion.bseries import evaluate_bseries
+
+        return evaluate_bseries(
+            shaft_rpm,
+            pods["propeller_diameter"],
+            pods["propeller_pitch"] / pods["propeller_diameter"],
+            pods["blade_area_ratio"],
+            n_blades=pods["blades"],
+            v_ship=velocity,
+            depth=depth,
+            water=water,
+        )
+
+    if pods is not None:
+        propeller = propellers(rpm, design["depth_pod"])
+        shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
+        constraints += [
+            n_pods * propeller["thrust"] / (0.1 * weight) == res["thrust"] / (0.1 * weight),
+            propeller["P_shaft"] / shaft_power_limit <= 1.0,
+            # The propeller turns clear below the hull.
+            design["depth_pod"]
+            >= -hull.keel_height(design["x_pod"] + pods["body_length"])
+            + 0.5 * pods["propeller_diameter"]
+            + 0.02,
+        ]
     if with_foils:
         foil = res["foil"]
         constraints += [
@@ -549,7 +701,7 @@ def optimize(
         raise ValueError(f"Unknown objective {objective!r}.")
     try:
         sol = opti.solve(
-            verbose=False,
+            verbose=bool(os.environ.get("OPTIMIZE_VERBOSE")),
             options={
                 "ipopt.hessian_approximation": "limited-memory",
                 "ipopt.max_iter": max_iterations,
@@ -566,12 +718,13 @@ def optimize(
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
     final = CraftBuildup(
-        assembly=build_assembly(solved, stabilizer, **layout_options) if with_foils else None,
+        assembly=build_assembly(solved, stabilizer, **layout_options) if with_assembly else None,
         sinkage=float(sol(sinkage)),
         trim=float(sol(trim)),
-        **craft_inputs(solved_loading),
-        **dict(exact_common, include_interference_breakdown=with_foils),
+        **craft_inputs(solved_loading, solved),
+        **dict(exact_common, include_interference_breakdown=with_assembly),
     ).run_with_stability()
+    x_cg_overall = scalar(final["xyz_cg"][0])
     # Keep the returned results plain (numbers only), so they can cross processes.
     final = {
         key: (scalar(value) if key not in ("sinkage", "trim") else float(value))
@@ -586,6 +739,17 @@ def optimize(
                 common.get("demihull_spacing"),
                 structural_lift_coefficient * 0.5 * water.density() * velocity**2,
             )
+        )
+    final["x_cg_overall"] = x_cg_overall
+    if pods is not None:
+        at = propellers(float(sol(rpm)), solved["depth_pod"])
+        final.update(
+            rpm=float(sol(rpm)),
+            pods=n_pods,
+            propeller_thrust_each=scalar(at["thrust"]),
+            shaft_power_each=scalar(at["P_shaft"]),
+            input_power_each=scalar(at["P_shaft"]) / pods["motor_efficiency"],
+            propeller_efficiency=scalar(at["eta_0"]),
         )
     return {"design": solved, "loading": solved_loading, "results": final}
 
