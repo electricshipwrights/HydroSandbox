@@ -32,19 +32,31 @@ Limits: deep water, linear theory (no breaking or spray sheets, loading not clos
 
 [`hydrosandbox.hull`](hull/) ports the core of the `boatmath` project's Rust crates (`hullgeom`, `thinship`) to `aerosandbox.numpy`, so a hull can sit inside the same `Opti` problem as the foils:
 
-- [`Hull`](hull/hull.py): a hull as a table of offsets (from numbers, a triangle mesh, or a boatmath `hull` record's mesh or B-spline geometry). At any sinkage and trim it gives hydrostatics, ITTC-57 friction, and thin-ship wave sources with boatmath's transom closure. Checked against boatmath itself on the Wigley hull: wave resistance within 0.6%, friction within 0.05%.
-- [`CraftBuildup`](hull/craft.py): hull plus `HydrofoilAssembly` as one rigid craft. The hull's sources and the foils' lift dipoles share one wave spectrum, so hull-foil wave interference is in `D_wave` (and reported as `D_wave_interference`). It returns the net vertical force and pitching moment about the centre of gravity; make sinkage and trim `Opti` variables and constrain both to zero, or call `CraftBuildup.solve_equilibrium(...)` for a fixed design.
+- [`Hull`](hull/hull.py): a hull as a table of offsets (from numbers, a triangle mesh, or a boatmath `hull` record's mesh or B-spline geometry). At any sinkage and trim it gives:
+  - hydrostatics and ITTC-57 friction;
+  - thin-ship wave sources, with boatmath's transom closure;
+  - the thin-ship dynamic sinkage force and trim moment of the hull's own pressure field (`dynamic_force`, a port of `thinship::squat`).
+- [`CraftBuildup`](hull/craft.py): hull plus `HydrofoilAssembly` as one rigid craft. The hull's sources and the foils' lift dipoles share one wave spectrum, so hull-foil wave interference is in `D_wave` (and reported as `D_wave_interference`). It returns the net vertical force and pitching moment about the centre of gravity.
 
 ```python
-hull = hsb.Hull.wigley(length=5.0, beam=0.8, draft=0.25, freeboard=0.3)
+hull = hsb.Hull.from_boatmath_geometry(record["geometry"])   # or Hull.wigley(...), Hull.from_mesh(...)
 res = hsb.CraftBuildup.solve_equilibrium(
-    hull=hull, assembly=assembly, velocity=4.5, mass=456.0,
-    xyz_cg=[0.2, 0.0, 0.1], xyz_thrust=[2.0, 0.0, -0.3],
+    hull=hull, assembly=assembly, velocity=4.5, mass=91.2, xyz_cg=[2.89, 0.0, 0.0],
 )
 res["trim"], res["sinkage"], res["D"], res["D_wave_interference"]
 ```
 
-Not ported yet: the hull's own dynamic sinkage, trim and lift (boatmath's `squat`, `nearfield` and 2D+t `lift`), so the attitude responds to hydrostatics, the foils and the thrust line only. The hull's near-field flow at the foil and the foil's pressure on the hull are also not modelled.
+`solve_equilibrium` is a Newton solve for a fixed design. For design optimization, make `sinkage` and `trim` `Opti` variables, constrain `F_z_net` and `M_y_net` to zero, start them from a `solve_equilibrium` result, and pass `options={"ipopt.hessian_approximation": "limited-memory"}` to `opti.solve`.
+
+Validation against boatmath's own Rust output:
+
+| Case | Quantity | Agreement |
+|---|---|---|
+| Wigley hull, Fn 0.2-0.5 | wave resistance, friction | 0.6%, 0.05% |
+| Wigley hull, Fn 0.2-0.5 | dynamic force, trim moment | 0.3%, 0.5% |
+| A real catamaran demihull (IGES, transom), free to sink and trim, Fn 0.3-0.9 | sinkage, trim, total resistance | 0.2 mm, 0.06 deg, 1.5% |
+
+Not modelled: the hull's planing lift (boatmath's 2D+t `lift`), the hull's near-field flow at the foil, the foil's pressure on the hull, and the foil's waves in the hull's dynamic force.
 
 ## Coordinate & Sign Conventions
 

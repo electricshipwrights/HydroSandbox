@@ -55,9 +55,12 @@ class CraftBuildup(ExplicitAnalysis):
       (reported separately as ``D_wave_interference``).
     - Thrust, equal to the drag, along the hull's x-axis through ``xyz_thrust``.
 
-    What is not: the hull's own dynamic lift, suction, sinkage and trim (boatmath's
-    ``squat`` and 2D+t lift are not ported), the hull's near-field flow at the foil,
-    and the foil's pressure field on the hull.
+    - The hull's own dynamic sinkage force and trim moment (``Hull.dynamic_force``,
+      boatmath's ``thinship::squat``), when ``include_hull_dynamics``.
+
+    What is not: the hull's planing lift (boatmath's 2D+t ``lift``), the hull's
+    near-field flow at the foil, the foil's pressure field on the hull, and the
+    foil's wave field in the hull's dynamic force.
     """
 
     def __init__(
@@ -76,6 +79,7 @@ class CraftBuildup(ExplicitAnalysis):
             "high_froude", "froude_blended", "rigid_lid"
         ] = "high_froude",
         include_transom_drag: bool = False,
+        include_hull_dynamics: bool = True,
         include_interference_breakdown: bool = True,
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
@@ -99,6 +103,8 @@ class CraftBuildup(ExplicitAnalysis):
         include_transom_drag : Add the hydrostatic thrust a dry transom loses
             (``rho g`` times the transom's first moment, scaled by its dryness), as
             boatmath's ``study --transom-drag``.
+        include_hull_dynamics : Include the thin-ship dynamic sinkage force and trim
+            moment of the hull's own pressure field in the balance.
         include_interference_breakdown : Also evaluate the hull's and the
             assembly's wave resistance alone (two more wave integrals), to report
             the interference between them.
@@ -122,6 +128,7 @@ class CraftBuildup(ExplicitAnalysis):
         self.model_size = model_size
         self.free_surface_mode = free_surface_mode
         self.include_transom_drag = include_transom_drag
+        self.include_hull_dynamics = include_hull_dynamics
         self.include_interference_breakdown = include_interference_breakdown
         self.wave_length_scales = wave_length_scales
         self.wave_reference_velocity = wave_reference_velocity
@@ -132,9 +139,14 @@ class CraftBuildup(ExplicitAnalysis):
             x, z, self.sinkage, self.trim, (self.xyz_cg[0], self.xyz_cg[2])
         )
 
-    def _wave_resistance(self, element_sets: list[dict[str, Any]]) -> Vectorizable:
-        """One wave integral over several element sets, all in earth axes."""
-        if not element_sets:
+    def _wave_resistance(
+        self, element_sets: list[dict[str, Any]], hull_amplitude=None
+    ) -> Vectorizable:
+        """
+        One wave integral over element sets (earth axes) and, optionally, the
+        hull's station-contracted source amplitude.
+        """
+        if not element_sets and hull_amplitude is None:
             return 0.0
 
         def strengths(key):
@@ -154,13 +166,20 @@ class CraftBuildup(ExplicitAnalysis):
                 min(0.05, max(0.5 * level_spacing, 0.01)),
             )
         water = self.water
+        if element_sets:
+            element_kwargs = dict(
+                xyz_a=tuple(_stack([e["xyz_a"][k] for e in element_sets]) for k in range(3)),
+                xyz_b=tuple(_stack([e["xyz_b"][k] for e in element_sets]) for k in range(3)),
+                source_flux=strengths("source_flux"),
+                force_y=strengths("force_y"),
+                force_z=strengths("force_z"),
+                smear_length=strengths("smear_length"),
+            )
+        else:
+            element_kwargs = dict(xyz_a=([], [], []), xyz_b=([], [], []))
         return kelvin_wave_resistance(
-            xyz_a=tuple(_stack([e["xyz_a"][k] for e in element_sets]) for k in range(3)),
-            xyz_b=tuple(_stack([e["xyz_b"][k] for e in element_sets]) for k in range(3)),
-            source_flux=strengths("source_flux"),
-            force_y=strengths("force_y"),
-            force_z=strengths("force_z"),
-            smear_length=strengths("smear_length"),
+            **element_kwargs,
+            extra_source_amplitude=hull_amplitude,
             velocity=self.velocity,
             density=water.density(),
             surface_z=0.0,
@@ -190,7 +209,11 @@ class CraftBuildup(ExplicitAnalysis):
         statics = hull.hydrostatics(self.sinkage, trim, pivot)
         buoyancy_hull = rho * g * statics["volume"]
         D_hull_viscous = hull.viscous_resistance(
-            velocity, rho, water.kinematic_viscosity(), statics["wetted_surface"]
+            velocity,
+            rho,
+            water.kinematic_viscosity(),
+            statics["wetted_surface"],
+            statics["wetted_length"],
         )
         transom = hull.transom(velocity, g, self.sinkage, trim, pivot)
         D_transom = (
@@ -198,10 +221,25 @@ class CraftBuildup(ExplicitAnalysis):
             if self.include_transom_drag
             else 0.0
         )
-        hull_sources = hull.wave_sources(velocity, g, self.sinkage, trim, pivot)
+        hull_amplitude = hull.wave_amplitude(velocity, g, self.sinkage, trim, pivot)
 
         F_z = -self.mass * g + buoyancy_hull
         M_y = moment_about_cg(statics["x_cb"], statics["z_cb"], 0.0, buoyancy_hull)
+
+        dynamic = None
+        if self.include_hull_dynamics:
+            dynamic = hull.dynamic_force(
+                velocity,
+                rho,
+                g,
+                self.sinkage,
+                trim,
+                pivot,
+                x_ref=x_cg,
+                reference_velocity=self.wave_reference_velocity,
+            )
+            F_z = F_z + dynamic["force_up"]
+            M_y = M_y + dynamic["moment_bow_up"]
 
         ### Foil assembly, riding with the hull
         foil: dict[str, Any] | None = None
@@ -256,10 +294,10 @@ class CraftBuildup(ExplicitAnalysis):
                 }
 
         ### Waves: one spectrum for everything
-        sets = [hull_sources] + ([foil_sources] if foil_sources is not None else [])
-        D_wave = self._wave_resistance(sets)
+        sets = [foil_sources] if foil_sources is not None else []
+        D_wave = self._wave_resistance(sets, hull_amplitude)
         if self.include_interference_breakdown and foil_sources is not None:
-            D_wave_hull = self._wave_resistance([hull_sources])
+            D_wave_hull = self._wave_resistance([], hull_amplitude)
             D_wave_foil = self._wave_resistance([foil_sources])
             D_wave_interference = D_wave - D_wave_hull - D_wave_foil
         else:
@@ -294,6 +332,8 @@ class CraftBuildup(ExplicitAnalysis):
             "D_wave_foil_alone": D_wave_foil,
             "D_wave_interference": D_wave_interference,
             "L_foil": foil["L"] if foil is not None else 0.0,
+            "F_z_hull_dynamic": dynamic["force_up"] if dynamic is not None else 0.0,
+            "M_y_hull_dynamic": dynamic["moment_bow_up"] if dynamic is not None else 0.0,
             "buoyancy_hull": buoyancy_hull,
             "displaced_volume_hull": statics["volume"],
             "wetted_surface_hull": statics["wetted_surface"],
@@ -312,35 +352,81 @@ class CraftBuildup(ExplicitAnalysis):
         sinkage_guess: float = 0.0,
         trim_guess: float = 0.0,
         max_trim: float = 15.0,
+        tolerance: float = 1e-6,
+        max_iterations: int = 40,
         verbose: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Find the sinkage and trim at which a fixed craft is in vertical-force and
-        pitching-moment balance, and return its results there (numeric).
+        Find the sinkage and trim at which a fixed (numeric) craft is in
+        vertical-force and pitching-moment balance, and return its results there.
 
-        Takes the constructor's arguments (without ``sinkage`` and ``trim``).
+        Takes the constructor's arguments (without ``sinkage`` and ``trim``). Solved
+        by a damped Newton iteration with a finite-difference Jacobian, residuals
+        scaled by the weight and by weight x hull length; converged when both are
+        below ``tolerance``. Raises ``RuntimeError`` if no balance is found (a craft
+        with no stable attitude, e.g. a lifting foil far forward at speed).
         """
-        import aerosandbox as asb
-
         hull = kwargs.get("hull", args[0] if args else None)
+        weight = float(kwargs["mass"]) * 9.80665
         depth_scale = float(hull.levels[-1] - hull.levels[0])
-        opti = asb.Opti()
-        sinkage = opti.variable(
-            init_guess=sinkage_guess, lower_bound=-depth_scale, upper_bound=depth_scale
-        )
-        trim = opti.variable(
-            init_guess=trim_guess, lower_bound=-max_trim, upper_bound=max_trim
-        )
-        res = cls(*args, sinkage=sinkage, trim=trim, **kwargs).run()
-        weight = kwargs["mass"] * 9.80665
-        opti.subject_to(
-            [
-                res["F_z_net"] / weight == 0,
-                res["M_y_net"] / (weight * hull.length) == 0,
-            ]
-        )
-        sol = opti.solve(verbose=verbose)
-        return cls(
-            *args, sinkage=float(sol(sinkage)), trim=float(sol(trim)), **kwargs
-        ).run()
+        scale = _onp.array([weight, weight * hull.length])
+        fast = dict(kwargs, include_interference_breakdown=False)
+
+        def residual(state):
+            res = cls(*args, sinkage=float(state[0]), trim=float(state[1]), **fast).run()
+            return _onp.array(
+                [
+                    float(_onp.ravel(res["F_z_net"])[0]),
+                    float(_onp.ravel(res["M_y_net"])[0]),
+                ]
+            ) / scale
+
+        def clamp(state):
+            return _onp.array(
+                [
+                    _onp.clip(state[0], -depth_scale, depth_scale),
+                    _onp.clip(state[1], -max_trim, max_trim),
+                ]
+            )
+
+        state = clamp(_onp.array([sinkage_guess, trim_guess], dtype=float))
+        steps = _onp.array([1e-4 * max(depth_scale, 1e-3), 1e-3])
+        value = residual(state)
+        for iteration in range(max_iterations):
+            norm = float(_onp.max(_onp.abs(value)))
+            if verbose:
+                print(
+                    f"  iter {iteration}: sinkage {state[0]:+.5f} m, trim {state[1]:+.4f} deg, "
+                    f"residual {norm:.2e}"
+                )
+            if norm < tolerance:
+                break
+            jacobian = _onp.column_stack(
+                [
+                    (residual(state + _onp.eye(2)[k] * steps[k]) - value) / steps[k]
+                    for k in range(2)
+                ]
+            )
+            try:
+                step = _onp.linalg.solve(jacobian, -value)
+            except _onp.linalg.LinAlgError:
+                break
+            # Limit the step, then backtrack until the residual falls.
+            limit = _onp.array([0.25 * depth_scale, 3.0])
+            step = step * min(1.0, float(_onp.min(limit / _onp.maximum(_onp.abs(step), 1e-300))))
+            damping = 1.0
+            while damping > 1e-3:
+                trial = clamp(state + damping * step)
+                trial_value = residual(trial)
+                if _onp.max(_onp.abs(trial_value)) < norm:
+                    break
+                damping *= 0.5
+            state, value = trial, trial_value
+        if float(_onp.max(_onp.abs(value))) >= max(tolerance, 1e-12) * 10:
+            raise RuntimeError(
+                "No equilibrium attitude found "
+                f"(last sinkage {state[0]:+.4f} m, trim {state[1]:+.3f} deg, "
+                f"scaled residual {float(_onp.max(_onp.abs(value))):.2e})."
+            )
+        return cls(*args, sinkage=float(state[0]), trim=float(state[1]), **kwargs).run()
