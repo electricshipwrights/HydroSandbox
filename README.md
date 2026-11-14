@@ -2,7 +2,7 @@
 
 > **Built on [AeroSandbox](https://github.com/peterdsharpe/AeroSandbox)**: HydroSandbox is a standalone package for differentiable hydrofoil, hull, and electric marine propulsion design optimization that builds directly on Peter Sharpe's [**AeroSandbox**](https://github.com/peterdsharpe/AeroSandbox) ([documentation](https://peterdsharpe.github.io/AeroSandbox/)). Rather than vendoring a fork, HydroSandbox installs `aerosandbox` (`>=4.2.10`) as a dependency and uses its CasADi/NumPy automatic-differentiation backend (`aerosandbox.numpy`), `Opti` IPOPT nonlinear optimization interface, parametric 3D geometry primitives (`Wing`, `Fuselage`, `Airfoil`, `KulfanAirfoil`, `MassProperties`), and [NeuralFoil](https://github.com/peterdsharpe/NeuralFoil) 2D viscous airfoil surrogates—extending them with marine physics ported from `boatmath` (`hullgeom`, `thinship`) and empirical marine propulsion models.
 
-HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO)** of foil-assisted boats and electric marine craft in seconds on a laptop. All solvers combine smooth, CasADi-differentiable potential flow, linearized thin-ship / Kelvin–Havelock wave resistance, and semi-empirical hydrodynamic/propulsion buildups rather than mesh-based RANS/VOF Navier–Stokes CFD.
+HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO)** of foil-assisted boats and electric marine craft on a workstation: a foil-only analysis takes seconds, a hull-in-the-loop optimization with stability takes minutes and a few GB of memory per solve. All solvers combine smooth, CasADi-differentiable potential flow, linearized thin-ship / Kelvin–Havelock wave resistance, and semi-empirical hydrodynamic/propulsion buildups rather than mesh-based RANS/VOF Navier–Stokes CFD.
 
 ---
 
@@ -16,7 +16,7 @@ HydroSandbox targets gradient-based **multidisciplinary design optimization (MDO
   - Method-of-images free-surface boundary conditions (`free_surface_mode="high_froude" | "froude_blended" | "rigid_lid" | "none"`), with `froude_image_weight` smoothly transitioning across $Fn_h \approx 1$.
   - Smooth free-surface submergence clipping and Archimedes hydrostatics (`clip_wing_to_free_surface`, `wing_submerged_volume_and_centroid`, `fuselage_submerged_volume_and_centroid`).
   - NeuralFoil incompressible 2D section polars (`evaluate_hydrofoil_2D`, `cavitation_bucket`) coupled with inviscid $C_{p,\min}$, cavitation inception speed/margin, smooth cavitation drag increment, foil/strut ventilation margins, Hoerner strut spray drag, and T-junction interference drag.
-  - Three 3D hydrodynamic solvers: `HydroBuildup` (fast conceptual buildup built for `Opti`), `HydroVLM` (3D vortex lattice with image reflections), and `HydroLiftingLine` (nonlinear viscous 3D lifting line).
+  - Three 3D hydrodynamic solvers: `HydroBuildup` (fast conceptual buildup built for `Opti`), `HydroVLM` (3D vortex lattice with image reflections), and `HydroLiftingLine` (3D lifting line with viscous section polars).
 
 ### 2. Linearized Wave-Making & Near-Field Wave Flow
 - **Unified Far-Field Wave Spectrum** (`hydrosandbox.library.wave_resistance`):
@@ -155,7 +155,7 @@ For full closed-loop vehicle sizing (coupled mass/CG/trim/thrust/battery iterati
   ```bash
   python hydrosandbox/examples/optimize_hydrofoil_assembly.py --velocity 6.0 --mass 30.0
   ```
-- **Hull-in-the-Loop Foil & Pod Optimization** ([`hydrosandbox/examples/optimize_foils_on_hull.py`](hydrosandbox/examples/optimize_foils_on_hull.py)): Minimizes total craft drag (hull friction + wave interference + foil/strut/pod drag) across monohull (`layout="centreline"`) and catamaran (`layout="pi" | "twin"`) configurations subject to attitude equilibrium, longitudinal stability floors (`GM_L` and `c_pitch_foils`), optional section thickness/camber optimization (`--optimize-section`) with solid-section root bending-stress limits (`--allowable-stress`), optional steerable/fixed pod drives (`EPROPULSION_POD_3`), STEP/VTK export, and multi-start search via `hsb.parallel_map`:
+- **Hull-in-the-Loop Foil & Pod Optimization** ([`hydrosandbox/examples/optimize_foils_on_hull.py`](hydrosandbox/examples/optimize_foils_on_hull.py)): Minimizes total craft drag (hull friction + wave interference + foil/strut/pod drag) across monohull (`layout="centreline"`) and catamaran (`layout="pi" | "twin"`) configurations subject to attitude equilibrium, longitudinal stability floors (`GM_L` and `c_pitch_foils`), and multi-start search via `hsb.parallel_map`. Its `optimize()` function (not the command line) also takes the objective (`"drag"`, `"pitch_stiffness"`, `"pitch_damping"`), section thickness/camber as variables (`optimize_section=True`) with a solid-section bending-stress limit (`allowable_stress`), and pod drives with free placement (`pods=EPROPULSION_POD_3`) including propeller–foil interaction and clearance rules:
   ```bash
   python hydrosandbox/examples/optimize_foils_on_hull.py --velocity 4.5 --gml-fractions 0.6,0.8,1.0 --stabilizer
   ```
