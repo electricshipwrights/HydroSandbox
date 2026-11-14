@@ -101,7 +101,7 @@ class HydroBuildup(ExplicitAnalysis):
         n_junctions: int | None = None,
         include_cavitation_penalty: bool = True,
         include_buoyancy_in_totals: bool = False,
-        include_wave_drag: bool = True,
+        include_wave_drag: bool | Literal["elements_only"] = True,
         wave_length_scales: tuple[float, float, float] | None = None,
         wave_reference_velocity: float | None = None,
         airplane: Airplane | HydrofoilAssembly | None = None,
@@ -110,7 +110,11 @@ class HydroBuildup(ExplicitAnalysis):
         Parameters beyond the obvious:
 
         include_wave_drag : Add wave-making drag (needs ``op_point.surface_z`` and
-            ``free_surface_mode != "none"``).
+            ``free_surface_mode != "none"``). ``"elements_only"`` prepares everything
+            for it (rigid-lid induced drag, and the wave singularities returned as
+            ``wave_elements``) but leaves the wave integral, and so ``D_wave``, to
+            the caller: used to combine the assembly with other wave-makers, such
+            as a hull, in one spectrum.
         wave_length_scales : ``(y_extent, x_extent, min_depth)`` [m] of the submerged
             assembly, used only to size the wave-integral quadrature when the
             geometry is symbolic (default ``(2, 2, 0.05)``; inferred when numeric).
@@ -255,7 +259,7 @@ class HydroBuildup(ExplicitAnalysis):
 
     def _wave_drag_active(self) -> bool:
         return (
-            self.include_wave_drag
+            bool(self.include_wave_drag)
             and getattr(self.op_point, "surface_z", None) is not None
             and self.free_surface_mode != "none"
         )
@@ -419,6 +423,7 @@ class HydroBuildup(ExplicitAnalysis):
 
         # Wave-making drag (lift/side-force dipoles + thickness sources, with interference)
         D_wave = 0.0
+        wave_elements = None
         if self._wave_drag_active():
             surface_z_wave = self.op_point.surface_z
             element_sets = [
@@ -440,7 +445,11 @@ class HydroBuildup(ExplicitAnalysis):
                     )
                 )
             elements = merge_wave_elements(*element_sets)
-            if len(elements["source_flux"]) > 0:
+            wave_elements = elements
+            if (
+                len(elements["source_flux"]) > 0
+                and self.include_wave_drag != "elements_only"
+            ):
                 D_wave = self._wave_resistance(elements)
 
                 # Apply at the load-weighted centroid of the lifting elements.
@@ -551,6 +560,7 @@ class HydroBuildup(ExplicitAnalysis):
         output["D_junction"] = D_junction
         output["D_cavitation"] = sum(comp.D_cavitation for comp in wing_components)
         output["D_wave"] = D_wave
+        output["wave_elements"] = wave_elements
 
         # Cavitation & ventilation summaries across submerged wing components
         if wing_components:

@@ -28,6 +28,24 @@ Results report `D_induced` as the trailing-vortex drag with a **rigid-lid** imag
 
 Limits: deep water, linear theory (no breaking or spray sheets, loading not closer than about half a chord to the surface), and the free surface's effect on lift is still the image approximation rather than the full finite-Froude near field.
 
+## Hull in the Loop
+
+[`hydrosandbox.hull`](hull/) ports the core of the `boatmath` project's Rust crates (`hullgeom`, `thinship`) to `aerosandbox.numpy`, so a hull can sit inside the same `Opti` problem as the foils:
+
+- [`Hull`](hull/hull.py): a hull as a table of offsets (from numbers, a triangle mesh, or a boatmath `hull` record's mesh or B-spline geometry). At any sinkage and trim it gives hydrostatics, ITTC-57 friction, and thin-ship wave sources with boatmath's transom closure. Checked against boatmath itself on the Wigley hull: wave resistance within 0.6%, friction within 0.05%.
+- [`CraftBuildup`](hull/craft.py): hull plus `HydrofoilAssembly` as one rigid craft. The hull's sources and the foils' lift dipoles share one wave spectrum, so hull-foil wave interference is in `D_wave` (and reported as `D_wave_interference`). It returns the net vertical force and pitching moment about the centre of gravity; make sinkage and trim `Opti` variables and constrain both to zero, or call `CraftBuildup.solve_equilibrium(...)` for a fixed design.
+
+```python
+hull = hsb.Hull.wigley(length=5.0, beam=0.8, draft=0.25, freeboard=0.3)
+res = hsb.CraftBuildup.solve_equilibrium(
+    hull=hull, assembly=assembly, velocity=4.5, mass=456.0,
+    xyz_cg=[0.2, 0.0, 0.1], xyz_thrust=[2.0, 0.0, -0.3],
+)
+res["trim"], res["sinkage"], res["D"], res["D_wave_interference"]
+```
+
+Not ported yet: the hull's own dynamic sinkage, trim and lift (boatmath's `squat`, `nearfield` and 2D+t `lift`), so the attitude responds to hydrostatics, the foils and the thrust line only. The hull's near-field flow at the foil and the foil's pressure on the hull are also not modelled.
+
 ## Coordinate & Sign Conventions
 
 - **Geometry axes (`_g`)**: `+x_g` aft/downstream, `+y_g` starboard/right, `+z_g` **upward** (so buoyancy acts in `+z_g`).
