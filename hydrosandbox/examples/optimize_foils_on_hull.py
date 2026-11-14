@@ -32,8 +32,10 @@ confused with what moving the centre of gravity buys on its own).
 
 By default the hull is a slender Wigley demihull. ``--hull-record FILE`` reads the
 first ``hull`` record of a boatmath JSON-lines stream instead
-(``boatmath hull my.igs > hull.jsonl``), with ``--mass`` and ``--lcg`` (metres aft of
-the bow) describing its load.
+(``boatmath hull my.igs > hull.jsonl``), and ``--camber FILE`` a camber document
+(see ``hydrosandbox.hull.camber``), with ``--mass`` and ``--lcg`` (metres aft of the
+bow) describing its load. To optimize over a family of camber hulls, blending them,
+see ``optimize_camber_blend.py``.
 """
 
 import argparse
@@ -519,6 +521,8 @@ def optimize(
     pods: dict | None = None,
     pod_start: tuple[float, float] | None = None,
     propeller_interaction: bool = True,
+    blend_start: list[float] | None = None,
+    cg_level_at_rest: bool = False,
 ) -> dict | None:
     """
     One optimization from one starting layout (``start=None``: the bare hull, with
@@ -561,7 +565,42 @@ def optimize(
     reach the propellers as a wake fraction and an inflow angle. The blade tips are
     kept ``min_tip_immersion`` under the still surface, and a propeller in line
     with a foil strut ``min_strut_gap`` diameters clear of it fore and aft.
+
+    ``hull`` may also be a camber ``HullFamily`` (``hydrosandbox.hull.camber``): its
+    blend weights then become design variables too (a slider ``blend_t`` for two
+    hulls, else ``blend_w0, blend_w1, ...`` on the simplex), starting from
+    ``blend_start`` (default: the family's centroid). The hull inside the solve is
+    the family's polynomial interpolant; the solution is re-evaluated on the exact
+    blend, swept from camber's blended control points, which is returned as
+    ``"hull"`` with the weights as ``"blend_weights"``.
+
+    ``cg_level_at_rest=True`` puts the centre of gravity (fore and aft) wherever the
+    hull floats level at rest under ``mass``: at its centre of buoyancy at the
+    level sinkage that displaces it. The CG then follows the hull when the hull is a
+    variable (a blend), which ``xyz_cg[0]`` and ``cg_range`` are ignored for.
     """
+    from hydrosandbox.hull.camber import HullFamily
+
+    family = hull if isinstance(hull, HullFamily) else None
+    if family is not None:
+        blend_start = list(blend_start) if blend_start is not None else [1.0 / family.n_hulls] * family.n_hulls
+        hull = family.at(blend_start)
+    n_hulls = 1 if (craft_options or {}).get("demihull_spacing") is None else 2
+
+    def level_at_rest(h, m):
+        """Level sinkage at which hull(s) `h` displace mass `m`, and the LCB there."""
+        from scipy.optimize import brentq
+
+        volume = m / water.density() / n_hulls
+        s0 = brentq(
+            lambda s_: float(h.hydrostatics(s_, 0.0, (0.0, 0.0))["volume"]) - volume, -0.5, 0.5, xtol=1e-7
+        )
+        return s0, float(h.hydrostatics(s0, 0.0, (0.0, 0.0))["x_cb"])
+
+    if cg_level_at_rest:
+        rest_start, x_cg_start = level_at_rest(hull, mass)
+        xyz_cg = [x_cg_start, xyz_cg[1], xyz_cg[2]]
+        cg_range = None
     with_foils = start is not None
     with_assembly = with_foils or pods is not None
     n_pods = 0 if pods is None else (1 if (craft_options or {}).get("demihull_spacing") is None else 2)
@@ -684,6 +723,27 @@ def optimize(
             lo, hi = (bounds or {}).get(name, limits)
             design[name] = opti.variable(init_guess=start[name], lower_bound=lo, upper_bound=hi)
         rpm = pods["max_rpm"] * opti.variable(init_guess=0.92, lower_bound=0.2, upper_bound=1.0)
+    blend_constraints = []
+    if family is not None:
+        # The blend: the hull inside the solve becomes the family's interpolant at
+        # variable weights, and so does everything built from it.
+        if family.n_hulls == 2:
+            design["blend_t"] = opti.variable(init_guess=blend_start[1], lower_bound=0.0, upper_bound=1.0)
+            blend_weights = [1.0 - design["blend_t"], design["blend_t"]]
+        else:
+            free = [
+                opti.variable(init_guess=blend_start[i], lower_bound=0.0, upper_bound=1.0)
+                for i in range(family.n_hulls - 1)
+            ]
+            design.update({f"blend_w{i}": w for i, w in enumerate(free)})
+            blend_weights = free + [1.0 - sum(free)]
+            blend_constraints.append(blend_weights[-1] >= 0.0)
+        hull = family.at(blend_weights)
+        common["hull"] = hull
+        for key in ("hull_dynamics", "hull_wave_amplitude"):
+            if key in common:
+                common[key] = hull.rebind(common[key])
+        layout_options["hull"] = hull
     interacting = pods is not None and propeller_interaction
     wake_fraction = inflow_angle = 0.0
     if interacting:
@@ -711,6 +771,14 @@ def optimize(
             upper_bound=thrust_height_range[1],
         )
 
+    rest_constraints = []
+    if cg_level_at_rest:
+        rest_sinkage = opti.variable(init_guess=rest_start, lower_bound=-0.5, upper_bound=0.5)
+        at_rest = hull.hydrostatics(rest_sinkage, 0.0, (0.0, 0.0))
+        loading["x_cg"] = at_rest["x_cb"]
+        rest_constraints.append(
+            n_hulls * at_rest["volume"] * water.density() / loading["mass"] == 1.0
+        )
     sinkage = opti.variable(init_guess=at_start["sinkage"], lower_bound=-0.4, upper_bound=0.2)
     trim = opti.variable(
         init_guess=float(onp.clip(at_start["trim"], *trim_bounds)),
@@ -796,7 +864,7 @@ def optimize(
     constraints = [
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
-    ]
+    ] + blend_constraints + rest_constraints
     if pods is not None:
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
@@ -892,6 +960,16 @@ def optimize(
 
     solved = {name: float(sol(var)) for name, var in design.items()}
     solved_loading = {name: value(v) for name, v in loading.items()}
+    solved_weights = None
+    if family is not None:
+        # Re-evaluate on the exact blend, not the interpolant.
+        solved_weights = [float(onp.clip(sol(w), 0.0, 1.0)) for w in blend_weights]
+        solved_weights = [w / sum(solved_weights) for w in solved_weights]
+        hull = family.exact(solved_weights)
+        exact_common = dict(exact_common, hull=hull)
+        if cg_level_at_rest:
+            solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
+        layout_options["hull"] = hull
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
     final = CraftBuildup(
@@ -952,7 +1030,10 @@ def optimize(
                 wake_fraction_viscous=scalar(seen["wake_fraction_viscous"]),
                 propeller_inflow_angle=angle_solved,
             )
-    return {"design": solved, "loading": solved_loading, "results": final}
+    outcome = {"design": solved, "loading": solved_loading, "results": final}
+    if family is not None:
+        outcome.update(blend_weights=solved_weights, hull=hull)
+    return outcome
 
 
 def optimize_task(task: tuple, freedoms: dict) -> dict | None:
@@ -999,6 +1080,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--velocity", type=float, default=4.5, help="speed [m/s]")
     parser.add_argument("--hull-record", type=str, default=None, help="boatmath hull JSONL")
+    parser.add_argument("--camber", type=str, default=None, help="camber hull document (JSON)")
     parser.add_argument("--mass", type=float, default=None, help="all-up mass [kg]")
     parser.add_argument("--lcg", type=float, default=None, help="CG, metres aft of the bow")
     parser.add_argument("--vcg", type=float, default=0.0, help="CG height above the waterline [m]")
@@ -1027,7 +1109,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     water = hsb.Water.seawater()
-    if args.hull_record:
+    if args.camber:
+        hull = Hull.from_camber(args.camber, n_stations=61, n_levels=41)
+    elif args.hull_record:
         with open(args.hull_record) as f:
             record = next(r for r in map(json.loads, f) if r.get("type") == "hull")
         hull = Hull.from_boatmath_geometry(
