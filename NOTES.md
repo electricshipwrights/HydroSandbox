@@ -78,6 +78,28 @@ solves, 3 starting layouts, free blend from t=0.4 plus fixed exact blends t =
   from the foil (unloading plus wave interference: wave 109 -> 49 N). Thin-ship
   at 4 deg trim on a 6 m hull is a stretch; treat the trim gain as optimistic.
 
+Generated hulls (branch `camber-generator`): `hydrosandbox/hull/camber/generate.py`
+draws a camber document from 13 numbers (plan: half-beam, its position,
+transom ratio, entry angle; sections per end: topside depth, flare, superellipse
+bottom depth/width/exponent), deck flat, transom square; `with_displacement` sets
+the waterline. `examples/design_camber_demihull.py`: differential evolution (48
+hulls/generation, 12 workers, ~0.26 GB each) then pattern search, on drag at
+speed + penalties, each candidate an exact evaluation (~10 s).
+- NACRA target (500 kg cat, 2.2 m spacing, 6 m/s, transom drag on): NACRA itself
+  401 N, GM_L 15.1 / 11.8 m (6 / 1 m/s). Limits: D <= 400 N (4 kW at 60%),
+  GM_L >= NACRA's, draft <= 0.30, freeboard >= 0.35, reserve >= 3.0x and
+  >= 0.25 m^3 above water forward, transom <= 0.08 m immersed.
+- First section model (one superellipse sheer to keel) stalled at 455 N: the
+  freeboard ate the section depth, deep narrow V-ish underwater (S too high).
+- Topsides + bottom section, 1.6 h (`local/gen/search2.*`): 405.6 N (wave 83,
+  viscous 295, transom 28), GM_L 15.5 / 12.0, draft 0.24, L/B_wl 16.4, S 3.10,
+  everything met except power (1.4% over). Bounds active: transom_ratio 1.0,
+  x_max_beam 0.35, flare 0: wants a wide parallel-sided boxy stern (generator
+  can't go wider aft than max beam). DE stalled after gen ~24; polish gave 4 N.
+- Ideas: let the stern be wider than amidships / max beam further aft; a mid
+  station; finite-difference SQP from this point; a HullFamily of generated
+  hulls around it for joint hull + foil optimization.
+
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
   through the node interpolant. Freeing individual control points (beyond blend
