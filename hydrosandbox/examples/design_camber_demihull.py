@@ -32,21 +32,56 @@ from hydrosandbox.hull.camber.generate import DemihullParameters, demihull, with
 GRID = dict(n_stations=61, n_levels=41)
 WAVE = (3.0, 8.0, 0.01)
 
-#: The searched numbers and their ranges (the rest of ``DemihullParameters`` fixed).
-BOUNDS = {
-    "half_beam": (150.0, 300.0),
-    "x_max_beam": (0.35, 0.65),
-    "transom_ratio": (0.2, 1.0),
+#: The searched numbers and their ranges; per-station ones are ``name.i``.
+PLAN_BOUNDS = {
+    "transom_half_beam": (100.0, 300.0),
+    "mid_half_beam": (120.0, 300.0),
+    "x_mid": (0.25, 0.70),
     "entry_angle": (3.0, 20.0),
-    "flare": (0.0, 80.0),
-    "side_aft": (150.0, 600.0),
-    "side_fwd": (150.0, 600.0),
-    "bottom_aft": (40.0, 450.0),
-    "bottom_fwd": (40.0, 450.0),
-    "width_ratio": (0.5, 1.5),
-    "shape_aft": (1.2, 5.0),
-    "shape_fwd": (1.2, 5.0),
+    "flare": (0.0, 60.0),
+    "keel_reach": (150.0, 450.0),
 }
+STATION_BOUNDS = {"side": (150.0, 600.0), "bottom": (40.0, 400.0), "fullness": (0.0, 1.0)}
+#: Interior stations' positions (plan parameter), by station count.
+U_BOUNDS = {3: [(0.15, 0.85)], 4: [(0.10, 0.50), (0.50, 0.90)]}
+
+
+def bounds(n_stations: int = 3) -> dict:
+    """Every searched number and its range, for hulls of ``n_stations`` stations."""
+    out = dict(PLAN_BOUNDS)
+    out.update({f"station_u.{i + 1}": r for i, r in enumerate(U_BOUNDS[n_stations])})
+    for name, r in STATION_BOUNDS.items():
+        out.update({f"{name}.{i}": r for i in range(n_stations)})
+    return out
+
+
+def nest(flat: dict) -> dict:
+    """Flat ``name.i`` numbers to ``DemihullParameters`` fields (station_u gets its ends)."""
+    out, per = {}, {}
+    for k, v in flat.items():
+        if "." in k:
+            name, i = k.split(".")
+            per.setdefault(name, {})[int(i)] = float(v)
+        else:
+            out[k] = float(v)
+    for name, d in per.items():
+        if name == "station_u":
+            out[name] = (0.0, *[d[i] for i in sorted(d)], 1.0)
+        else:
+            out[name] = tuple(d[i] for i in sorted(d))
+    return out
+
+
+def flatten(params: dict, keys) -> dict:
+    """``DemihullParameters`` fields (as from ``asdict``) to the flat numbers ``keys``."""
+    out = {}
+    for k in keys:
+        if "." in k:
+            name, i = k.split(".")
+            out[k] = float(params[name][int(i)])
+        else:
+            out[k] = float(params[k])
+    return out
 
 
 def _f(v) -> float:
@@ -102,7 +137,7 @@ def geometry(hull: Hull) -> dict:
 def evaluate(params: dict, mass: float = 500.0, spacing: float = 2.2, speed: float = 6.0) -> dict:
     """One candidate: its document, geometry and performance (or the error that stopped it)."""
     t0 = time.time()
-    p = DemihullParameters().replace(**params)
+    p = DemihullParameters().replace(**nest(params))
     res = {"params": asdict(p)}
     try:
         doc = with_displacement(demihull(p), 0.5 * mass / hsb.Water.seawater().density(), **GRID)
@@ -141,6 +176,10 @@ def merit(res: dict, limits: dict, weight: float = 20.0) -> float:
     if "error" in v:
         return 1e6
     return res["cruise"]["D"] * (1.0 + weight * sum(v.values()))
+
+
+#: The search's ranges (``bounds(n)``; set by ``main``).
+BOUNDS = bounds(3)
 
 
 def to_unit(params: dict) -> onp.ndarray:
@@ -260,9 +299,12 @@ def main():
     ap.add_argument("--reserve-ratio", type=float, required=True, help="min volume to deck / displacement")
     ap.add_argument("--reserve-fwd", type=float, required=True, help="min above-water volume, fwd half [m^3]")
     ap.add_argument("--transom-immersion", type=float, default=0.08, help="max at rest [m]")
+    ap.add_argument("--stations", type=int, default=3, choices=(3, 4))
+    ap.add_argument("--start", help="a .best.json from an earlier search to start from")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=40, help="pattern-search rounds (after evolution)")
     ap.add_argument("--generations", type=int, default=40, help="differential-evolution generations (0: none)")
+    ap.add_argument("--popsize", type=int, default=3, help="population per searched number")
     ap.add_argument("--out", default="design_camber_demihull.json")
     a = ap.parse_args()
     limits = dict(
@@ -275,11 +317,19 @@ def main():
     best_path = a.out.replace(".json", ".camber.json")  # kept current as the search improves
     t0 = time.time()
     log = lambda s: print(f"[{time.time() - t0:6.0f}s] {s}", flush=True)
-    start = {k: getattr(DemihullParameters(), k) for k in BOUNDS}
+    global BOUNDS
+    BOUNDS = bounds(a.stations)
+    p0 = DemihullParameters()
+    if a.stations == 4:
+        p0 = p0.replace(station_u=(0.0, 0.3, 0.7, 1.0), side=(330.0, 400.0, 450.0, 480.0),
+                        bottom=(180.0, 230.0, 230.0, 220.0), fullness=(0.6, 0.5, 0.45, 0.4))
+    start = flatten(asdict(p0), BOUNDS)
+    if a.start:
+        start = flatten(json.load(open(a.start))["params"], BOUNDS)
     if a.generations:
-        best, history = evolve(start, limits, a.jobs, a.generations, log=log, history=history, case=case,
+        best, history = evolve(start, limits, a.jobs, a.generations, popsize=a.popsize, log=log, history=history, case=case,
                                best_path=best_path)
-        start = {k: best["params"][k] for k in BOUNDS}
+        start = flatten(best["params"], BOUNDS)
     best, history = pattern_search(start, limits, a.jobs, step=0.05 if a.generations else 0.15,
                                    max_rounds=a.rounds, log=log, history=history, case=case, best_path=best_path)
     log(f"best: {summary(best)}")

@@ -245,18 +245,33 @@ def test_surface_patches_follow_the_sweep():
 
 
 def test_generated_demihull():
-    """A hull from numbers alone: valid, square-sterned, at the asked displacement."""
-    from hydrosandbox.hull.camber.generate import DemihullParameters, demihull, plan_polygon, with_displacement
-    from hydrosandbox.hull.camber.curves import PlanCurve
+    """A hull from numbers alone: valid, few points, square-sterned, at the asked displacement."""
+    from hydrosandbox.hull.camber.generate import DemihullParameters, demihull, with_displacement
 
-    p = DemihullParameters(half_beam=220.0, entry_angle=7.0, shape_aft=3.0)
-    widest = max(PlanCurve(plan_polygon(p)).at(float(u))[1] for u in onp.linspace(0, 1, 401))
-    assert widest == pytest.approx(p.half_beam, rel=1e-9)
-    doc = with_displacement(demihull(p), 0.25, n_stations=41, n_levels=25)
-    again = parse_document(json.loads(doc.to_json()))  # a valid version-2 document
-    hull = Hull.from_camber(again, n_stations=41, n_levels=25)
-    assert float(hull.hydrostatics()["volume"]) == pytest.approx(0.25, rel=2e-3)
-    assert hull.length == pytest.approx(p.length / 1000.0, rel=1e-3)
-    assert hull.has_transom
-    # Narrower stations are cut nearer the sheer: the keel rises to the stem.
-    assert float(hull.keel_height(hull.stations[1])) > float(hull.keel_height(hull.stations[20]))
+    for p in (
+        DemihullParameters(),
+        DemihullParameters(station_u=(0.0, 0.3, 0.7, 1.0), side=(300.0, 380.0, 450.0, 480.0),
+                           bottom=(150.0, 220.0, 230.0, 200.0), fullness=(0.9, 0.6, 0.4, 0.2)),
+    ):
+        doc = with_displacement(demihull(p), 0.25, n_stations=41, n_levels=25)
+        assert doc.topology == (5, 3, 4, p.n_stations)
+        again = parse_document(json.loads(doc.to_json()))  # a valid version-2 document
+        hull = Hull.from_camber(again, n_stations=41, n_levels=25)
+        assert float(hull.hydrostatics()["volume"]) == pytest.approx(0.25, rel=2e-3)
+        assert hull.length == pytest.approx(p.length / 1000.0, rel=1e-3)
+        assert hull.has_transom
+        # Narrower stations are cut nearer the sheer: the keel rises to the stem.
+        assert float(hull.keel_height(hull.stations[1])) > float(hull.keel_height(hull.stations[20]))
+        # The bow closes: nothing at the stem swings outboard of the centreline.
+        stem = SweptHull(doc).swept_section(1.0, 8)["pts"]
+        assert stem is None or onp.abs(stem[:, 1]).max() < 0.5
+
+
+def test_generated_bow_closes_with_a_smooth_foot():
+    """A section whose smooth topsides would bulge outboard gets just enough knuckle."""
+    from hydrosandbox.hull.camber.generate import inboard, outboard_bulge, section_points
+
+    pts = section_points(side=500.0, bottom=100.0, fullness=0.2, flare=38.0, reach=298.0)
+    assert outboard_bulge(pts) > 5.0
+    fixed = inboard(pts)
+    assert outboard_bulge(fixed) <= 0.05 and 0.0 < fixed[1].k <= 1.0
