@@ -79,26 +79,45 @@ solves, 3 starting layouts, free blend from t=0.4 plus fixed exact blends t =
   at 4 deg trim on a 6 m hull is a stretch; treat the trim gain as optimistic.
 
 Generated hulls (branch `camber-generator`): `hydrosandbox/hull/camber/generate.py`
-draws a camber document from 13 numbers (plan: half-beam, its position,
-transom ratio, entry angle; sections per end: topside depth, flare, superellipse
-bottom depth/width/exponent), deck flat, transom square; `with_displacement` sets
-the waterline. `examples/design_camber_demihull.py`: differential evolution (48
-hulls/generation, 12 workers, ~0.26 GB each) then pattern search, on drag at
-speed + penalties, each candidate an exact evaluation (~10 s).
+draws a camber document the way hand-drawn ones are: a five-point sheer plan
+(transom half-beam, a point square to it, a mid point and its position, a point
+setting the entry angle, the stem), flat sheer, vertical transom, and 3 or 4
+stations of four points each (sheer knuckle, topsides' foot, bilge point, keel
+knuckle past the centreline). Per station: `side`, `bottom`, `fullness`; shared:
+`flare`, `keel_reach`. The foot gets the least knuckle that keeps the topsides
+inboard of the sheer (`inboard`), else Catmull-Rom overshoot leaves the bow open
+(seen on the first 3-station result: 37 mm stem face). `with_displacement` sets
+the waterline. `examples/design_camber_demihull.py`: differential evolution
+(`--stations 3|4`, workers via `hsb.parallel_map`) then pattern search, on drag
+at speed + penalties, each candidate an exact evaluation.
 - NACRA target (500 kg cat, 2.2 m spacing, 6 m/s, transom drag on): NACRA itself
   401 N, GM_L 15.1 / 11.8 m (6 / 1 m/s). Limits: D <= 400 N (4 kW at 60%),
   GM_L >= NACRA's, draft <= 0.30, freeboard >= 0.35, reserve >= 3.0x and
   >= 0.25 m^3 above water forward, transom <= 0.08 m immersed.
-- First section model (one superellipse sheer to keel) stalled at 455 N: the
-  freeboard ate the section depth, deep narrow V-ish underwater (S too high).
-- Topsides + bottom section, 1.6 h (`local/gen/search2.*`): 405.6 N (wave 83,
-  viscous 295, transom 28), GM_L 15.5 / 12.0, draft 0.24, L/B_wl 16.4, S 3.10,
-  everything met except power (1.4% over). Bounds active: transom_ratio 1.0,
-  x_max_beam 0.35, flare 0: wants a wide parallel-sided boxy stern (generator
-  can't go wider aft than max beam). DE stalled after gen ~24; polish gave 4 N.
-- Ideas: let the stern be wider than amidships / max beam further aft; a mid
-  station; finite-difference SQP from this point; a HullFamily of generated
-  hulls around it for joint hull + foil optimization.
+- Earlier generators: one superellipse section stalled at 455 N; topsides +
+  superellipse (13 numbers, 2 stations) 405.6 N, 1.4% over power.
+- Four-point generator, 30 DE generations + 30 pattern rounds, 10 jobs each,
+  ~4 h (`local/gen/search4_s3.*`, `search4_s4.*`, plots `search4_s*.png`). All
+  limits met by both:
+
+  | drag [N]       | 3 m/s | 4.5 m/s | 6 m/s | GM_L 6 m/s | L/B_wl | S [m^2] |
+  |----------------|-------|---------|-------|------------|--------|---------|
+  | NACRA          | 134.3 | 281.6   | 400.6 | 15.1       | 14.8   | 3.00    |
+  | 3 stations     | 118.9 | 261.7   | 375.5 | 17.9       | 13.8   | 2.88    |
+  | 4 stations     | 121.7 | 263.2   | 376.2 | 18.6       | 13.8   | 2.89    |
+
+  6% under the NACRA at 6 m/s, 11% at 3 m/s (only 6 m/s was optimized). Less
+  wave drag (78 vs 103 N) and wetted area, slightly more transom drag. Draft
+  0.21, freeboard 0.42-0.47. Bounds active: mid_half_beam at 120 mm and x_mid at
+  0.25 (lower bounds) with the forward plan point at the transom's half-beam:
+  the search wants a plan widest at the transom and forward, with a slight
+  hollow between; 3-station: forward station side 600 (max), bottom 40 (min).
+  4-station result has a cut-away forefoot (keel rises in the last 0.15 m).
+  4 stations gave nothing over 3.
+- Ideas: re-parameterize the plan (beam at transom / max beam position) since
+  the mid point is now pinned to its bound; a multi-speed objective; finite-
+  difference SQP from these points; a HullFamily of generated hulls around them
+  for joint hull + foil optimization.
 
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
