@@ -192,3 +192,93 @@ def with_displacement(doc: CamberHull, volume: float, iterations: int = 3, **hul
         if abs(s) < 1e-4:
             break
     return doc
+
+
+def _shifted(p: DemihullParameters, shift: dict) -> DemihullParameters:
+    """``p`` with ``shift`` added: keys are fields, or ``field.i`` for a station's value."""
+    changes = {}
+    for key, delta in shift.items():
+        name, _, i = key.partition(".")
+        if i:
+            values = list(changes.get(name, getattr(p, name)))
+            values[int(i)] += delta
+            changes[name] = tuple(values)
+        else:
+            changes[name] = changes.get(name, getattr(p, name)) + delta
+    return p.replace(**changes)
+
+
+def simplex_around(base: DemihullParameters, steps: dict) -> list[DemihullParameters]:
+    """
+    ``len(steps) + 1`` hulls whose centroid is ``base``: the first has every
+    stepped number lowered by its step, and each other raises one of them by
+    ``len(steps) + 1`` steps from there. Blends of them reach each number from
+    ``base - step`` to ``base + step`` with the others held at ``base`` (and
+    further when the others move too).
+    """
+    d = len(steps)
+    corner = _shifted(base, {k: -v for k, v in steps.items()})
+    return [corner] + [_shifted(corner, {k: (d + 1) * v}) for k, v in steps.items()]
+
+
+class GeneratedFamily:
+    """
+    A blend family around one generated hull, so that its numbers become smooth
+    design variables of a gradient-based solve (``HullFamily``) without the sweep
+    being differentiated.
+
+    The members are generated hulls at the corners of a simplex around ``base``
+    (``simplex_around``), all with one design waterline (``base``'s, at
+    ``volume``). Blending control points is linear, so a blend is close to the
+    hull generated at the blended numbers (``parameters``), though not equal to
+    it: the bilge point is bilinear in ``fullness`` and the depths, the forward
+    plan point is clamped to the widest beam, and the foot knuckle and keel reach
+    are set by the generator per hull.
+
+    ``family`` is the ``HullFamily``; ``parameters(weights)`` the numbers a blend
+    stands for, ``document(weights)`` the blend itself.
+    """
+
+    def __init__(self, base: DemihullParameters, steps: dict, volume: float | None = None,
+                 name: str = "generated family", **family_kwargs):
+        from hydrosandbox.hull.camber.blended import HullFamily
+
+        self.base = base
+        self.steps = dict(steps)
+        self.vertices = simplex_around(base, self.steps)
+        grid = {k: family_kwargs[k] for k in ("n_stations", "n_levels") if k in family_kwargs}
+        reference = demihull(base, name="base")
+        if volume is not None:
+            reference = with_displacement(reference, volume, **grid)
+        docs = []
+        for i, v in enumerate(self.vertices):
+            doc = demihull(v, name=f"{name} vertex {i}")
+            doc.waterline = reference.waterline
+            docs.append(doc)
+        self.family = HullFamily(docs, name=name, **family_kwargs)
+
+    @property
+    def n_hulls(self) -> int:
+        return len(self.vertices)
+
+    def parameters(self, weights) -> DemihullParameters:
+        """The numbers a blend stands for: the weighted mean of the vertices' (stepped ones only)."""
+        total = float(sum(weights))
+        w = [float(x) / total for x in weights]
+        shift = {}
+        for key in self.steps:
+            name, _, i = key.partition(".")
+            values = [getattr(v, name)[int(i)] if i else getattr(v, name) for v in self.vertices]
+            base = getattr(self.base, name)[int(i)] if i else getattr(self.base, name)
+            shift[key] = sum(wk * x for wk, x in zip(w, values)) - base
+        return _shifted(self.base, shift)
+
+    def weights(self, shift: dict | None = None) -> list[float]:
+        """The barycentric weights of ``base`` plus ``shift`` (in stepped numbers; default the centroid)."""
+        d = len(self.steps)
+        t = [(shift or {}).get(k, 0.0) / v for k, v in self.steps.items()]  # in steps from base
+        upper = [(ti + 1.0) / (d + 1) for ti in t]
+        return [1.0 - sum(upper)] + upper
+
+    def document(self, weights, name: str = "") -> CamberHull:
+        return self.family.document(weights, name=name)

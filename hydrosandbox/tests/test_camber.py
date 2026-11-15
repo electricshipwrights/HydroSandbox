@@ -275,3 +275,29 @@ def test_generated_bow_closes_with_a_smooth_foot():
     assert outboard_bulge(pts) > 5.0
     fixed = inboard(pts)
     assert outboard_bulge(fixed) <= 0.05 and 0.0 < fixed[1].k <= 1.0
+
+
+def test_generated_family():
+    """A blend family around a generated hull: its centroid is the hull, its weights move the numbers."""
+    from hydrosandbox.hull.camber.generate import DemihullParameters, GeneratedFamily, demihull, with_displacement
+
+    base = DemihullParameters()
+    steps = {"side.1": 40.0, "transom_half_beam": 15.0}
+    g = GeneratedFamily(base, steps, volume=0.25, n_stations=31, n_levels=21)
+    assert g.n_hulls == 3 and len(g.family.nodes) == 10
+    centroid = g.weights()
+    assert centroid == pytest.approx([1 / 3] * 3)
+    assert g.parameters(centroid) == base
+    # One step along one number, the other held.
+    w = g.weights({"side.1": 40.0})
+    assert min(w) >= -1e-12
+    p = g.parameters(w)
+    assert p.side[1] == pytest.approx(base.side[1] + 40.0) and p.transom_half_beam == pytest.approx(base.transom_half_beam)
+    # The centroid blend is close to the base hull at its displacement: blending is linear in the
+    # control points, but the generator clamps the forward plan point (here at the widest beam).
+    doc = with_displacement(demihull(base), 0.25, n_stations=31, n_levels=21)
+    blend = g.document(centroid)
+    assert blend.waterline == pytest.approx(doc.waterline)
+    for a, b in zip(blend.stations, doc.stations):
+        assert [c for q in a.points for c in (q.n, q.z)] == pytest.approx([c for q in b.points for c in (q.n, q.z)], abs=1e-6)
+    assert float(g.family.at(centroid).hydrostatics()["volume"]) == pytest.approx(0.25, rel=1e-2)
