@@ -361,6 +361,45 @@ class FFDFamily(DesignFamily):
             return list(_onp.asarray(G @ _onp.array([float(v) - self.centre.get(n, 0.0) for n, v in zip(self.names, values)]) + c) >= 0.0)
         return [cas.mtimes(cas.DM(G), d) + cas.DM(c) >= 0]
 
+    def transom_depth(self, values):
+        """
+        Equivalent-rectangle depth [m] of the immersed transom at rest, as
+        ``Hull.transom`` computes it, but straight from the deformed transom
+        section, which is linear in the moves: exact (not interpolated between the
+        nodes) and smooth, for numbers or CasADi expressions in ``names`` order.
+        """
+        import aerosandbox.numpy as np
+        from hydrosandbox.library.free_surface import smooth_submergence_fraction
+
+        lat = self.lattice
+        if not hasattr(self, "_transom_map"):
+            _, y0, z0 = lat.deform(self.centre)
+            jy, jz = [], []
+            for n in self.names:
+                _, ys, zs = lat.deform({**self.centre, n: self.centre.get(n, 0.0) + 1.0})
+                jy.append(ys[-1] - y0[-1])
+                jz.append(zs[-1] - z0[-1])
+            self._transom_map = (y0[-1], _onp.array(jy).T, z0[-1], _onp.array(jz).T)
+        y0, jy, z0, jz = self._transom_map
+        values = self._values(values)
+        d = [v - self.centre.get(n, 0.0) for n, v in zip(self.names, values)]
+        if any(np.is_casadi_type(v, recursive=False) for v in d):
+            import casadi as cas
+
+            dv = cas.vertcat(*d)
+            y = cas.DM(y0) + cas.mtimes(cas.DM(jy), dv)
+            z = cas.DM(z0) + cas.mtimes(cas.DM(jz), dv)
+        else:
+            dv = _onp.array([float(v) for v in d])
+            y, z = y0 + jy @ dv, z0 + jz @ dv
+        f_band = 0.5 * (y[:-1] + y[1:])
+        z_lo, z_hi = z[:-1], z[1:]
+        f_sub, _, _ = smooth_submergence_fraction(z_lo, z_hi, 0.0, transition_thickness=lat.base.waterline_smoothing)
+        area = np.sum(2.0 * f_band * (z_hi - z_lo) * f_sub)
+        softness = 0.02 * max(float(_onp.max(y0)), 1e-6)
+        peak = softness * np.log(np.sum(np.exp(f_band * f_sub / softness)))
+        return area / (2.0 * np.fmax(peak, 1e-9))
+
     def exact(self, values, **kwargs):
         """The deformed hull at ``values``, cut over its own extent."""
         values = self._values(values)
