@@ -276,3 +276,42 @@ Left:
 - Junction drag is buildup-only, cavitation penalty defaults differ, VLM is
   inviscid; HydroLiftingLine is linear despite its docstring.
 - Large copy-adapted overlap with AeroBuildup/VLM/LiftingLine; relies on private ASB methods.
+
+## hydrosandbox.design (branch `design-api`, 2026-11-16)
+
+Generic design-optimization API, from the design doc
+(https://claude.ai/artifact/R5AFVRakAKjaNGC1w4iMoC): `Boat` + `PointMass` loads
+(number / distribution / `Free`), `DesignSpace` (variables + geometry builder),
+`Objective` (maximize, `Cost` with exponent, `AtLeast` / `AtMost` penalties, no
+hard limits beyond balance and bounds), scenarios derived from the loads,
+`optimize()` and `evaluate()`. Tests: `tests/test_design.py` (6, ~100 s).
+
+Done and measured:
+- Model built once as a CasADi function and mapped over scenarios: memory flat
+  (0.9 GB prototype cat, 2.7 GB NACRA with free section, for 1 or 3 scenarios).
+- The solver maximizes the log of the expected utility (the utility itself is
+  flat at zero far past a threshold).
+- Derivatives are supplied in forward mode. Left to itself the solver takes the
+  objective's gradient in reverse, which through the stiffness (already a
+  derivative) is ~6x slower: 67 -> 11 s per iteration on the NACRA case. The
+  gradient and the Jacobian each recompute the same forward Jacobian; sharing it
+  would halve this again.
+- `Cost(reference="baseline")`: reference taken per scenario from a baseline
+  design (bare boat by default).
+- NACRA two-strut, free section, damping x (392/drag)^8, fixed 520 kg: converged
+  in 106 iterations / 22 min; reproduces the earlier optimizer's design family
+  (foil at 95% length, depth 0.80, chord 0.30->0.12, 9.2% thick, carries 49%).
+
+Left:
+- The 3-scenario NACRA run (payload mass uncertain) hit its 1 h limit at 104
+  iterations (35 s each) without converging; the objective collapsed and
+  recovered twice on the way. Not yet understood. Its set-up is also artificial
+  (a 100 kg payload the optimizer may place up to 5 m aft of the centre of
+  buoyancy, i.e. off the boat); real loads are needed.
+- Pod drives and propeller-foil interaction are not ported: propulsion is None
+  or `ThrustAt`. The three layouts are duplicated from the example, which other
+  branches are editing.
+- The prototype's "AD stiffness is quicker than finite differences" was measured
+  under reverse mode and should be re-measured.
+- Design doc still describes maximizing the utility, not its logarithm, and does
+  not mention the baseline reference.
