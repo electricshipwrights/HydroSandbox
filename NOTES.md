@@ -177,9 +177,14 @@ Off `hull-transforms` (TransformedFamily + calibrated transom closure merged in)
   grid + attitude only), batched builders `dynamic_force_tables` /
   `wave_amplitude_tables` (BlendedHull uses them), shared-grid FFD families,
   per-k batched products in `dynamic_force.forms`, `wave_amplitude_batch`
-  (dense per-strip products across hulls). Results identical to per-hull (tests:
-  83 pass). Next speed step: batch `forms` across hulls (dynamic force is now 63
-  of the 97 s); a GPU only after that.
+  (dense per-strip products across hulls), `dynamic_force_batch` (the whole
+  near-field quadrature with a hull axis: shared kernels, stacked contractions,
+  only the real or imaginary part each caller uses, chunks of 8 hulls to stay in
+  cache). Results match per-hull to ~1e-14 (tests: 83 pass). Per attitude for 61
+  hulls, single-threaded: dynamic force ~14 s originally -> 1.0 s (cache) -> 0.45 s
+  quiet / 1.5 s under load (batched; per-hull path 4.5 s under the same load).
+  The batched element-wise work is memory-bandwidth-bound: other jobs on the box
+  slow it 3x. A GPU (FP64-capable) would suit what's left.
 - Driver `local/ffd_optimize.py` (trust region, linear family per step, 7x7
   narrow attitude tables, CG at LCB, GM_L >= 15.1, draft <= 0.30, freeboard >=
   0.35, transom equivalent depth <= 0.065, moves within +-0.12). First attempt:
