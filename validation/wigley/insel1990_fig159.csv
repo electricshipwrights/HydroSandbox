@@ -1,0 +1,22 @@
+# Insel (1990), Fig. 159: wave resistance by tank harmonic, Wigley hull (C2) held fixed, Fn 0.50, monohull and
+# catamarans. Read off the scanned figure against an overlaid grid: +/- 0.01, and the harmonics n >= 3 are
+# too crowded to separate. Ordinate as plotted ("Rw/(U*U)"). Normalisation, inferred (not stated in the thesis):
+# the thesis's own monohull theory curve is half this code's Michell tank harmonic R_n / U^2 [N s^2/m^2], and
+# the measured catamaran curves are per demihull (half the craft's).
+# harmonic angles at Fn 0.5 in the 3.70 m tank: n=0 0 deg, n=1 32.7, n=2 46.5, n=3 53.6
+config,n,measured,thesis_theory,thesis_predicted
+mono,0,0.153,0.138,
+mono,1,0.255,0.190,
+mono,2,0.137,0.105,
+s0.2,0,0.305,0.553,0.300
+s0.2,1,0.440,0.690,0.495
+s0.2,2,0.210,0.275,0.240
+s0.3,0,0.330,0.557,0.305
+s0.3,1,0.400,0.612,0.480
+s0.3,2,0.140,0.095,0.205
+s0.4,0,0.320,0.550,0.305
+s0.4,1,0.400,0.510,0.455
+s0.4,2,0.050,,0.160
+s0.5,0,0.308,,0.300
+s0.5,1,0.255,,0.420
+s0.5,2,0.000,,0.120
