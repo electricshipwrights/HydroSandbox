@@ -138,8 +138,8 @@ def raked(stations, levels, half_breadths, bow_rake: float):
     if _onp.any(_onp.diff(moved, axis=0) <= 0.0):
         raise ValueError(f"bow_rake {bow_rake} folds the forebody over itself")
     new_bow = min(x_bow, float(moved[0].min()))
-    # Same station spacing, stretched to the new extent.
-    x_new = new_bow + (x - x_bow) * (x_end - new_bow) / (x_end - x_bow)
+    # The forebody's stations stretched to the new extent; the afterbody's kept.
+    x_new = _onp.where(x < x_mid, new_bow + (x - x_bow) * (x_mid - new_bow) / (x_mid - x_bow), x)
     f_new = _onp.column_stack(
         [_onp.interp(x_new, moved[:, j], f[:, j], left=0.0, right=f[-1, j]) for j in range(len(z))]
     )
