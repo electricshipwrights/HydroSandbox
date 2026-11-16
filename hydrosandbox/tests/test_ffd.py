@@ -66,3 +66,22 @@ def test_recentred_family_moves_its_centre(lattice):
     assert step.ranges["p1o1y"] == pytest.approx((-0.005, 0.035))
     assert onp.allclose(step.exact({"p1o1y": 0.015, "p2o1y": -0.01}).half_breadths,
                         lattice.hull({"p1o1y": 0.015, "p2o1y": -0.01}).half_breadths)
+
+
+def test_no_fold_constraints_keep_solutions_buildable(lattice):
+    import aerosandbox as asb
+
+    names = lattice.names()
+    fam = FFDFamily(lattice, names, 0.05)
+    assert all(fam.no_fold({}))
+    bad = {f"p{i}i0z": 0.3 for i in range(4)} | {f"p{i}i1z": -0.3 for i in range(4)}
+    assert not all(fam.no_fold(bad))
+    with pytest.raises(ValueError):
+        lattice.hull(bad)
+    # A solve driven toward folding stops where the hull can still be built.
+    opti = asb.Opti()
+    v = [opti.variable(init_guess=0.0, lower_bound=-0.3, upper_bound=0.3) for _ in names]
+    opti.subject_to(fam.no_fold(v))
+    opti.minimize(sum(v[names.index(f"p{i}i1z")] - v[names.index(f"p{i}i0z")] for i in range(4)))
+    sol = opti.solve(verbose=False)
+    lattice.hull({n: float(sol(x)) for n, x in zip(names, v)})

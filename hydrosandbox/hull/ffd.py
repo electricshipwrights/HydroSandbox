@@ -278,6 +278,41 @@ class FFDFamily(DesignFamily):
             ranges, design, name or f"{lattice.base.name} FFD", start,
         )
 
+    def no_fold(self, values, margin: float = 0.25) -> list:
+        """
+        Constraints (on ``values``, numbers or CasADi expressions, in ``names``
+        order) that keep the deformed hull representable as offsets: along every
+        station column the levels stay in order, and along every level the
+        stations do, each gap at least ``margin`` of the base table's. The surface
+        is linear in the moves, so these are linear.
+        """
+        import casadi as cas
+
+        lat = self.lattice
+        if not hasattr(self, "_fold_rows"):
+            x0, _, z0 = lat.deform(self.centre)
+            grads = []
+            for n in self.names:
+                xs, _, zs = lat.deform({**self.centre, n: self.centre.get(n, 0.0) + 1.0})
+                grads.append((xs - x0, zs - z0))
+            on = lat._on_hull
+            zbase = _onp.asarray(lat.base.levels, dtype=float)
+            xbase = _onp.asarray(lat.base.stations, dtype=float)
+            # Gaps up each column, and along each level, on the hull.
+            col = on[:, 1:] | on[:, :-1]
+            row = on[1:, :] | on[:-1, :]
+            g_col = _onp.stack([(gz[:, 1:] - gz[:, :-1])[col] for _, gz in grads], axis=1)
+            g_row = _onp.stack([(gx[1:, :] - gx[:-1, :])[row] for gx, _ in grads], axis=1)
+            c_col = (z0[:, 1:] - z0[:, :-1])[col] - margin * _onp.diff(zbase)[None, :].repeat(len(xbase), 0)[col]
+            c_row = (x0[1:, :] - x0[:-1, :])[row] - margin * _onp.diff(xbase)[:, None].repeat(len(zbase), 1)[row]
+            self._fold_rows = (_onp.vstack([g_col, g_row]), _onp.concatenate([c_col, c_row]))
+        G, c = self._fold_rows
+        values = self._values(values)
+        d = cas.vertcat(*[v - self.centre.get(n, 0.0) for n, v in zip(self.names, values)])
+        if not any(isinstance(v, (cas.MX, cas.SX)) for v in values):
+            return list(_onp.asarray(G @ _onp.array([float(v) - self.centre.get(n, 0.0) for n, v in zip(self.names, values)]) + c) >= 0.0)
+        return [cas.mtimes(cas.DM(G), d) + cas.DM(c) >= 0]
+
     def moves(self, values: Mapping[str, float]) -> dict[str, float]:
         """All the lattice's moves at ``values`` of this family's variables."""
         return {**self.centre, **{k: float(v) for k, v in values.items()}}
