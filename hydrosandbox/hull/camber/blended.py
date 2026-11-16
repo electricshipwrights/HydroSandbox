@@ -167,6 +167,14 @@ class BlendedHull:
         def method(*args, **kwargs):
             if name in self._FROM_SECTIONS and kwargs.get("sections") is not None:
                 return first(*args, **kwargs)
+            if name in ("dynamic_force_table", "wave_amplitude_table"):
+                # Every node needs one (tables are built once and rebound to other
+                # weights): build them together, attitude by attitude, so nodes on
+                # a shared grid share the expensive kernels.
+                from hydrosandbox.hull import hull as _hull
+
+                tables = getattr(_hull, name + "s")(self.nodes, *args, **kwargs)
+                return _mix(tables, self.basis)
             # Tables are built once and rebound to other weights, so every node needs one.
             every = name.endswith("_table")
             active = [(b, n) for b, n in zip(self.basis, self.nodes) if every or not _is_zero(b)]

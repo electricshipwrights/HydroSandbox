@@ -168,23 +168,36 @@ class FFDLattice:
         wet = _onp.clip((waterline - lo) / _onp.fmax(hi - lo, 1e-12), 0.0, 1.0)
         return float(2.0 * _onp.sum(area * wet * on))
 
-    def hull(self, values: Mapping[str, float] | None = None, name: str | None = None):
-        """The deformed hull, cut back into an offset table over its own extent."""
+    def extent(self, values: Mapping[str, float] | None = None, surface=None) -> dict[str, float]:
+        """The deformed hull's bow ``x``, transom plane ``x``, keel ``z`` and deck ``z``."""
+        h = self.base
+        X, _, Z = surface if surface is not None else self.deform(values)
+        on = self._on_hull
+        z_base = _onp.asarray(h.levels, dtype=float)
+        transom = h.half_breadths[-1] > 0.0
+        wet = transom & (z_base < 0.0)
+        pick = wet if wet.any() else (transom if transom.any() else _onp.ones_like(transom))
+        return dict(x_bow=float(X[on].min()), x_end=float(X[-1, pick].mean()),
+                    z_keel=float(Z[on].min()), z_deck=float(Z[on].max()))
+
+    def hull(self, values: Mapping[str, float] | None = None, name: str | None = None,
+             extent: Mapping[str, float] | None = None):
+        """
+        The deformed hull, cut back into an offset table over its own extent, or
+        over a given ``extent`` (``extent()``'s keys: hulls cut over the same one
+        share their grid, and so their table kernels). Its own ``draft`` and
+        ``freeboard`` (keel and deck relative to the design waterline) are kept
+        as attributes either way.
+        """
         from hydrosandbox.hull.hull import Hull
 
         h = self.base
         X, Y, Z = self.deform(values)
         x_base = _onp.asarray(h.stations, dtype=float)
         z_base = _onp.asarray(h.levels, dtype=float)
-        on = self._on_hull
-
-        # Extent: bow to the transom's plane, keel to deck.
-        x_bow = float(X[on].min())
-        transom = h.half_breadths[-1] > 0.0
-        wet = transom & (z_base < 0.0)
-        pick = wet if wet.any() else (transom if transom.any() else _onp.ones_like(transom))
-        x_end = float(X[-1, pick].mean())
-        z_keel, z_deck = float(Z[on].min()), float(Z[on].max())
+        own = self.extent(surface=(X, Y, Z))
+        e = dict(own, **(extent or {}))
+        x_bow, x_end, z_keel, z_deck = e["x_bow"], e["x_end"], e["z_keel"], e["z_deck"]
 
         # The base spacing, mapped onto the new extent (below and above the waterline
         # separately, so a level at z = 0 stays there).
@@ -233,6 +246,8 @@ class FFDLattice:
             result.wetted_surface_scale = h.wetted_surface_scale * (self.surface_area(values) / direct0) / (table / table0)
         else:
             result.wetted_surface_scale = h.wetted_surface_scale
+        result.draft = -own["z_keel"]
+        result.freeboard = own["z_deck"]
         return result
 
 
@@ -251,13 +266,16 @@ class FFDFamily(DesignFamily):
         or ``"quadratic"``.
     name : The family's name.
     limit : Bound on every move [m], whatever the centre (ranges are clipped to it).
+    shared_grid : Cut every node over one common extent (default), so their
+        attitude tables share kernels and build together much faster; ``exact``
+        still cuts over the hull's own extent.
 
     ``exact(values)`` and the nodes are ``lattice.hull(centre | values)``.
     """
 
     def __init__(self, lattice: FFDLattice, names: Sequence[str], half_width: float | Mapping[str, float] = 0.05,
                  centre: Mapping[str, float] | None = None, design: str = "linear", name: str | None = None,
-                 limit: float | None = None):
+                 limit: float | None = None, shared_grid: bool = True):
         self.lattice = lattice
         self.limit = limit
         self.centre = dict(centre or {})
@@ -273,10 +291,23 @@ class FFDFamily(DesignFamily):
                     lo, hi = (hi - 1e-6, hi) if c > 0 else (lo, lo + 1e-6)
             ranges[n] = (lo, hi)
         start = {n: self.centre.get(n, 0.0) for n in names}
-        super().__init__(
-            lambda values, node_name: lattice.hull({**self.centre, **values}, name=node_name),
-            ranges, design, name or f"{lattice.base.name} FFD", start,
-        )
+        self.shared_grid = shared_grid
+        self._extent = None
+
+        def make_hull(values, node_name):
+            if not shared_grid:
+                return lattice.hull({**self.centre, **values}, name=node_name)
+            if self._extent is None:
+                # One grid for every node: the family's furthest bow, deepest keel
+                # and highest deck, and the centre's transom plane.
+                each = [lattice.extent({**self.centre, **p}) for p in self.node_parameters]
+                self._extent = dict(
+                    x_bow=min(e["x_bow"] for e in each), z_keel=min(e["z_keel"] for e in each),
+                    z_deck=max(e["z_deck"] for e in each), x_end=lattice.extent(self.centre)["x_end"],
+                )
+            return lattice.hull({**self.centre, **values}, name=node_name, extent=self._extent)
+
+        super().__init__(make_hull, ranges, design, name or f"{lattice.base.name} FFD", start)
 
     def no_fold(self, values, margin: float = 0.25) -> list:
         """
@@ -313,6 +344,12 @@ class FFDFamily(DesignFamily):
             return list(_onp.asarray(G @ _onp.array([float(v) - self.centre.get(n, 0.0) for n, v in zip(self.names, values)]) + c) >= 0.0)
         return [cas.mtimes(cas.DM(G), d) + cas.DM(c) >= 0]
 
+    def exact(self, values, **kwargs):
+        """The deformed hull at ``values``, cut over its own extent."""
+        values = self._values(values)
+        return self.lattice.hull(self.moves(dict(zip(self.names, values))),
+                                 name=kwargs.pop("name", f"{self.name} exact"))
+
     def moves(self, values: Mapping[str, float]) -> dict[str, float]:
         """All the lattice's moves at ``values`` of this family's variables."""
         return {**self.centre, **{k: float(v) for k, v in values.items()}}
@@ -322,4 +359,4 @@ class FFDFamily(DesignFamily):
         """The same family centred on ``values`` (a trust-region step)."""
         hw = half_width if half_width is not None else {n: 0.5 * (hi - lo) for n, (lo, hi) in self.ranges.items()}
         return FFDFamily(self.lattice, self.names, hw, self.moves(values), design or self.design, self.name,
-                         self.limit)
+                         self.limit, self.shared_grid)
