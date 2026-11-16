@@ -118,6 +118,21 @@ at speed + penalties, each candidate an exact evaluation.
   the mid point is now pinned to its bound; a multi-speed objective; finite-
   difference SQP from these points; a HullFamily of generated hulls around them
   for joint hull + foil optimization.
+- `GeneratedFamily` (generate.py): a blend family on a simplex of generator
+  variants around a base. Joint hull + foil at 6 m/s (`local/gen/joint.py`,
+  family on side.1/bottom.1/transom_half_beam): with transom drag the foil
+  (3.0 m aft of bow, span 0.9, chord 0.12, 20% lift) takes the base hull from
+  375.8 to 352.3 N; the family alone moved only 1 N, and family + foil found
+  no solution from start 1. These results came from the uncalibrated closure.
+- Transom closure validation (2026-11-16): NPL 4b/5b/6b rebuilt from Report 71
+  (`local/npl/`, data in `../HydroSandbox/local/refs/data/`, gitignored). The
+  old closure overpredicted wave drag 2-7x at low Fn. Recalibrated (no closure
+  while wet, 0.3 lambda hollow once dry, Fn_T 2.0-2.5) on branch
+  `transom-closure-calibration`, PR #3. With 0.3 lambda the 3-station hull is
+  still 6% under NACRA at 6 m/s, 7% at 3 m/s.
+- Next: once PR #3 is merged, rebase, then rerun the generator search and the
+  families on the new closure. Consider capping transom aspect: generated
+  transoms are ~7 beam/immersion vs ~3 on the NPL hulls (extrapolation).
 
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
