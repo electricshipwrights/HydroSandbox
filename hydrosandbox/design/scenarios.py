@@ -58,9 +58,13 @@ def _slots(boat: Boat) -> list[tuple[int, str]]:
 
 def _state(boat: Boat, values: dict[tuple[int, str], float], aboard: Sequence[bool]) -> Scenario:
     """The scenario for given values of the uncertain numbers (others at their own value)."""
-    mass = float(boat.fixed_mass)
-    moment = mass * onp.asarray(boat.fixed_cg, dtype=float)
     placed = {}
+    if boat.fixed_placed:
+        mass, moment = 0.0, onp.zeros(3)
+        placed["fixed"] = float(boat.fixed_mass)
+    else:
+        mass = float(boat.fixed_mass)
+        moment = mass * onp.asarray(boat.fixed_cg, dtype=float)
     for i, load in enumerate(boat.loads):
         m = values.get((i, "mass"), mean_of(load.mass)) if aboard[i] else 0.0
         if load.placed:
@@ -94,7 +98,7 @@ def _spread_points(boat: Boat, aboard: Sequence[bool], n_draws: int = 2048):
     direction of variation. Also whether anything varied that the model ignores.
     """
     slots = [s for s in _slots(boat) if aboard[s[0]]]
-    placed_names = [load.name for load in boat.loads if load.placed]
+    placed_names = boat.placed_names()
     length = boat.hull.length
     centre = _state(boat, {}, aboard)
     if not slots:

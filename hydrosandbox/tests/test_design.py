@@ -75,6 +75,18 @@ def test_optional_and_placed_loads_and_explicit_cases(hull):
     mass, cg = centre_of_gravity(boat, {"battery.x": 1.0}, 500.0, [100.0, 0.0, 50.0], {"battery": 40.0})
     assert mass == 540 and cg[0] == pytest.approx(140 / 540) and cg[2] == pytest.approx(50 / 540)
 
+    # The fixed part's own position can be the optimizer's, within a small range.
+    shiftable = hd.Boat(hull, 400.0, [hd.Free(0.1, 0.5), 0, 0.2], loads=[hd.PointMass("crew", hd.Normal(80, 15), [0.5, 0, 0.5])])
+    assert shiftable.placed_names() == ["fixed"]
+    for s in hd.load_scenarios(shiftable)[0]:
+        assert s.placed_masses == {"fixed": 400.0} and s.moment[0] == pytest.approx(s.mass * 0.5)
+    mass, cg = centre_of_gravity(shiftable, {"fixed.x": 0.4}, 80.0, [40.0, 0.0, 40.0], {"fixed": 400.0})
+    assert mass == 480 and cg[0] == pytest.approx((40 + 160) / 480) and cg[2] == pytest.approx((40 + 80) / 480)
+    with pytest.raises(ValueError, match="cannot be uncertain"):
+        hd.Boat(hull, 400.0, [hd.Normal(0.3, 0.1), 0, 0])
+    with pytest.raises(ValueError, match="reserved"):
+        hd.Boat(hull, 400.0, [0, 0, 0], loads=[hd.PointMass("fixed", 1.0, [0, 0, 0])])
+
     nominal, _ = hd.load_scenarios(boat, 1)
     assert len(nominal) == 1 and nominal[0].mass == pytest.approx(400 + 80 + 0.25 * 75)
     drawn, _ = hd.load_scenarios(boat, 16)

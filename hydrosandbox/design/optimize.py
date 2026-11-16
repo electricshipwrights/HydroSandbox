@@ -135,7 +135,6 @@ def evaluate(
     names, _, _, start = _all_variables(boat, design)
     values = dict(zip(names, start)) if values is None else {n: float(values[n]) for n in names}
     scenario_list, notes = load_scenarios(boat, scenarios)
-    placed_names = [load.name for load in boat.loads if load.placed]
     per_scenario, records = [], []
     for k, s in enumerate(scenario_list):
         mass, cg = centre_of_gravity(boat, values, s.mass, s.moment, s.placed_masses)
@@ -237,7 +236,7 @@ def optimize(
     names, low, high, start = _all_variables(boat, design)
     scenario_list, notes = load_scenarios(boat, scenarios)
     n, n_design = len(scenario_list), len(names)
-    placed_names = [load.name for load in boat.loads if load.placed]
+    placed_names = boat.placed_names()
     tables = hull_tables(boat, velocity, solver.trim_bounds, jobs=solver.table_jobs)
     start_values = dict(zip(names, start))
 

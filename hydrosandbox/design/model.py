@@ -47,25 +47,23 @@ class ThrustAt:
 def placed_variables(boat: Boat) -> dict[str, tuple[float, float, float]]:
     """The design variables for loads the optimizer places: name -> (low, high, start)."""
     out = {}
-    for load in boat.loads:
-        for axis, component in zip("xyz", load.position):
+    for name, position in boat.placed_items():
+        for axis, component in zip("xyz", position):
             if is_free(component):
-                out[f"{load.name}.{axis}"] = (component.low, component.high, component.initial())
+                out[f"{name}.{axis}"] = (component.low, component.high, component.initial())
     return out
 
 
 def centre_of_gravity(boat: Boat, values: dict[str, Any], mass, moment, placed_masses: dict[str, Any]):
-    """Total mass and centre of gravity, from a scenario and the placed loads' positions."""
+    """Total mass and centre of gravity, from a scenario and the placed items' positions."""
     total = mass
     moment = [moment[k] for k in range(3)]
-    for load in boat.loads:
-        if not load.placed:
-            continue
-        m = placed_masses[load.name]
+    for name, position in boat.placed_items():
+        m = placed_masses[name]
         total = total + m
-        for k, (axis, component) in enumerate(zip("xyz", load.position)):
-            position = values[f"{load.name}.{axis}"] if is_free(component) else mean_of(component)
-            moment[k] = moment[k] + m * position
+        for k, (axis, component) in enumerate(zip("xyz", position)):
+            at = values[f"{name}.{axis}"] if is_free(component) else mean_of(component)
+            moment[k] = moment[k] + m * at
     return total, [moment[k] / total for k in range(3)]
 
 
