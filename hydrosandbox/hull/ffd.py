@@ -150,6 +150,24 @@ class FFDLattice:
         dz = (1.0 - t) * field(0, 2) + t * field(1, 2)
         return x0 + dx, _onp.maximum(f0 + dy, 0.0), z0 + dz
 
+    def surface_area(self, values: Mapping[str, float] | None = None, waterline: float = 0.0) -> float:
+        """
+        Wetted area [m^2, both sides] of the deformed offset surface itself, below
+        ``waterline``: its cells' quads in 3D, each by the fraction of its height
+        below the water.
+        """
+        X, Y, Z = self.deform(values)
+        P = _onp.stack([X, Y, Z], axis=-1)
+        a, b, c, d = P[:-1, :-1], P[1:, :-1], P[1:, 1:], P[:-1, 1:]
+        tri = lambda p, q, r: 0.5 * _onp.linalg.norm(_onp.cross(q - p, r - p), axis=-1)
+        area = tri(a, b, c) + tri(a, c, d)
+        f = _onp.asarray(self.base.half_breadths)
+        on = (f[:-1, :-1] > 0) | (f[1:, :-1] > 0) | (f[:-1, 1:] > 0) | (f[1:, 1:] > 0)
+        zs = _onp.stack([a[..., 2], b[..., 2], c[..., 2], d[..., 2]])
+        lo, hi = zs.min(axis=0), zs.max(axis=0)
+        wet = _onp.clip((waterline - lo) / _onp.fmax(hi - lo, 1e-12), 0.0, 1.0)
+        return float(2.0 * _onp.sum(area * wet * on))
+
     def hull(self, values: Mapping[str, float] | None = None, name: str | None = None):
         """The deformed hull, cut back into an offset table over its own extent."""
         from hydrosandbox.hull.hull import Hull
@@ -196,7 +214,7 @@ class FFDLattice:
             row = _onp.interp(stations, xs, ys, left=0.0, right=ys[-1])
             row[-1] = ys[-1]  # the transom, projected onto its plane
             out[:, b] = row
-        return Hull(
+        result = Hull(
             stations, levels, out,
             name=name or f"{h.name} FFD",
             form_factor=h.form_factor,
@@ -204,6 +222,18 @@ class FFDLattice:
             transom_closure=h.transom_closure,
             waterline_smoothing=h.waterline_smoothing,
         )
+        # The table's outline (keel, stem) no longer lies on grid lines, which adds
+        # shell along it: carry the deformed surface's own change of wetted area
+        # instead (relative to the base, whose table area stands).
+        if values:
+            if not hasattr(self, "_area0"):
+                self._area0 = (self.surface_area({}), float(_onp.ravel(h.hydrostatics()["wetted_surface"])[0]))
+            direct0, table0 = self._area0
+            table = float(_onp.ravel(Hull.hydrostatics(result)["wetted_surface"])[0])
+            result.wetted_surface_scale = h.wetted_surface_scale * (self.surface_area(values) / direct0) / (table / table0)
+        else:
+            result.wetted_surface_scale = h.wetted_surface_scale
+        return result
 
 
 class FFDFamily(DesignFamily):
@@ -220,17 +250,28 @@ class FFDFamily(DesignFamily):
     design : ``"linear"`` (default; ``n + 1`` hulls), ``"diagonal"`` (``2n + 1``)
         or ``"quadratic"``.
     name : The family's name.
+    limit : Bound on every move [m], whatever the centre (ranges are clipped to it).
 
     ``exact(values)`` and the nodes are ``lattice.hull(centre | values)``.
     """
 
     def __init__(self, lattice: FFDLattice, names: Sequence[str], half_width: float | Mapping[str, float] = 0.05,
-                 centre: Mapping[str, float] | None = None, design: str = "linear", name: str | None = None):
+                 centre: Mapping[str, float] | None = None, design: str = "linear", name: str | None = None,
+                 limit: float | None = None):
         self.lattice = lattice
+        self.limit = limit
         self.centre = dict(centre or {})
         lattice.moves({**self.centre, **{n: 0.0 for n in names}})  # validates the names
         hw = half_width if isinstance(half_width, Mapping) else {n: float(half_width) for n in names}
-        ranges = {n: (self.centre.get(n, 0.0) - hw[n], self.centre.get(n, 0.0) + hw[n]) for n in names}
+        ranges = {}
+        for n in names:
+            c = self.centre.get(n, 0.0)
+            lo, hi = c - hw[n], c + hw[n]
+            if limit is not None:
+                lo, hi = max(lo, -limit), min(hi, limit)
+                if hi - lo < 1e-6:  # at the limit: keep a sliver of range, inside it
+                    lo, hi = (hi - 1e-6, hi) if c > 0 else (lo, lo + 1e-6)
+            ranges[n] = (lo, hi)
         start = {n: self.centre.get(n, 0.0) for n in names}
         super().__init__(
             lambda values, node_name: lattice.hull({**self.centre, **values}, name=node_name),
@@ -245,4 +286,5 @@ class FFDFamily(DesignFamily):
                   design: str | None = None) -> "FFDFamily":
         """The same family centred on ``values`` (a trust-region step)."""
         hw = half_width if half_width is not None else {n: 0.5 * (hi - lo) for n, (lo, hi) in self.ranges.items()}
-        return FFDFamily(self.lattice, self.names, hw, self.moves(values), design or self.design, self.name)
+        return FFDFamily(self.lattice, self.names, hw, self.moves(values), design or self.design, self.name,
+                         self.limit)

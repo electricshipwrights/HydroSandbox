@@ -523,6 +523,7 @@ def optimize(
     propeller_interaction: bool = True,
     blend_start: list[float] | None = None,
     transform_start: dict | None = None,
+    hull_constraints=None,
     cg_level_at_rest: bool = False,
 ) -> dict | None:
     """
@@ -582,6 +583,9 @@ def optimize(
     (default: the family's ``start``).
     The solution is re-evaluated on the exact transformed hull, returned as
     ``"hull"`` with the values as ``"transform"``.
+
+    ``hull_constraints(hull)`` (optional) returns further constraints on the hull
+    inside the solve (e.g. draft or freeboard limits on a family's interpolant).
 
     ``cg_level_at_rest=True`` puts the centre of gravity (fore and aft) wherever the
     hull floats level at rest under ``mass``: at its centre of buoyancy at the
@@ -897,6 +901,8 @@ def optimize(
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
     ] + blend_constraints + rest_constraints
+    if hull_constraints is not None:
+        constraints += list(hull_constraints(hull))
     if pods is not None:
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
@@ -1074,6 +1080,11 @@ def optimize(
                 propeller_inflow_angle=angle_solved,
             )
     outcome = {"design": solved, "loading": solved_loading, "results": final}
+    # What the solve itself predicted (on a family's interpolant, before the exact
+    # re-evaluation above), for trust-region steps.
+    outcome["predicted"] = {
+        key: float(sol(res[key])) for key in ("D", "GM_L") if key in res and res[key] is not None
+    }
     if family is not None:
         outcome.update(blend_weights=solved_weights, hull=hull)
     if transform is not None:

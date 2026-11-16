@@ -53,6 +53,11 @@ class Hull(AeroSandboxObject):
     sharing the spectrum), but no dynamic lift, sinkage or trim of the hull itself.
     """
 
+    #: Factor on the wetted surface the offset table gives (and so on viscous drag):
+    #: set by constructions that know the true surface better than the table can
+    #: (``FFDLattice.hull``, whose deformed keel and stem lines fall between grid lines).
+    wetted_surface_scale: float = 1.0
+
     def __init__(
         self,
         stations: Sequence[float],
@@ -594,7 +599,7 @@ class Hull(AeroSandboxObject):
             "wetted_length": wetted_length,
             "x_cb": np.sum(d_volume * x_mid) / volume_safe,
             "z_cb": np.sum(d_volume * z_mid) / volume_safe,
-            "wetted_surface": np.sum(d_area * cells["f_sub"]),
+            "wetted_surface": self.wetted_surface_scale * np.sum(d_area * cells["f_sub"]),
         }
 
     def viscous_resistance(
