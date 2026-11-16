@@ -130,6 +130,15 @@ at speed + penalties, each candidate an exact evaluation.
   while wet, 0.3 lambda hollow once dry, Fn_T 2.0-2.5) on branch
   `transom-closure-calibration`, PR #3. With 0.3 lambda the 3-station hull is
   still 6% under NACRA at 6 m/s, 7% at 3 m/s.
+- `TransformedFamily` (hydrosandbox/hull/transformed.py, branch `hull-transforms`,
+  closure branch merged in): beam, draft, length, Lackenby Cp/LCB and bow rake of
+  any `Hull` as variables, on a minimal quadratic design ((n+1)(n+2)/2 nodes; 21
+  for 5). `optimize()` takes it like a `HullFamily` (variables `hull_<name>`).
+  3-station hull at 6 m/s, no foil, calibrated closure (`local/gen/transform.py`):
+  base 379.6 N -> 371.9 N (wave 83.5->82.8, visc 271.2->270.4, transom 24.9->18.8);
+  cp +0.03, lcb -0.02 (forward) and bow_rake -0.3 all at their bounds; beam and
+  draft ~neutral. Most of the gain is transom drag. Not yet run with a foil
+  (21-node tables: watch memory, ~13 GB at 10 nodes).
 - Next: once PR #3 is merged, rebase, then rerun the generator search and the
   families on the new closure. Consider capping transom aspect: generated
   transoms are ~7 beam/immersion vs ~3 on the NPL hulls (extrapolation).
