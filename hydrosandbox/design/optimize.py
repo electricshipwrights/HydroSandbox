@@ -67,9 +67,29 @@ def _all_variables(boat: Boat, design: DesignSpace):
     return names, low, high, start
 
 
+def _references(objective: Objective, nominal: dict, baseline: list[dict] | None, n: int) -> list[dict[int, float]]:
+    """Each cost's reference in each scenario: its own number, the baseline's value there, or the nominal value."""
+    per_scenario = []
+    for k in range(n):
+        refs = {}
+        for i, cost in enumerate(objective.costs):
+            if cost.reference == "baseline":
+                refs[i] = float(_cost_value(cost, baseline[k]))
+            elif cost.reference is None:
+                refs[i] = float(_cost_value(cost, nominal))
+            else:
+                refs[i] = float(cost.reference)
+        per_scenario.append(refs)
+    return per_scenario
+
+
+def _needs_baseline(objective: Objective | None) -> bool:
+    return objective is not None and any(c.reference == "baseline" for c in objective.costs)
+
+
 def _summarize(objective: Objective, scenarios: list[Scenario], per_scenario: list[dict], references, scale):
     weights = onp.array([s.weight for s in scenarios])
-    logs = onp.array([float(objective.log_utility(q, references, scale)) for q in per_scenario])
+    logs = onp.array([float(objective.log_utility(q, r, scale)) for q, r in zip(per_scenario, references)])
     utilities = onp.exp(logs)
     mean = float(weights @ utilities)
     sd = float(onp.sqrt(weights @ (utilities - mean) ** 2))
@@ -89,7 +109,8 @@ def evaluate(
     objective: Objective | None = None,
     propulsion: ThrustAt | None = None,
     scenarios: Any = None,
-    references: dict[int, float] | None = None,
+    baseline: DesignSpace | None = None,
+    references: list[dict[int, float]] | None = None,
     measure_scale: float | None = None,
     guesses: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
@@ -98,8 +119,9 @@ def evaluate(
     directly, and report every quantity, the utility and any violations.
 
     ``values`` are the design variables (the design space's start if None). The
-    scenarios, and the meaning of ``objective``, are as for ``optimize()``. The
-    cost references default to the nominal (first) scenario's own values.
+    scenarios, the ``baseline`` and the meaning of ``objective`` are as for
+    ``optimize()``. Cost references that are left open default to the nominal
+    (first) scenario's own values.
     """
     names, _, _, start = _all_variables(boat, design)
     values = dict(zip(names, start)) if values is None else {n: float(values[n]) for n in names}
@@ -119,10 +141,11 @@ def evaluate(
     result = {"design": values, "notes": notes}
     if objective is not None:
         if references is None:
-            references = {
-                i: (c.reference if c.reference is not None else float(_cost_value(c, per_scenario[0])))
-                for i, c in enumerate(objective.costs)
-            }
+            base = None
+            if _needs_baseline(objective):
+                base = baseline_quantities(boat, velocity, baseline, propulsion, scenarios)
+                result["baseline"] = base
+            references = _references(objective, per_scenario[0], base, len(scenario_list))
         if measure_scale is None:
             measure_scale = _measure_scale(objective, per_scenario[0])
         utilities, expected, value = _summarize(objective, scenario_list, per_scenario, references, measure_scale)
@@ -133,6 +156,19 @@ def evaluate(
         record["quantities"] = q
     result["scenarios"] = records
     return result
+
+
+def baseline_quantities(boat: Boat, velocity: float, baseline: DesignSpace | None = None,
+                        propulsion: ThrustAt | None = None, scenarios: Any = None) -> list[dict[str, float]]:
+    """
+    The quantities of the baseline design in every scenario, with the hull integrated
+    directly. The baseline is the boat with no appendages unless a design space is
+    given, at that space's starting values; placed loads sit at their own starts.
+    """
+    from hydrosandbox.design.layouts import no_appendages
+
+    assessed = evaluate(boat, velocity, baseline or no_appendages(), None, None, propulsion, scenarios)
+    return [s["quantities"] for s in assessed["scenarios"]]
 
 
 def _cost_value(cost, named):
@@ -153,6 +189,7 @@ def optimize(
     objective: Objective,
     propulsion: ThrustAt | None = None,
     scenarios: Any = None,
+    baseline: DesignSpace | None = None,
     solver: Solver | None = None,
 ) -> dict[str, Any]:
     """
@@ -168,6 +205,9 @@ def optimize(
     scenarios : How the loads' uncertainty becomes scenarios; see
         ``hydrosandbox.design.scenarios.load_scenarios``. None places a few points
         on the spread of the load summaries the model responds to.
+    baseline : The design that costs with ``reference="baseline"`` are measured
+        against, scenario by scenario: a design space evaluated at its starting
+        values. None is the boat with no appendages.
     solver : Iteration limit, attitude bounds and threads (``Solver``).
 
     Returns
@@ -207,10 +247,8 @@ def optimize(
         if c.exponent != 0 and any(float(_cost_value(c, q)) <= 0 for q in start_quantities):
             raise ValueError(f"Cost {i} is not positive for the starting design; a cost must be a positive quantity.")
     need = objective.needed()
-    references = {
-        i: (c.reference if c.reference is not None else float(_cost_value(c, start_quantities[0])))
-        for i, c in enumerate(objective.costs)
-    }
+    base = baseline_quantities(boat, velocity, baseline, propulsion, scenarios) if _needs_baseline(objective) else None
+    references = _references(objective, start_quantities[0], base, n)
     measure_scale = _measure_scale(objective, start_quantities[0])
     _, _, start_objective = _summarize(objective, scenario_list, start_quantities, references, measure_scale)
 
@@ -243,7 +281,7 @@ def optimize(
     logs = []
     for k in range(n):
         named = {name: outputs[2 + j, k] for j, name in enumerate(quantity_names)}
-        logs.append(objective.log_utility(named, references, measure_scale) + onp.log(scenario_list[k].weight))
+        logs.append(objective.log_utility(named, references[k], measure_scale) + onp.log(scenario_list[k].weight))
     log_mean = cas.logsumexp(cas.vertcat(*logs)) if n > 1 else logs[0]
     log_value = log_mean
     if objective.risk_aversion != 0 and n > 1:
@@ -279,6 +317,8 @@ def optimize(
         boat, velocity, design, solved, objective, propulsion, scenarios,
         references=references, measure_scale=measure_scale, guesses=guesses,
     )
+    if base is not None:
+        result["baseline"] = base
     result.update(
         status=_STATUS.get(stats["return_status"], stats["return_status"]),
         iterations=int(stats["iter_count"]),

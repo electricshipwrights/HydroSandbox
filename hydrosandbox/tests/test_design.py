@@ -150,7 +150,21 @@ def test_evaluate_and_optimize_on_a_catamaran(hull):
     by_mass = sorted(assessed["scenarios"], key=lambda s: s["mass"])
     assert by_mass[0]["quantities"]["drag"] < by_mass[-1]["quantities"]["drag"]
 
+    # Against a fixed reference a lighter boat scores better merely for being lighter;
+    # against the baseline in the same scenario most of that goes.
+    def spread(result):
+        utilities = [s["utility"] for s in result["scenarios"]]
+        return max(utilities) / min(utilities)
+
+    objective.costs[0].reference = "baseline"
+    relative = hd.evaluate(boat, 6.0, design, objective=objective)
+    assert len(relative["baseline"]) == 3 and all(b["pitch_damping"] == 0 for b in relative["baseline"])
+    for s, b, r in zip(relative["scenarios"], relative["baseline"], relative["references"]):
+        assert r[0] == pytest.approx(b["drag"]) and b["mass"] == pytest.approx(s["mass"])
+    assert spread(assessed) > 1.5 and spread(relative) - 1 < 0.25 * (spread(assessed) - 1)
+
     out = hd.optimize(boat, 6.0, design, objective, solver=hd.Solver(max_iterations=4, table_jobs=4))
+    assert len(out["baseline"]) == 3
     assert out["status"] in ("converged", "iteration limit") and out["iterations"] <= 4
     assert set(out["design"]) == set(design.variables)
     assert all(design.variables[n][0] - 1e-6 <= v <= design.variables[n][1] + 1e-6 for n, v in out["design"].items())

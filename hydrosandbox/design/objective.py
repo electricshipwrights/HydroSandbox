@@ -39,13 +39,21 @@ def _label(quantity: Quantity) -> str:
 class Cost:
     """
     A quantity to keep small: multiplies the utility by ``(reference / q) ** exponent``.
-    With ``reference=None`` it is the quantity's value for the starting design in the
-    nominal scenario.
+
+    ``reference`` is a number, or ``"baseline"``: the quantity's value for the
+    baseline design *in the same scenario* (by default the boat with no appendages;
+    see ``optimize``). Against a baseline, a scenario is not scored well merely for
+    being one in which the boat is lighter. With ``reference=None`` it is the
+    quantity's value for the starting design in the nominal scenario.
     """
 
     quantity: Quantity
     exponent: float = 1.0
-    reference: float | None = None
+    reference: float | str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.reference, str) and self.reference != "baseline":
+            raise ValueError("A cost's reference is a number, None or \"baseline\".")
 
 
 @dataclass
