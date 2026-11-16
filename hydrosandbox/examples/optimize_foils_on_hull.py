@@ -575,10 +575,11 @@ def optimize(
     blend, swept from camber's blended control points, which is returned as
     ``"hull"`` with the weights as ``"blend_weights"``.
 
-    ``hull`` may likewise be a ``TransformedFamily`` (``hydrosandbox.hull.transformed``:
-    one hull's beam, draft, Lackenby prismatic and LCB, bow rake, ...). Each varied
-    transformation becomes a variable ``hull_<name>`` within the family's range,
-    starting from ``transform_start`` (default: neutral, clipped into the range).
+    ``hull`` may likewise be a ``DesignFamily`` (``hydrosandbox.hull.transformed``:
+    e.g. a ``TransformedFamily`` of one hull's beam, draft, Lackenby prismatic and
+    LCB, bow rake, or an ``FFDFamily``). Each of its variables becomes a variable
+    ``hull_<name>`` within the family's range, starting from ``transform_start``
+    (default: the family's ``start``).
     The solution is re-evaluated on the exact transformed hull, returned as
     ``"hull"`` with the values as ``"transform"``.
 
@@ -588,13 +589,13 @@ def optimize(
     variable (a blend), which ``xyz_cg[0]`` and ``cg_range`` are ignored for.
     """
     from hydrosandbox.hull.camber import HullFamily
-    from hydrosandbox.hull.transformed import NEUTRAL, TransformedFamily
+    from hydrosandbox.hull.transformed import DesignFamily
 
     family = hull if isinstance(hull, HullFamily) else None
-    transform = hull if isinstance(hull, TransformedFamily) else None
+    transform = hull if isinstance(hull, DesignFamily) else None
     if transform is not None:
         transform_start = {
-            k: float(onp.clip((transform_start or {}).get(k, NEUTRAL[k]), *transform.ranges[k]))
+            k: float(onp.clip((transform_start or {}).get(k, transform.start[k]), *transform.ranges[k]))
             for k in transform.names
         }
         hull = transform.at(transform_start)

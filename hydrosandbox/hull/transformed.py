@@ -178,73 +178,80 @@ def transform_hull(hull, name: str | None = None, **parameters):
     )
 
 
-def box_design(n: int, degree: int = 2) -> tuple[list[tuple[float, ...]], list[tuple[int, ...]]]:
+DESIGNS = ("linear", "diagonal", "quadratic")
+
+
+def box_design(n: int, degree: int | str = 2) -> tuple[list[tuple[float, ...]], list[tuple[int, ...]]]:
     """
     Nodes (in ``[-1, 1]^n``) and monomial exponents of the minimal interpolation
-    design for a full polynomial of total ``degree`` 1 or 2: the centre, a step to
-    the upper end of each axis (and, for degree 2, the lower end and one corner per
-    pair of axes).
+    design for a polynomial in ``n`` variables:
+
+    - ``"linear"`` (or 1): the centre and a step to the upper end of each axis
+      (``n + 1`` nodes; total degree 1).
+    - ``"diagonal"``: the centre and both ends of each axis (``2n + 1`` nodes;
+      ``1, u_i, u_i^2``: each variable's curvature, no cross terms).
+    - ``"quadratic"`` (or 2): the diagonal design plus one corner per pair of axes
+      (``(n + 1)(n + 2) / 2`` nodes; total degree 2).
     """
-    if degree not in (1, 2):
-        raise ValueError("degree must be 1 or 2")
+    design = {1: "linear", 2: "quadratic"}.get(degree, degree)
+    if design not in DESIGNS:
+        raise ValueError(f"design must be one of {DESIGNS} (or degree 1, 2)")
     eye = _onp.eye(n, dtype=int)
     nodes = [tuple([0.0] * n)] + [tuple(map(float, e)) for e in eye]
     monomials = [tuple([0] * n)] + [tuple(e) for e in eye]
-    if degree == 2:
+    if design in ("diagonal", "quadratic"):
         nodes += [tuple(map(float, -e)) for e in eye]
         monomials += [tuple(2 * e) for e in eye]
+    if design == "quadratic":
         for i, j in itertools.combinations(range(n), 2):
             nodes.append(tuple(map(float, eye[i] + eye[j])))
             monomials.append(tuple(eye[i] + eye[j]))
     return nodes, monomials
 
 
-class TransformedFamily:
+class DesignFamily:
     """
-    Transformations of one hull (see the module docstring) as design variables.
+    Hulls made by any function of a few numbers, as a design space: the hull is
+    built exactly at the nodes of an interpolation design over the box of
+    ``ranges`` (see ``box_design``), and anything a ``Hull`` computes is the
+    polynomial interpolant of the nodes' values (``BlendedHull``).
 
     Parameters
     ----------
-    hull : The base ``Hull`` (any: from camber, a mesh, offsets, ...).
-    ranges : ``{parameter: (low, high)}`` for each transformation to vary, from
-        ``NEUTRAL``'s keys. The others stay neutral.
-    degree : 2 (default; ``(n + 1)(n + 2) / 2`` nodes) or 1 (``n + 1`` nodes).
+    make_hull : ``make_hull(values: dict, name: str) -> Hull``.
+    ranges : ``{name: (low, high)}`` for each variable.
+    design : ``"linear"``, ``"diagonal"`` or ``"quadratic"`` (see ``box_design``).
     name : The family's name.
+    start : Where a solve starts (default: the centre of each range).
 
-    ``at(values)`` is the interpolated hull at a ``{parameter: value}`` dict or a
+    ``at(values)`` is the interpolated hull at a ``{name: value}`` dict or a
     sequence in ``names`` order (numbers or CasADi expressions); ``exact(values)``
-    the transformed hull itself, to check a solution against.
+    the hull ``make_hull`` builds there, to check a solution against.
     """
 
-    def __init__(self, hull, ranges: Mapping[str, tuple[float, float]], degree: int = 2,
-                 name: str | None = None):
-        unknown = set(ranges) - set(NEUTRAL)
-        if unknown:
-            raise ValueError(f"unknown transformation(s) {sorted(unknown)}; expected some of {list(NEUTRAL)}")
+    def __init__(self, make_hull, ranges: Mapping[str, tuple[float, float]], design: int | str = "quadratic",
+                 name: str = "design family", start: Mapping[str, float] | None = None):
         if not ranges:
-            raise ValueError("vary at least one transformation")
-        self.base = hull
+            raise ValueError("vary at least one variable")
+        self.make_hull = make_hull
         self.names = list(ranges)
         self.ranges = {k: (float(lo), float(hi)) for k, (lo, hi) in ranges.items()}
         for k, (lo, hi) in self.ranges.items():
             if not hi > lo:
                 raise ValueError(f"range of {k} must be (low, high) with high > low")
-        self.degree = degree
-        self.name = name or f"{hull.name} transformed"
-        unit_nodes, self._monomials = box_design(len(self.names), degree)
+        self.design = {1: "linear", 2: "quadratic"}.get(design, design)
+        self.name = name
+        self.start = {k: 0.5 * (lo + hi) for k, (lo, hi) in self.ranges.items()}
+        self.start.update(start or {})
+        unit_nodes, self._monomials = box_design(len(self.names), self.design)
         self.node_parameters = [self._from_unit(u) for u in unit_nodes]
         vandermonde = _onp.array([[self._monomial(u, m) for m in self._monomials] for u in unit_nodes])
         self._inverse = _onp.linalg.inv(vandermonde)
-        self.nodes = [
-            transform_hull(hull, name=f"{self.name} node {i}", **p)
-            for i, p in enumerate(self.node_parameters)
-        ]
+        self.nodes = [make_hull(p, f"{self.name} node {i}") for i, p in enumerate(self.node_parameters)]
 
     def __repr__(self) -> str:
-        return (
-            f"TransformedFamily '{self.name}' ({', '.join(self.names)}; degree {self.degree}, "
-            f"{len(self.nodes)} nodes)"
-        )
+        names = ", ".join(self.names) if len(self.names) <= 8 else f"{len(self.names)} variables"
+        return f"{type(self).__name__} '{self.name}' ({names}; {self.design}, {len(self.nodes)} nodes)"
 
     def _from_unit(self, u) -> dict[str, float]:
         return {
@@ -266,12 +273,15 @@ class TransformedFamily:
                 value = value * u_k
         return value
 
+    def _default(self, name: str) -> float:
+        return self.start[name]
+
     def _values(self, values) -> list[Any]:
         if isinstance(values, Mapping):
             unknown = set(values) - set(self.names)
             if unknown:
-                raise ValueError(f"{sorted(unknown)} are not varied by this family ({self.names})")
-            return [values.get(k, NEUTRAL[k]) for k in self.names]
+                raise ValueError(f"{sorted(unknown)} are not varied by this family")
+            return [values.get(k, self._default(k)) for k in self.names]
         values = list(values)
         if len(values) != len(self.names):
             raise ValueError(f"expected {len(self.names)} values ({self.names})")
@@ -298,9 +308,40 @@ class TransformedFamily:
         return BlendedHull(self, self._values(values))
 
     def exact(self, values, **kwargs):
-        """The transformed hull itself at ``values``."""
+        """The hull itself at ``values``."""
         values = self._values(values)
-        return transform_hull(
-            self.base, name=kwargs.pop("name", f"{self.name} exact"),
-            **{k: float(v) for k, v in zip(self.names, values)},
+        return self.make_hull({k: float(v) for k, v in zip(self.names, values)},
+                              kwargs.pop("name", f"{self.name} exact"))
+
+
+class TransformedFamily(DesignFamily):
+    """
+    Transformations of one hull (see the module docstring) as design variables.
+
+    Parameters
+    ----------
+    hull : The base ``Hull`` (any: from camber, a mesh, offsets, ...).
+    ranges : ``{parameter: (low, high)}`` for each transformation to vary, from
+        ``NEUTRAL``'s keys. The others stay neutral.
+    degree : 2 (default; ``(n + 1)(n + 2) / 2`` nodes), 1 (``n + 1`` nodes) or a
+        design name (``box_design``).
+    name : The family's name.
+
+    A solve starts from neutral (clipped into each range).
+    """
+
+    def __init__(self, hull, ranges: Mapping[str, tuple[float, float]], degree: int | str = 2,
+                 name: str | None = None):
+        unknown = set(ranges) - set(NEUTRAL)
+        if unknown:
+            raise ValueError(f"unknown transformation(s) {sorted(unknown)}; expected some of {list(NEUTRAL)}")
+        self.base = hull
+        self.degree = degree
+        start = {k: float(_onp.clip(NEUTRAL[k], *r)) for k, r in ranges.items()}
+        super().__init__(
+            lambda p, node_name: transform_hull(hull, name=node_name, **p),
+            ranges, degree, name or f"{hull.name} transformed", start,
         )
+
+    def _default(self, name: str) -> float:
+        return NEUTRAL[name]
