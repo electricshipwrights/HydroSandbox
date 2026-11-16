@@ -251,6 +251,29 @@ class FFDLattice:
         return result
 
 
+def _fold_rows(lattice: FFDLattice, centre: Mapping[str, float], names: Sequence[str], margin: float):
+    """
+    Linear no-fold conditions ``G d + c >= 0`` on the moves ``d`` (from ``centre``)
+    of ``names``: each gap up a station column and along a level, on the hull, at
+    least ``margin`` of the base table's.
+    """
+    x0, _, z0 = lattice.deform(centre)
+    grads = []
+    for n in names:
+        xs, _, zs = lattice.deform({**centre, n: centre.get(n, 0.0) + 1.0})
+        grads.append((xs - x0, zs - z0))
+    on = lattice._on_hull
+    zbase = _onp.asarray(lattice.base.levels, dtype=float)
+    xbase = _onp.asarray(lattice.base.stations, dtype=float)
+    col = on[:, 1:] | on[:, :-1]
+    row = on[1:, :] | on[:-1, :]
+    g_col = _onp.stack([(gz[:, 1:] - gz[:, :-1])[col] for _, gz in grads], axis=1)
+    g_row = _onp.stack([(gx[1:, :] - gx[:-1, :])[row] for gx, _ in grads], axis=1)
+    c_col = (z0[:, 1:] - z0[:, :-1])[col] - margin * _onp.diff(zbase)[None, :].repeat(len(xbase), 0)[col]
+    c_row = (x0[1:, :] - x0[:-1, :])[row] - margin * _onp.diff(xbase)[:, None].repeat(len(zbase), 1)[row]
+    return _onp.vstack([g_col, g_row]), _onp.concatenate([c_col, c_row])
+
+
 class FFDFamily(DesignFamily):
     """
     Moves of an ``FFDLattice``'s control points as design variables.
@@ -280,7 +303,16 @@ class FFDFamily(DesignFamily):
         self.limit = limit
         self.centre = dict(centre or {})
         lattice.moves({**self.centre, **{n: 0.0 for n in names}})  # validates the names
-        hw = half_width if isinstance(half_width, Mapping) else {n: float(half_width) for n in names}
+        hw = dict(half_width) if isinstance(half_width, Mapping) else {n: float(half_width) for n in names}
+        # Shrink any move whose range would fold the hull at either end, so every
+        # node can be built (a centre at the edge of what offsets can represent).
+        G, c = _fold_rows(lattice, self.centre, list(names), 0.1)
+        for i, n in enumerate(names):
+            g = G[:, i]
+            up = c[g < 0] / -g[g < 0]  # largest step up each row allows
+            down = c[g > 0] / g[g > 0]  # ... and down
+            room = min(up.min() if up.size else _onp.inf, down.min() if down.size else _onp.inf)
+            hw[n] = max(min(hw[n], 0.9 * max(room, 0.0)), 1e-4)
         ranges = {}
         for n in names:
             c = self.centre.get(n, 0.0)
@@ -321,22 +353,7 @@ class FFDFamily(DesignFamily):
 
         lat = self.lattice
         if not hasattr(self, "_fold_rows"):
-            x0, _, z0 = lat.deform(self.centre)
-            grads = []
-            for n in self.names:
-                xs, _, zs = lat.deform({**self.centre, n: self.centre.get(n, 0.0) + 1.0})
-                grads.append((xs - x0, zs - z0))
-            on = lat._on_hull
-            zbase = _onp.asarray(lat.base.levels, dtype=float)
-            xbase = _onp.asarray(lat.base.stations, dtype=float)
-            # Gaps up each column, and along each level, on the hull.
-            col = on[:, 1:] | on[:, :-1]
-            row = on[1:, :] | on[:-1, :]
-            g_col = _onp.stack([(gz[:, 1:] - gz[:, :-1])[col] for _, gz in grads], axis=1)
-            g_row = _onp.stack([(gx[1:, :] - gx[:-1, :])[row] for gx, _ in grads], axis=1)
-            c_col = (z0[:, 1:] - z0[:, :-1])[col] - margin * _onp.diff(zbase)[None, :].repeat(len(xbase), 0)[col]
-            c_row = (x0[1:, :] - x0[:-1, :])[row] - margin * _onp.diff(xbase)[:, None].repeat(len(zbase), 1)[row]
-            self._fold_rows = (_onp.vstack([g_col, g_row]), _onp.concatenate([c_col, c_row]))
+            self._fold_rows = _fold_rows(lat, self.centre, self.names, margin)
         G, c = self._fold_rows
         values = self._values(values)
         d = cas.vertcat(*[v - self.centre.get(n, 0.0) for n, v in zip(self.names, values)])
