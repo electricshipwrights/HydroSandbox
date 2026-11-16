@@ -152,6 +152,41 @@ Left:
 - Blending hulls where some have an immersed transom and some not raises an error
   (their section structures differ).
 
+## FFD hull optimization (branch `ffd`, worktree `~/projects/HydroSandbox-ffd`)
+
+Off `hull-transforms` (TransformedFamily + calibrated transom closure merged in).
+
+- `hydrosandbox/hull/ffd.py`: `FFDLattice` (Bernstein FFD, Sederberg & Parry 1986,
+  nx x 2 x nz control points around any `Hull`; moves named `p<i><i|o><k><x|y|z>`),
+  `hull(moves)` resamples the deformed surface into an offset table (own extent,
+  or a given one); `FFDFamily` = moves as variables (a `DesignFamily`, usually
+  "linear": n + 1 hulls), `recentred()` for trust-region steps, `no_fold()`
+  linear constraints that keep columns/levels ordered (else a tunnel/hollow
+  section the offset table can't represent; the first solve went there).
+- `DesignFamily` (transformed.py): any `make_hull(values)` + box design
+  ("linear", "diagonal", "quadratic"); `optimize()` takes one (variables
+  `hull_<name>`), plus `hull_constraints(hull)` and returns `predicted`.
+- Wetted surface: resampling moves the keel/stem outline off grid lines, which
+  inflated S by 1-3% (optimizer could exploit it). FFD hulls carry
+  `Hull.wetted_surface_scale` from the deformed surface's own area change.
+- Linearization check (`local/linear_check.py`, NACRA, 4x2x3 = 60 moves): linear
+  family vs exact deformed hull within 0.2% of drag at +-3 cm corners, 0.5-0.75%
+  at +-6 cm (wave, transom, trim, sinkage all track).
+- Table speed (61-hull family, 11x11 tables, 6 workers): 522 s -> 97 s. Kernel
+  cache (`_kernel` in hull.py: depth exponentials and strip phases depend on
+  grid + attitude only), batched builders `dynamic_force_tables` /
+  `wave_amplitude_tables` (BlendedHull uses them), shared-grid FFD families,
+  per-k batched products in `dynamic_force.forms`, `wave_amplitude_batch`
+  (dense per-strip products across hulls). Results identical to per-hull (tests:
+  83 pass). Next speed step: batch `forms` across hulls (dynamic force is now 63
+  of the 97 s); a GPU only after that.
+- Driver `local/ffd_optimize.py` (trust region, linear family per step, 7x7
+  narrow attitude tables, CG at LCB, GM_L >= 15.1, draft <= 0.30, freeboard >=
+  0.35, transom equivalent depth <= 0.065, moves within +-0.12). First attempt:
+  step 1 at +-6 cm gave exact 387.8 N vs base 403.4 but broke the transom limit
+  (the keel-based transom measure steps level to level: not usable in a
+  gradient solve; replaced by the smooth `transom()["depth"]`).
+
 ## hydrosandbox (branch `hydrosandbox`)
 
 Gemini-authored hydrofoil package on top of AeroSandbox; reviewed 2026-11-14.
