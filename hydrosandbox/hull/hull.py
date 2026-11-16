@@ -2103,12 +2103,87 @@ def _dynamic_force_point_batch(specs, velocity, density, gravity, sinkage, trim,
 
 
 def _wave_amplitude_point_batch(specs, velocity, gravity, sinkage, trim, pivots, spacing, kx, kappa, ky):
-    """One attitude's amplitude spectrum for every hull in turn."""
+    """One attitude's amplitude spectrum for every hull (batched where they share a grid)."""
+    hulls = _hulls_from_specs(specs)
+    if len(hulls) > 1 and len({(h.stations.tobytes(), h.levels.tobytes()) for h in hulls}) == 1 \
+            and len(set(pivots)) == 1:
+        re, im = wave_amplitude_batch(hulls, velocity, gravity, sinkage, trim, pivots[0], spacing, kx, kappa, ky)
+        return [(re[n], im[n]) for n in range(len(hulls))]
     out = []
-    for h, p in zip(_hulls_from_specs(specs), pivots):
+    for h, p in zip(hulls, pivots):
         re_v, im_v = h.wave_amplitude(velocity, gravity, sinkage, trim, p, demihull_spacing=spacing)(kx, kappa, ky)
         out.append((_onp.asarray(re_v, dtype=float).ravel(), _onp.asarray(im_v, dtype=float).ravel()))
     return out
+
+
+def wave_amplitude_batch(hulls, velocity, gravity, sinkage, trim, pivot_xz, spacing, kx, kappa, ky):
+    """
+    ``Hull.wave_amplitude(...)(kx, kappa, ky)`` for many hulls on one offset grid
+    at one attitude (numeric), as ``(re, im)`` arrays of shape (hulls, wavenumbers).
+    The hull cells' depth exponentials are computed once and contracted for every
+    hull together, strip by strip, as dense products; the bow step and transom
+    hollow (which differ per hull) go hull by hull.
+    """
+    kx = _onp.asarray(kx, dtype=float).reshape(1, -1)
+    kappa = _onp.asarray(kappa, dtype=float).reshape(1, -1)
+    m = kx.shape[1]
+    strips = [h._strips(velocity, gravity, sinkage, trim, pivot_xz) for h in hulls]
+    s0 = strips[0]
+    n_strips = s0["n_hull"]
+    W = _onp.stack([_onp.asarray(st["slope_hull"], dtype=float).ravel() for st in strips])  # (H, cells)
+    zlo = _onp.minimum(_onp.asarray(s0["z_lo_hull"], dtype=float).ravel(), 0.0)
+    zhi = _onp.minimum(_onp.asarray(s0["z_hi_hull"], dtype=float).ravel(), 0.0)
+    n_per = W.shape[1] // n_strips
+
+    def depth_average():
+        out = _onp.empty((len(zlo), m), dtype=float)
+        for c0 in range(0, m, 512):
+            kc = kappa[:, c0 : c0 + 512]
+            a, b = zlo[:, None] * kc, zhi[:, None] * kc
+            d = b - a
+            sm = _onp.abs(d) < 1e-6
+            out[:, c0 : c0 + 512] = _onp.where(
+                sm, _onp.exp(0.5 * (a + b)), (_onp.exp(b) - _onp.exp(a)) / _onp.where(sm, 1.0, d)
+            )
+        return out
+
+    avg = _kernel("depth_average_all", (zlo, zhi, kappa), depth_average)
+    g = _onp.zeros((len(hulls), n_strips, m), dtype=float)
+    for s in range(n_strips):
+        cells = slice(s * n_per, (s + 1) * n_per)
+        w_s = W[:, cells]
+        live = _onp.flatnonzero(_onp.any(w_s != 0.0, axis=0))
+        if live.size:
+            g[:, s, :] = w_s[:, live] @ avg[cells][live]
+    ker_c, ker_s = _kernel(
+        "strip_transform",
+        (_onp.asarray(s0["x_hull"], dtype=float).reshape(-1, 1), _onp.asarray(s0["dx_hull"], dtype=float), kx),
+        lambda: _strip_kernel(s0["x_hull"], s0["dx_hull"], kx),
+    )
+    re = _onp.einsum("hsm,sm->hm", g, ker_c)
+    im = -_onp.einsum("hsm,sm->hm", g, ker_s)
+    for n, (h, st) in enumerate(zip(hulls, strips)):
+        for part in ("bow", "hollow"):
+            if st[f"n_{part}"] > 0:
+                gp = h._contract_groups(st[f"slope_{part}"], st[f"z_lo_{part}"], st[f"z_hi_{part}"], kappa, st[f"n_{part}"])
+                r, i = h._strip_transform(gp, st[f"x_{part}"], st[f"dx_{part}"], kx, sign=-1.0)
+                re[n] += _onp.ravel(r)
+                im[n] += _onp.ravel(i)
+    if spacing is not None:
+        pair = 2.0 * _onp.cos(0.5 * spacing * _onp.asarray(ky, dtype=float).reshape(1, -1))
+        re, im = pair * re, pair * im
+    return 2.0 * velocity * re, 2.0 * velocity * im
+
+
+def _strip_kernel(x_strip, dx_strip, kx):
+    """``sinc(kx dx / 2) cos(kx x)`` and ``... sin(kx x)`` per strip and wavenumber."""
+    x_col = _onp.asarray(x_strip, dtype=float).reshape(-1, 1)
+    dx_arr = _onp.asarray(dx_strip, dtype=float)
+    phase = x_col @ kx
+    half = (0.5 * float(dx_arr)) * kx if dx_arr.ndim == 0 else 0.5 * dx_arr.reshape(-1, 1) @ kx
+    half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
+    smear = _onp.where(_onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe)
+    return smear * _onp.cos(phase), smear * _onp.sin(phase)
 
 
 def dynamic_force_tables(
