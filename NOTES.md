@@ -192,6 +192,27 @@ Off `hull-transforms` (TransformedFamily + calibrated transom closure merged in)
   (the keel-based transom measure steps level to level: not usable in a
   gradient solve; replaced by the smooth `transom()["depth"]`).
 
+- Result (`local/ffd_optimize_run5.*`, moves in `local/ffd_best_moves.json`,
+  lines `local/ffd_best_lines.png`): on one fixed grid for the whole run, NACRA
+  402.4 N -> 377.5 N (-6.2%) at 6 m/s (wave 106.3 -> 76.6, viscous 277.5 ->
+  280.8, transom 18.6 -> 20.1), GM_L 13.3 -> 18.9 (floor = NACRA's on the same
+  grid; it is 15.1 on the original grid: GM_L is sensitive to level spacing at
+  the waterline), draft 0.240, freeboard 0.350 (at its limit), transom depth
+  0.042. Cp 0.643 -> 0.749: fuller ends, narrower amidships, wider aft, flared
+  aft topsides, sheer lowered forward. Most moves at the +-0.12 m LIMIT.
+  Caveat: with the transom plane fixed, forward stern moves become a parallel
+  extension of the transom section aft (the optimizer used it: all stern x moves
+  at -0.12).
+- Lessons: (1) a family's model and the exact check must cut onto the same grid
+  (otherwise ~1% grid-sensitive drag, mostly transom, swamps late steps): use
+  `FFDFamily(extent=...)`; (2) ratio/max quantities (transom depth) must not be
+  interpolated between nodes: compute them from the lattice's linear surface map
+  (`FFDFamily.transom_depth`), as `no_fold` does; (3) the IPOPT solve (3-25 min
+  per step) is now the cost, not the tables (~18 s).
+- Next: free the transom plane (or forbid stern x moves); higher LIMIT with a
+  fairness measure; finer levels near the waterline for GM_L; profile the solve;
+  try the 3-station camber hull and a foil.
+
 ## hydrosandbox (branch `hydrosandbox`)
 
 Gemini-authored hydrofoil package on top of AeroSandbox; reviewed 2026-11-14.
