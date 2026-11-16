@@ -276,3 +276,133 @@ Left:
 - Junction drag is buildup-only, cavitation penalty defaults differ, VLM is
   inviscid; HydroLiftingLine is linear despite its docstring.
 - Large copy-adapted overlap with AeroBuildup/VLM/LiftingLine; relies on private ASB methods.
+
+## Validation against tank data (branch `validation`, worktree `.worktrees/validation`; 2026-11-15)
+
+`validation/` (see its README): Wigley fixed (Ju 1983), R/V Athena fixed and free
+(Jenkins 1984), Southampton NPL catamaran series (Report 71, all ten models,
+monohull + four spacings; tables OCR'd and checked). Another session works on
+the same series' transom closure in `HydroSandbox-camber/local/npl`; the NPL body
+plan here is copied from its extraction.
+
+Findings so far:
+- Wigley, fixed: Michell C_W is ~2x measured below Fn 0.25, ~1.4x at 0.25-0.32,
+  within ~25% at 0.32-0.40.
+- Athena (B/T 4.2), fixed: C_W / C_WP grows 1.1 (Fn 0.41) -> 1.5 (0.52) -> 2.4
+  (0.8) -> 4 (1.0). `auto` closure is 5-11x high at Fn 0.28. Trim within ~20%.
+- Southampton at the *measured* attitude, Fn >= 0.3: thin ship is off by a
+  typical factor of 2 (closure `none` underpredicts, median 0.55; opposite sign
+  to Athena).
+- Spectrum-gain test (`southampton/spectrum_gain.py`): a per-demihull energy gain
+  G2(theta; Fn, L/vol^(1/3), B/T), fitted with one model held out, predicts the
+  held-out model's monohull C_WP to a factor 1.15 and its catamaran C_WP at all
+  four spacings to 1.18 (closure `none`). Scaling each catamaran point by its own
+  monohull's measured ratio gives 1.25. The fitted gain values themselves are not
+  physical (poorly identified from integrated data); identical side-by-side hulls
+  cannot test phase; all ten hulls are one parent form.
+- The rebuilt NPL hulls' wetted surface is ~5% above Report 71's Table II.
+
+Left:
+- Free-attitude sweep done (100 curves, `southampton/report/summary.md`). Fn >= 0.65:
+  C_T within ~10% with `auto` (0.90-1.01 monohull), 10-13% low with `none`. Fn 0.2-0.35:
+  `auto` gives 10-30x the measured C_WP and C_T 1.1-2.1x high; `none` is 25-35% low on
+  C_T. Monohull trim within ~0.15 deg for models 5 and 6, 0.4-0.5 deg low for model 4
+  and 1.8 deg low for 3b above Fn 0.65. Interference factor tau: `none` matches the
+  measured median at every spacing (rms 0.13-0.30); `auto` is ~0.25 high.
+  Measured (C_T - C_WP) / C_F is 1.26-1.54 and the model's friction + transom drag
+  reproduces it within ~0.08 with no form factor.
+- Insel's 1990 thesis (`local/refs/457354.pdf`) has one tabulated measured spectrum
+  (Wigley, Fn 0.331; `wigley/insel_spectrum.py`): Michell's total is 5% high and its
+  transverse and cusp waves match (0.99-1.13); the diverging waves do not (1.2-1.3x at
+  41-53 deg, 0.58x at 53-61 deg). The thesis's other spectra (Fn 0.5, models C2-C5)
+  and all its resistance data are plots. Insel also predicted catamaran C_WP by
+  superposing *measured* monohull spectra: it works but puts the hump at a shifted
+  Froude number, which he puts down to hull-hull flow the superposition leaves out.
+- Insel Fig. 159 digitised (`wigley/insel_fig159.py`; Wigley fixed, Fn 0.5, by tank
+  harmonic): measured monohull harmonics x the linear placement factor reproduce the
+  measured catamaran harmonics at four spacings (rms 0.025 in the figure's units; thin
+  ship 0.070). The figure's normalisation is inferred, see the CSV header.
+- Couser's 1996 thesis (`local/refs/199075.pdf`): his "slender body" method is the same
+  centreplane-source thin ship, with measured trim/sinkage and a virtual appendage
+  6 transom half-breadths long (tuned with Fn, his Fig. 5.8). In this code (`spectra.py`
+  closures `c6`, `couser`; one length from the DWL transom half-breadth, smoothstep
+  shape, not his per-waterline taper) it is 1.4-1.5x high on C_WP but consistent:
+  error factor ~1.5 raw (auto 2.2, none 1.9-2.0), 1.19 after scaling by the hull's own
+  monohull ratio, 1.12 / 1.15 (mono / cat) with the held-out theta gain.
+  Shorter appendages are worse, not better (2, 3, 4 half-breadths: 1.8x, 1.7x, 1.6x
+  high), so the unbiased length lies between 6 half-breadths and `auto`'s half
+  wavelength; the camber session's wavelength-fraction scan covers that range.
+- Dynamic force and moment (`southampton/attitude.py`): the measured attitude gives the
+  measured dynamic force and moment (minus the hydrostatic imbalance there). Thin ship
+  has the vertical force about right with a closure (-10 to -14% of weight) but its
+  trim moment barely varies with fullness (38-57 against measured 43-102, in 1e-3 W L,
+  Fn >= 0.65): 2.5x low on 3b. A held-out linear correction cuts force rms 3.2 -> 1.6
+  (% W) and moment 19 -> 13 (closure c6).
+- Surrogate training plan (Claude doc, Avi's notes in it, 2026-11-16):
+  https://claude.ai/artifact/NxuucDnzpkN3MdFmF5wQF7 . Avi: cloud CFD is fine; focus on
+  power-boat demihulls first; consider correcting sinkage/trim first (plan now does);
+  closure change goes to the camber session.
+- Phase A (`southampton/phase_a.py`, closure c6): additive ridge correction to the
+  dynamic force and moment, tested closed loop with each hull held out (1700 free
+  solves, ~50 min on 18 cores). Trim rms 0.41 -> 0.13 deg monohull, 0.52 -> 0.22 cat;
+  sinkage 2.0 -> 0.5 and 2.1 -> 0.9 % of draught. Gate (0.3 deg, 1%) met overall; 3b
+  (0.38 deg, 1.1%) and 4a (no gain) are the weak hulls. Total resistance unchanged.
+  The correction is closure-specific and has only seen the Southampton family.
+- Phase A generalisation (`southampton/generalisation.py`, open loop): holding out a
+  whole slenderness or B/T group still works (3b moment error 44.7 -> 9.7). It does
+  NOT extrapolate in speed (Fn >= 0.8 held out: force 3.3 -> 9.8), from monohulls to
+  catamarans (moment 18.9 -> 32.4), or to another family: on Athena (B/T 4.1) the
+  Report-71 correction makes both worse (force 6.3 -> 11.7, moment 12.3 -> 17.1), where
+  plain thin ship is decent. It needs an envelope guard and more families before use
+  on other hulls.
+- Where Avi's hulls sit against the Report 71 envelope (NACRA demihull at 520 kg, four
+  camber-generated demihulls at 500 kg; 2.2 m spacing, 3-6 m/s): inside on
+  L/vol^(1/3) (8.7-8.8), B/T (1.4-1.9), S/L (0.40) and Fn (0.41-0.82); outside on
+  things the series never varied: C_B 0.47-0.55 (NPL 0.397), transom area / max
+  section 0.10-0.22 (NPL 0.53), transom immersion / draught 0.16-0.25 (NPL 0.49).
+  Report 106's Series 64 model 5s (C_B 0.537, L/B 12.8, B/T 2.0, L/vol^(1/3) 8.5) is
+  the closest tank hull to them; its offsets are not in hand (body plan is a scan).
+- Series 64 model 5s (`validation/series64/`): geometry traced from Report 106's body
+  plan (Yeh 1965, `local/refs/yeh.pdf`, has no offset table, only the parent's
+  sectional-area and beam curves, used to identify the stations). Traced hull: C_B
+  0.530 (0.537), C_M 0.851 (0.848), C_P 0.622 (0.633), L/vol^(1/3) 8.52 (8.5), LCB
+  5.9% aft (6.4). The Report 71 Phase A correction does NOT transfer to it: closed
+  loop, all three configurations, trim rms 0.43 -> 0.40 deg and sinkage 1.84 -> 2.19%
+  of draught (monohull trim gets worse, 0.40 -> 0.49). Thin ship alone is ~0.4 deg low
+  in trim above Fn 0.5 on this hull. So Phase A as fitted is specific to the NPL
+  family; refitting it on the PR #3 closure was not done.
+- 2D+t dynamic lift tested against thin ship's shortfall (`validation/lift_2dt/`;
+  boatmath's `lift.rs` formulation with Lewis-form added mass, at the measured
+  attitudes, closure c6, Fn >= 0.4). Moment: right sign and trend with fullness on
+  the NPL series and Series 64 but about half the size needed (slope 1.8 and 2.2,
+  r ~0.6; rms 20 -> 15 and 19 -> 13); no relation on Athena (14 -> 21). Force: it adds
+  3-11% of weight of lift that the measurements do not show (NPL rms 3.4 -> 4.0, Series
+  64 3.6 -> 6.9, where the shortfall is *more suction*, r -0.9). Dropping the transom
+  fade or the cross-flow drag changes little; the "run" angle is worse for moment.
+  So it is not the missing physics in this form. Avi agreed (2026-11-16) that a
+  single-family CFD surrogate is not worth training; plan doc now leads with a CFD
+  spot check.
+- Bow wave (2026-11-16). `athena/wave_profile.py`: thin ship's wave profile along the
+  hull against Jenkins Table 8 (Athena held fixed). Bow crest height, thin / measured:
+  0.98 at Fn 0.28, 0.77, 0.72, 0.61, 0.46 at Fn 0.65, and the thin-ship crest sits
+  1-3 stations too far aft; thin ship's stern trough is also too deep. Noblesse et
+  al.'s analytical relations (J. Hydrodynamics 25(4) 2013, eq. 6a,b; wedge form) give
+  the crest position within about a station and a height a steady 1.5-1.6x the
+  measured one at all five speeds (the hull is flared; their flare factors are in
+  tables not in hand). But a bow-wave load scale built from them
+  (`bow_wave/test.py`) does not explain thin ship's force / moment shortfall: r = 0.03
+  with the moment shortfall on the NPL series (the scale hardly varies with fullness,
+  the shortfall runs -15 to +51), and the fitted slopes differ in sign between
+  families. So: thin ship does lack the bow wave, the relations would fix the picture,
+  and neither this nor 2D+t lift accounts for the missing trim moment.
+- PR #3 (camber session: `auto` = no closure while wet, 0.3 wavelength hollow once dry),
+  scored here from a `.worktrees/pr3` checkout: C_W / C_WP error factor 1.37 on all ten
+  Southampton hulls at measured attitude (old auto 2.19, none 1.98, c6 1.55), the same
+  on the seven hulls it was not fitted to, and no low-speed blow-up. On Athena free to
+  trim it is worse than the old closure at Fn 0.41-0.65 (C_T +27 to +50% against +9 to
+  +23%); held fixed the two are alike (`athena/pr3/summary.md`).
+- Report 106 (`local/refs/106.pdf`, Series 64 catamaran 5s): C_T, trim, sinkage
+  tables, no wave pattern, body plan only as a scanned figure. Not transcribed.
+- Data found but not used: Series 60 fixed/free (Kim & Jenkins 1981), DTMB 5415
+  (Olivieri 2001, IGES), Delft yacht series (4TU, 61 IGES hulls + raw runs).
+  Downloads are in `~/projects/HydroSandbox/local/refs/datasets/` (git-excluded).
