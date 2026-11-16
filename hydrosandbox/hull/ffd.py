@@ -292,14 +292,21 @@ class FFDFamily(DesignFamily):
     shared_grid : Cut every node over one common extent (default), so their
         attitude tables share kernels and build together much faster; ``exact``
         still cuts over the hull's own extent.
+    extent : A fixed extent (``FFDLattice.extent`` keys) to cut every hull over,
+        the nodes and ``exact`` alike: the model and the exact hull are then the
+        same table at the centre, and the grid never moves with the hull (whose
+        resampling otherwise shifts grid-sensitive terms such as transom drag).
+        Pick it to contain everything the moves can reach.
 
     ``exact(values)`` and the nodes are ``lattice.hull(centre | values)``.
     """
 
     def __init__(self, lattice: FFDLattice, names: Sequence[str], half_width: float | Mapping[str, float] = 0.05,
                  centre: Mapping[str, float] | None = None, design: str = "linear", name: str | None = None,
-                 limit: float | None = None, shared_grid: bool = True):
+                 limit: float | None = None, shared_grid: bool = True,
+                 extent: Mapping[str, float] | None = None):
         self.lattice = lattice
+        self.fixed_extent = dict(extent) if extent is not None else None
         self.limit = limit
         self.centre = dict(centre or {})
         lattice.moves({**self.centre, **{n: 0.0 for n in names}})  # validates the names
@@ -327,6 +334,8 @@ class FFDFamily(DesignFamily):
         self._extent = None
 
         def make_hull(values, node_name):
+            if self.fixed_extent is not None:
+                return lattice.hull({**self.centre, **values}, name=node_name, extent=self.fixed_extent)
             if not shared_grid:
                 return lattice.hull({**self.centre, **values}, name=node_name)
             if self._extent is None:
@@ -404,7 +413,7 @@ class FFDFamily(DesignFamily):
         """The deformed hull at ``values``, cut over its own extent."""
         values = self._values(values)
         return self.lattice.hull(self.moves(dict(zip(self.names, values))),
-                                 name=kwargs.pop("name", f"{self.name} exact"))
+                                 name=kwargs.pop("name", f"{self.name} exact"), extent=self.fixed_extent)
 
     def moves(self, values: Mapping[str, float]) -> dict[str, float]:
         """All the lattice's moves at ``values`` of this family's variables."""
@@ -415,4 +424,4 @@ class FFDFamily(DesignFamily):
         """The same family centred on ``values`` (a trust-region step)."""
         hw = half_width if half_width is not None else {n: 0.5 * (hi - lo) for n, (lo, hi) in self.ranges.items()}
         return FFDFamily(self.lattice, self.names, hw, self.moves(values), design or self.design, self.name,
-                         self.limit, self.shared_grid)
+                         self.limit, self.shared_grid, self.fixed_extent)
