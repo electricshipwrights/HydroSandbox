@@ -13,11 +13,21 @@ from hydrosandbox.library.free_surface import smooth_submergence_fraction
 
 #: Free-fall hollow-length coefficient (boatmath ``thinship::BALLISTIC_COEFF``).
 BALLISTIC_COEFF = float(_onp.sqrt(2.0))
-#: Dry-transom hollow length, in transverse wavelengths (``DRY_HOLLOW_FRACTION``).
-DRY_HOLLOW_FRACTION = 0.5
-#: Transom Froude numbers between which the transom goes from wet to dry.
-AUTO_WET_FN_T = 2.5
-AUTO_DRY_FN_T = 3.5
+#: Dry-transom hollow length, in transverse wavelengths (boatmath's ``DRY_HOLLOW_FRACTION``,
+#: used by the ``"boatmath"`` closure).
+BOATMATH_DRY_HOLLOW_FRACTION = 0.5
+#: Dry-transom hollow length of the ``"auto"`` closure, in transverse wavelengths
+#: ``2 pi U^2 / g``: fitted to the wave-pattern resistance of the Southampton
+#: catamaran series (Molland, Wellicome & Couser 1994, models 4b, 5b, 6b,
+#: monohull and S/L 0.2-0.5, Fn 0.4-1.0). The physical hollow closes much sooner
+#: (about 0.1 L behind the transom); this is the length a linear source closure
+#: needs to radiate what the tank measured.
+DRY_HOLLOW_FRACTION = 0.3
+#: Transom Froude numbers between which the transom goes from wet to dry (and the
+#: ``"auto"`` closure fades in). Fitted to the same data: no closure fits best up
+#: to Fn 0.4, the full closure from Fn 0.45.
+AUTO_WET_FN_T = 2.0
+AUTO_DRY_FN_T = 2.5
 
 
 def ittc57_cf(reynolds: Vectorizable) -> Vectorizable:
@@ -51,7 +61,7 @@ class Hull(AeroSandboxObject):
         name: str = "Hull",
         form_factor: float = 0.0,
         roughness_delta_cf: float = 0.0,
-        transom_closure: Literal["auto", "none"] | float = "auto",
+        transom_closure: Literal["auto", "boatmath", "none"] | float = "auto",
         waterline_smoothing: float | None = None,
     ):
         """
@@ -62,10 +72,13 @@ class Hull(AeroSandboxObject):
         half_breadths : ``(n_stations, n_levels)`` half-breadths [m].
         form_factor : Viscous form factor ``k``, as ``(1 + k) * C_F``.
         roughness_delta_cf : Roughness allowance added to ``C_F`` outside ``1 + k``.
-        transom_closure : How the wave integral closes an immersed transom, as in
-            boatmath's ``TransomClosure``: ``"auto"`` (ballistic hollow while the
-            transom is wet, half a transverse wavelength once dry), ``"none"`` (an
-            open body), or a fixed hollow length [m].
+        transom_closure : How the wave integral closes an immersed transom:
+            ``"auto"`` (calibrated against tank data: no closure while the transom
+            is wet, the closing hollow fading in as it runs dry, over
+            ``DRY_HOLLOW_FRACTION`` of a transverse wavelength), ``"boatmath"``
+            (boatmath's ``TransomClosure::Auto``: ballistic hollow while wet, half
+            a transverse wavelength once dry), ``"none"`` (an open body), or a
+            fixed hollow length [m].
         waterline_smoothing : Thickness [m] over which a cell's wetting is blended
             as the water surface passes through it (keeps everything
             differentiable in attitude). Defaults to 1% of the depth of the
@@ -643,7 +656,9 @@ class Hull(AeroSandboxObject):
         The immersed transom at an attitude: its ``area`` [m^2, both sides], its
         first moment about the waterline ``depth_moment`` [m^3], its
         equivalent-rectangle ``depth`` [m], its ``dryness`` (0 wet .. 1 dry, by
-        transom Froude number) and the closing ``hollow_length`` [m].
+        transom Froude number), the closing ``hollow_length`` [m] and the
+        ``closure_strength`` (the fraction of the transom's flux the hollow
+        closes: ``dryness`` for the ``"auto"`` closure, else 1).
         """
         end = self._end_station_submergence(self.stations[-1], sinkage, trim, pivot_xz)
         f_sub = end["f_sub"]
@@ -664,11 +679,17 @@ class Hull(AeroSandboxObject):
         t = np.clip((froude_t - AUTO_WET_FN_T) / (AUTO_DRY_FN_T - AUTO_WET_FN_T), 0.0, 1.0)
         dryness = t * t * (3.0 - 2.0 * t)
 
+        strength = 1.0
         if self.transom_closure == "none" or not self.has_transom:
             hollow = None
         elif self.transom_closure == "auto":
+            # A wet transom is an open body (no closure fits the tank data best);
+            # the closure fades in as the transom runs dry.
+            hollow = DRY_HOLLOW_FRACTION * 2.0 * np.pi / nu
+            strength = dryness
+        elif self.transom_closure == "boatmath":
             wet = BALLISTIC_COEFF * np.sqrt(depth_safe / nu)
-            dry = DRY_HOLLOW_FRACTION * 2.0 * np.pi / nu
+            dry = BOATMATH_DRY_HOLLOW_FRACTION * 2.0 * np.pi / nu
             hollow = wet + dryness * (dry - wet)
         else:
             hollow = float(self.transom_closure)
@@ -678,6 +699,7 @@ class Hull(AeroSandboxObject):
             "depth": depth,
             "dryness": dryness,
             "hollow_length": hollow,
+            "closure_strength": strength,
             "f_sub": f_sub,
             "x_earth": end["x_earth"],
             # Submerged part of each band of the transom section, in earth z.
@@ -752,6 +774,7 @@ class Hull(AeroSandboxObject):
                     * self._transom_f
                     * dz
                     * (shape[k + 1] - shape[k])
+                    * transom["closure_strength"]
                 )
                 sets["smear"].append((hollow / n_hollow) * ones)
 
@@ -866,6 +889,7 @@ class Hull(AeroSandboxObject):
                 )
                 slope.append(
                     cos * transom["f_sub"] * self._transom_f * dz * (shape[k + 1] - shape[k])
+                    * transom["closure_strength"]
                 )
                 z_lo.append(transom["z_lo"])
                 z_hi.append(transom["z_hi"])
