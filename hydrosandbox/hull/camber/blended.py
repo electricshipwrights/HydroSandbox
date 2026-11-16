@@ -139,7 +139,9 @@ class BlendedHull:
     def __init__(self, family: "HullFamily", weights: Sequence[Any]):
         self.family = family
         self.weights = list(weights)
-        self.basis = lattice_basis(self.weights, family.lattice, family.degree)
+        # Any family with ``nodes``, ``name`` and a ``basis(weights)`` (the
+        # Lagrange basis of its lattice) can stand behind a ``BlendedHull``.
+        self.basis = family.basis(self.weights)
         self.name = family.name
 
     def __repr__(self) -> str:
@@ -250,6 +252,10 @@ class HullFamily:
     @property
     def n_hulls(self) -> int:
         return len(self.members)
+
+    def basis(self, weights: Sequence[Any]) -> list[Any]:
+        """The Lagrange basis of the family's lattice at ``weights``."""
+        return lattice_basis(weights, self.lattice, self.degree)
 
     def document(self, weights: Sequence[float], name: str = "") -> CamberHull:
         """The blend itself, as a camber document (camber's ``blendState``)."""

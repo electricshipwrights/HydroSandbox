@@ -522,6 +522,7 @@ def optimize(
     pod_start: tuple[float, float] | None = None,
     propeller_interaction: bool = True,
     blend_start: list[float] | None = None,
+    transform_start: dict | None = None,
     cg_level_at_rest: bool = False,
 ) -> dict | None:
     """
@@ -574,14 +575,29 @@ def optimize(
     blend, swept from camber's blended control points, which is returned as
     ``"hull"`` with the weights as ``"blend_weights"``.
 
+    ``hull`` may likewise be a ``TransformedFamily`` (``hydrosandbox.hull.transformed``:
+    one hull's beam, draft, Lackenby prismatic and LCB, bow rake, ...). Each varied
+    transformation becomes a variable ``hull_<name>`` within the family's range,
+    starting from ``transform_start`` (default: neutral, clipped into the range).
+    The solution is re-evaluated on the exact transformed hull, returned as
+    ``"hull"`` with the values as ``"transform"``.
+
     ``cg_level_at_rest=True`` puts the centre of gravity (fore and aft) wherever the
     hull floats level at rest under ``mass``: at its centre of buoyancy at the
     level sinkage that displaces it. The CG then follows the hull when the hull is a
     variable (a blend), which ``xyz_cg[0]`` and ``cg_range`` are ignored for.
     """
     from hydrosandbox.hull.camber import HullFamily
+    from hydrosandbox.hull.transformed import NEUTRAL, TransformedFamily
 
     family = hull if isinstance(hull, HullFamily) else None
+    transform = hull if isinstance(hull, TransformedFamily) else None
+    if transform is not None:
+        transform_start = {
+            k: float(onp.clip((transform_start or {}).get(k, NEUTRAL[k]), *transform.ranges[k]))
+            for k in transform.names
+        }
+        hull = transform.at(transform_start)
     if family is not None:
         blend_start = list(blend_start) if blend_start is not None else [1.0 / family.n_hulls] * family.n_hulls
         hull = family.at(blend_start)
@@ -739,6 +755,21 @@ def optimize(
             blend_weights = free + [1.0 - sum(free)]
             blend_constraints.append(blend_weights[-1] >= 0.0)
         hull = family.at(blend_weights)
+        common["hull"] = hull
+        for key in ("hull_dynamics", "hull_wave_amplitude"):
+            if key in common:
+                common[key] = hull.rebind(common[key])
+        layout_options["hull"] = hull
+    if transform is not None:
+        # The transformations: each a variable within its range; the hull inside the
+        # solve becomes the family's interpolant there.
+        transform_values = {}
+        for k in transform.names:
+            lo, hi = transform.ranges[k]
+            design[f"hull_{k}"] = transform_values[k] = opti.variable(
+                init_guess=transform_start[k], lower_bound=lo, upper_bound=hi, scale=0.5 * (hi - lo)
+            )
+        hull = transform.at(transform_values)
         common["hull"] = hull
         for key in ("hull_dynamics", "hull_wave_amplitude"):
             if key in common:
@@ -970,6 +1001,17 @@ def optimize(
         if cg_level_at_rest:
             solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
         layout_options["hull"] = hull
+    solved_transform = None
+    if transform is not None:
+        # Re-evaluate on the exact transformed hull, not the interpolant.
+        solved_transform = {
+            k: float(onp.clip(solved[f"hull_{k}"], *transform.ranges[k])) for k in transform.names
+        }
+        hull = transform.exact(solved_transform)
+        exact_common = dict(exact_common, hull=hull)
+        if cg_level_at_rest:
+            solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
+        layout_options["hull"] = hull
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
     final = CraftBuildup(
@@ -1033,6 +1075,8 @@ def optimize(
     outcome = {"design": solved, "loading": solved_loading, "results": final}
     if family is not None:
         outcome.update(blend_weights=solved_weights, hull=hull)
+    if transform is not None:
+        outcome.update(transform=solved_transform, hull=hull)
     return outcome
 
 
