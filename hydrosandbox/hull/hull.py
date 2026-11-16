@@ -37,7 +37,16 @@ AUTO_DRY_FN_T = 2.5
 #: on the half-breadths, so hulls sharing a grid (a design family's nodes, built
 #: attitude by attitude) and repeated contractions within one evaluation reuse them.
 _KERNELS: "collections.OrderedDict[bytes, Any]" = collections.OrderedDict()
-_KERNELS_KEPT = 6
+_KERNELS_KEPT = 64
+_KERNELS_BYTES = 600e6  # per process
+
+
+def _nbytes(value) -> int:
+    if isinstance(value, _onp.ndarray):
+        return value.nbytes
+    if isinstance(value, (tuple, list)):
+        return sum(_nbytes(v) for v in value)
+    return 0
 
 
 def _kernel(tag: str, arrays, compute):
@@ -53,7 +62,9 @@ def _kernel(tag: str, arrays, compute):
         return _KERNELS[key]
     value = compute()
     _KERNELS[key] = value
-    while len(_KERNELS) > _KERNELS_KEPT:
+    while len(_KERNELS) > 1 and (
+        len(_KERNELS) > _KERNELS_KEPT or sum(_nbytes(v) for v in _KERNELS.values()) > _KERNELS_BYTES
+    ):
         _KERNELS.popitem(last=False)
     return value
 
@@ -986,20 +997,30 @@ class Hull(AeroSandboxObject):
                 )
             return out
 
-        # Every submerged cell's depth average, shared by whatever weights come next.
+        # Every cell's depth average, shared by whatever weights come next.
         rows, avg = _kernel(
             "depth_average", (zlo, zhi, k),
-            lambda: (lambda r: (r, depth_average(r)))(_onp.flatnonzero(zlo < 0.0)),
+            lambda: (lambda r: (r, depth_average(r)))(_onp.arange(len(w))),
         )
         where = _onp.full(len(w), -1)
         where[rows] = _onp.arange(len(rows))
         pos = where[nz]
         missing = pos < 0
-        g_mat = _onp.zeros((n_groups, len(nz)), dtype=float)
-        g_mat[nz // n_per, _onp.arange(len(nz))] = w[nz]
-        out = g_mat[:, ~missing] @ avg[pos[~missing]]
+        # Each cell belongs to one group: a weighted sum of rows per group.
+        def grouped(cells, rows_of_cells):
+            out = _onp.zeros((n_groups, m), dtype=float)
+            if len(cells) == 0:
+                return out
+            groups = cells // n_per  # ascending: cells are numbered strip by strip
+            starts = _onp.flatnonzero(_onp.r_[True, groups[1:] != groups[:-1]])
+            out[groups[starts]] = _onp.add.reduceat(w[cells, None] * rows_of_cells, starts, axis=0)
+            return out
+
+        hit = nz[~missing]
+        out = grouped(hit, avg[pos[~missing]])
         if missing.any():  # (cells above the water only through smoothing)
-            out = out + g_mat[:, missing] @ depth_average(nz[missing])
+            lost = nz[missing]
+            out = out + grouped(lost, depth_average(lost))
         return out
 
     @staticmethod
@@ -1012,20 +1033,23 @@ class Hull(AeroSandboxObject):
             w_arr = _onp.asarray(weights, dtype=float)
             x_col = _onp.asarray(x_strip, dtype=float).reshape(-1, 1)
             kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
-            phase = x_col @ kx_arr
-            if _onp.ndim(dx_strip) == 0:
-                half = (0.5 * float(dx_strip)) * kx_arr
-            else:
-                half = (
-                    0.5 * _onp.asarray(dx_strip, dtype=float).reshape(-1, 1) @ kx_arr
+            dx_arr = _onp.asarray(dx_strip, dtype=float)
+
+            def kernel():
+                phase = x_col @ kx_arr
+                if dx_arr.ndim == 0:
+                    half = (0.5 * float(dx_arr)) * kx_arr
+                else:
+                    half = 0.5 * dx_arr.reshape(-1, 1) @ kx_arr
+                half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
+                smear = _onp.where(
+                    _onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
                 )
-            half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
-            smear = _onp.where(
-                _onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
-            )
-            weighted = w_arr * smear
-            re = _onp.sum(weighted * _onp.cos(phase), axis=0, keepdims=True)
-            im = sign * _onp.sum(weighted * _onp.sin(phase), axis=0, keepdims=True)
+                return smear * _onp.cos(phase), smear * _onp.sin(phase)
+
+            ker_c, ker_s = _kernel("strip_transform", (x_col, dx_arr, kx_arr), kernel)
+            re = _onp.sum(w_arr * ker_c, axis=0, keepdims=True)
+            im = sign * _onp.sum(w_arr * ker_s, axis=0, keepdims=True)
             return re, im
         x_col = np.reshape(x_strip, (-1, 1))
         phase = x_col @ kx_row
