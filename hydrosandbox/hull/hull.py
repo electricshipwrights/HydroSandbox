@@ -1328,12 +1328,16 @@ class Hull(AeroSandboxObject):
             kx_row = np.reshape(kx_row, (1, -1))
             if contraction is None:
                 contraction = contract(k_row)
-            g_q = tile(contraction["g_q"], repeats)
-            g_p = tile(contraction["g_p"], repeats)
+            numeric = not self._has_casadi(
+                big_x_hull, arm_hull, d_f_wl, f_wl_mid, contraction["g_q"], contraction["g_p"], kx_row
+            )
+            if numeric and repeats > 1:
+                g_q = g_p = None  # (contracted per k below, never tiled)
+            else:
+                g_q = tile(contraction["g_q"], repeats)
+                g_p = tile(contraction["g_p"], repeats)
 
-            if not self._has_casadi(
-                big_x_hull, arm_hull, d_f_wl, f_wl_mid, g_q, g_p, kx_row
-            ):
+            if numeric:
                 x_col = _onp.asarray(-big_x_hull, dtype=float).reshape(-1, 1)
                 kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
                 dx_col = _onp.asarray(strips["dx_hull"], dtype=float).reshape(-1, 1)
@@ -1348,22 +1352,49 @@ class Hull(AeroSandboxObject):
                     return smear_h * _onp.cos(phase_h), smear_h * _onp.sin(phase_h)
 
                 ker_re, ker_im = _kernel("strip_kernel", (x_col, dx_col, kx_arr), strip_kernel)
-                g_q_arr = _onp.asarray(g_q, dtype=float)
-                g_p_arr = _onp.asarray(g_p, dtype=float)
                 arm_col = _onp.asarray(arm_hull, dtype=float).reshape(-1, 1)
-                g_q1_arr = arm_col * g_q_arr
                 df_row = _onp.asarray(d_f_wl, dtype=float).reshape(1, -1)
                 fwm_row = _onp.asarray(f_wl_mid, dtype=float).reshape(1, -1)
                 adf_row = (arm_col.ravel() * df_row.ravel()).reshape(1, -1)
-                q_re = _onp.sum(g_q_arr * ker_re, axis=0, keepdims=True)
-                q_im = _onp.sum(g_q_arr * ker_im, axis=0, keepdims=True)
-                p_re = _onp.sum(g_p_arr * ker_re, axis=0, keepdims=True)
-                p_im = _onp.sum(g_p_arr * ker_im, axis=0, keepdims=True)
-                q1_re = _onp.sum(g_q1_arr * ker_re, axis=0, keepdims=True)
-                q1_im = _onp.sum(g_q1_arr * ker_im, axis=0, keepdims=True)
-                w_re, w_im = df_row @ ker_re, df_row @ ker_im
-                pw_re, pw_im = fwm_row @ ker_re, fwm_row @ ker_im
-                q1w_re, q1w_im = adf_row @ ker_re, adf_row @ ker_im
+                # The three weightings that don't depend on k, as one product.
+                rows3 = _onp.vstack([df_row, fwm_row, adf_row])
+                r_re, r_im = rows3 @ ker_re, rows3 @ ker_im
+                w_re, pw_re, q1w_re = r_re[0:1], r_re[1:2], r_re[2:3]
+                w_im, pw_im, q1w_im = r_im[0:1], r_im[1:2], r_im[2:3]
+                if repeats > 1:
+                    # The k-row is the contraction's k repeated per theta (theta-major):
+                    # sum over strips as one batched product per k, with the kernel
+                    # laid out (k, theta, strip), instead of tiling the weights.
+                    n_s = x_col.shape[0]
+                    n_kk = kx_arr.shape[1] // repeats
+                    kt_re, kt_im = _kernel(
+                        "strip_kernel_by_k", (x_col, dx_col, kx_arr),
+                        lambda: tuple(
+                            _onp.ascontiguousarray(k.reshape(n_s, repeats, n_kk).transpose(2, 1, 0))
+                            for k in (ker_re, ker_im)
+                        ),
+                    )
+                    g0_q = _onp.asarray(contraction["g_q"], dtype=float)
+                    g0_p = _onp.asarray(contraction["g_p"], dtype=float)
+                    stacked = _onp.stack([g0_q, g0_p, arm_col * g0_q], axis=-1).transpose(1, 0, 2)  # (k, s, 3)
+                    t_re = _onp.matmul(kt_re, stacked)  # (k, theta, 3)
+                    t_im = _onp.matmul(kt_im, stacked)
+
+                    def flat(t, c):
+                        return t[:, :, c].T.reshape(1, -1)  # theta-major row
+
+                    q_re, p_re, q1_re = (flat(t_re, c) for c in range(3))
+                    q_im, p_im, q1_im = (flat(t_im, c) for c in range(3))
+                else:
+                    g_q_arr = _onp.asarray(g_q, dtype=float)
+                    g_p_arr = _onp.asarray(g_p, dtype=float)
+                    g_q1_arr = arm_col * g_q_arr
+                    q_re = _onp.sum(g_q_arr * ker_re, axis=0, keepdims=True)
+                    q_im = _onp.sum(g_q_arr * ker_im, axis=0, keepdims=True)
+                    p_re = _onp.sum(g_p_arr * ker_re, axis=0, keepdims=True)
+                    p_im = _onp.sum(g_p_arr * ker_im, axis=0, keepdims=True)
+                    q1_re = _onp.sum(g_q1_arr * ker_re, axis=0, keepdims=True)
+                    q1_im = _onp.sum(g_q1_arr * ker_im, axis=0, keepdims=True)
             else:
                 phase_h = np.reshape(-big_x_hull, (-1, 1)) @ kx_row
                 half_h = 0.5 * _onp.reshape(strips["dx_hull"], (-1, 1)) @ kx_row
