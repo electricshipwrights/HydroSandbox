@@ -35,7 +35,7 @@ FROUDE = [round(0.2 + 0.05 * i, 2) for i in range(17)]
 
 
 def closure_value(closure: str, froude: float, length: float):
-    if closure in ("auto", "none"):
+    if closure in ("auto", "boatmath", "none"):
         return closure
     if closure.startswith("f"):
         return float(closure[1:]) * 2 * math.pi * froude**2 * length

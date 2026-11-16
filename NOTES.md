@@ -401,6 +401,14 @@ Left:
   on the seven hulls it was not fitted to, and no low-speed blow-up. On Athena free to
   trim it is worse than the old closure at Fn 0.41-0.65 (C_T +27 to +50% against +9 to
   +23%); held fixed the two are alike (`athena/pr3/summary.md`).
+- Reports rerun on the merged PR #3 closure (2026-11-16; `auto` is now the calibrated
+  rule, the old one is `boatmath`). Southampton free attitude, monohull: C_W / C_WP
+  0.65-1.6 below Fn 0.35 (was 10-34), 0.65-0.93 above; C_T 0.66-0.90 of measured below
+  Fn 0.35, 0.98-1.20 at Fn 0.4-0.6, 0.93-1.09 above. The interference factor runs
+  high with it (1.43 against a measured 1.12 at S/L 0.2; `none` gives 1.07). Athena
+  free, Fn 0.41-0.65: C_T 27-50% high with `auto`, 9-23% with `boatmath`, 5-17% with
+  `none`. The Phase A, lift and bow-wave experiments use the fixed c6 closure and
+  were not rerun.
 - Report 106 (`local/refs/106.pdf`, Series 64 catamaran 5s): C_T, trim, sinkage
   tables, no wave pattern, body plan only as a scanned figure. Not transcribed.
 - Data found but not used: Series 60 fixed/free (Kim & Jenkins 1981), DTMB 5415

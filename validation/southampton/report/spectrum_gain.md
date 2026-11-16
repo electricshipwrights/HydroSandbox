@@ -6,93 +6,47 @@ Southampton series, Fn >= 0.3, thin ship at the measured attitude. Each cell: me
 
 | predictor | trained on | monohull (n=150) | catamaran (n=585) |
 |---|---|---|---|
-| thin ship | - | 0.66 / x2.20 | 0.84 / x2.19 |
-| mono-scaled | the same hull's monohull point | exact by construction | 1.23 / x1.33 |
-| flat gain | mono only | (training data) | 1.22 / x1.36 |
-| flat gain | leave one model out | 0.86 / x1.35 | 1.03 / x1.28 |
-| theta gain | mono only | (training data) | 1.57 / x1.61 |
-| theta gain | leave one model out | 0.93 / x1.25 | 1.02 / x1.23 |
+| thin ship | - | 0.76 / x1.42 | 0.92 / x1.36 |
+| mono-scaled | the same hull's monohull point | exact by construction | 1.19 / x1.29 |
+| flat gain | mono only | (training data) | 1.20 / x1.39 |
+| flat gain | leave one model out | 0.87 / x1.32 | 1.03 / x1.33 |
+| theta gain | mono only | (training data) | 1.06 / x1.31 |
+| theta gain | leave one model out | 1.00 / x1.25 | 0.98 / x1.29 |
 
 Leave-one-model-out theta gain, catamarans, by speed and by spacing:
 
 | | thin ship | mono-scaled | theta gain (held out) |
 |---|---|---|---|
-| Fn 0.30-0.45 | 3.20 / x3.96 | 1.18 / x1.36 | 1.00 / x1.25 |
-| Fn 0.50-0.70 | 0.79 / x1.56 | 1.25 / x1.34 | 1.04 / x1.23 |
-| Fn 0.75-1.00 | 0.79 / x1.30 | 1.23 / x1.30 | 1.02 / x1.20 |
-| S/L 0.2 | 0.81 / x2.35 | 1.19 / x1.39 | 1.00 / x1.22 |
-| S/L 0.3 | 0.84 / x2.17 | 1.23 / x1.33 | 0.99 / x1.24 |
-| S/L 0.4 | 0.86 / x2.11 | 1.25 / x1.30 | 1.04 / x1.21 |
-| S/L 0.5 | 0.83 / x2.12 | 1.23 / x1.29 | 1.04 / x1.23 |
+| Fn 0.30-0.45 | 0.84 / x1.67 | 1.04 / x1.31 | 0.98 / x1.48 |
+| Fn 0.50-0.70 | 0.96 / x1.19 | 1.23 / x1.26 | 1.00 / x1.24 |
+| Fn 0.75-1.00 | 0.91 / x1.19 | 1.22 / x1.31 | 0.98 / x1.16 |
+| S/L 0.2 | 0.94 / x1.32 | 1.23 / x1.32 | 0.96 / x1.28 |
+| S/L 0.3 | 0.98 / x1.38 | 1.26 / x1.35 | 1.00 / x1.36 |
+| S/L 0.4 | 0.91 / x1.39 | 1.19 / x1.27 | 0.98 / x1.29 |
+| S/L 0.5 | 0.86 / x1.34 | 1.13 / x1.23 | 1.00 / x1.23 |
 
-## Transom closure `c2`
+## Transom closure `boatmath`
 
 | predictor | trained on | monohull (n=150) | catamaran (n=585) |
 |---|---|---|---|
-| thin ship | - | 1.83 / x2.30 | 1.82 / x2.39 |
-| mono-scaled | the same hull's monohull point | exact by construction | 1.00 / x1.18 |
-| flat gain | mono only | (training data) | 0.99 / x1.19 |
-| flat gain | leave one model out | 0.98 / x1.16 | 0.99 / x1.18 |
-| theta gain | mono only | (training data) | 1.13 / x1.22 |
-| theta gain | leave one model out | 0.97 / x1.13 | 1.00 / x1.17 |
+| thin ship | - | 0.63 / x1.99 | 0.77 / x2.01 |
+| mono-scaled | the same hull's monohull point | exact by construction | 1.20 / x1.33 |
+| flat gain | mono only | (training data) | 1.18 / x1.47 |
+| flat gain | leave one model out | 0.84 / x1.42 | 1.00 / x1.44 |
+| theta gain | mono only | (training data) | 0.94 / x1.50 |
+| theta gain | leave one model out | 0.94 / x1.33 | 0.99 / x1.41 |
 
 Leave-one-model-out theta gain, catamarans, by speed and by spacing:
 
 | | thin ship | mono-scaled | theta gain (held out) |
 |---|---|---|---|
-| Fn 0.30-0.45 | 3.29 / x4.01 | 1.07 / x1.24 | 0.97 / x1.20 |
-| Fn 0.50-0.70 | 1.75 / x1.80 | 0.98 / x1.11 | 1.01 / x1.11 |
-| Fn 0.75-1.00 | 1.67 / x1.71 | 1.00 / x1.18 | 0.99 / x1.18 |
-| S/L 0.2 | 1.67 / x2.44 | 0.95 / x1.22 | 0.99 / x1.17 |
-| S/L 0.3 | 1.82 / x2.36 | 0.99 / x1.21 | 1.00 / x1.18 |
-| S/L 0.4 | 1.81 / x2.35 | 1.00 / x1.16 | 1.00 / x1.15 |
-| S/L 0.5 | 1.90 / x2.40 | 1.03 / x1.13 | 1.01 / x1.16 |
-
-## Transom closure `c3`
-
-| predictor | trained on | monohull (n=150) | catamaran (n=585) |
-|---|---|---|---|
-| thin ship | - | 1.73 / x2.05 | 1.73 / x2.14 |
-| mono-scaled | the same hull's monohull point | exact by construction | 1.01 / x1.18 |
-| flat gain | mono only | (training data) | 1.00 / x1.19 |
-| flat gain | leave one model out | 0.98 / x1.16 | 0.99 / x1.18 |
-| theta gain | mono only | (training data) | 1.11 / x1.20 |
-| theta gain | leave one model out | 0.96 / x1.13 | 1.01 / x1.16 |
-
-Leave-one-model-out theta gain, catamarans, by speed and by spacing:
-
-| | thin ship | mono-scaled | theta gain (held out) |
-|---|---|---|---|
-| Fn 0.30-0.45 | 2.74 / x3.26 | 1.07 / x1.25 | 0.99 / x1.20 |
-| Fn 0.50-0.70 | 1.67 / x1.72 | 1.00 / x1.11 | 1.02 / x1.11 |
-| Fn 0.75-1.00 | 1.60 / x1.65 | 0.99 / x1.19 | 1.01 / x1.15 |
-| S/L 0.2 | 1.61 / x2.19 | 0.96 / x1.22 | 1.01 / x1.17 |
-| S/L 0.3 | 1.74 / x2.12 | 1.00 / x1.21 | 1.01 / x1.16 |
-| S/L 0.4 | 1.73 / x2.11 | 1.01 / x1.16 | 1.02 / x1.15 |
-| S/L 0.5 | 1.77 / x2.15 | 1.03 / x1.13 | 1.02 / x1.15 |
-
-## Transom closure `c4`
-
-| predictor | trained on | monohull (n=150) | catamaran (n=585) |
-|---|---|---|---|
-| thin ship | - | 1.59 / x1.82 | 1.63 / x1.91 |
-| mono-scaled | the same hull's monohull point | exact by construction | 1.02 / x1.18 |
-| flat gain | mono only | (training data) | 1.02 / x1.19 |
-| flat gain | leave one model out | 0.97 / x1.16 | 0.99 / x1.17 |
-| theta gain | mono only | (training data) | 1.10 / x1.20 |
-| theta gain | leave one model out | 0.98 / x1.12 | 1.01 / x1.14 |
-
-Leave-one-model-out theta gain, catamarans, by speed and by spacing:
-
-| | thin ship | mono-scaled | theta gain (held out) |
-|---|---|---|---|
-| Fn 0.30-0.45 | 2.26 / x2.64 | 1.08 / x1.25 | 0.99 / x1.19 |
-| Fn 0.50-0.70 | 1.58 / x1.63 | 1.01 / x1.11 | 1.01 / x1.10 |
-| Fn 0.75-1.00 | 1.53 / x1.59 | 0.99 / x1.19 | 1.01 / x1.14 |
-| S/L 0.2 | 1.56 / x1.96 | 0.98 / x1.23 | 1.01 / x1.16 |
-| S/L 0.3 | 1.64 / x1.89 | 1.01 / x1.21 | 1.00 / x1.15 |
-| S/L 0.4 | 1.63 / x1.89 | 1.01 / x1.16 | 1.00 / x1.13 |
-| S/L 0.5 | 1.67 / x1.92 | 1.04 / x1.13 | 1.01 / x1.13 |
+| Fn 0.30-0.45 | 1.05 / x3.25 | 1.08 / x1.41 | 0.93 / x1.64 |
+| Fn 0.50-0.70 | 0.69 / x1.63 | 1.23 / x1.31 | 1.00 / x1.38 |
+| Fn 0.75-1.00 | 0.79 / x1.30 | 1.23 / x1.30 | 0.99 / x1.23 |
+| S/L 0.2 | 0.71 / x2.15 | 1.13 / x1.34 | 0.91 / x1.45 |
+| S/L 0.3 | 0.75 / x2.05 | 1.20 / x1.39 | 0.96 / x1.45 |
+| S/L 0.4 | 0.79 / x1.95 | 1.26 / x1.32 | 1.02 / x1.37 |
+| S/L 0.5 | 0.79 / x1.90 | 1.23 / x1.29 | 1.05 / x1.37 |
 
 ## Transom closure `c6`
 
@@ -172,27 +126,4 @@ Fitted energy gain G2 (all data), model 5b:
 | 0.5 | 1.41 | 3.24 | 1.31 | 3.16 |
 | 0.7 | 2.82 | 1.64 | 2.39 | 0.79 |
 | 1.0 | 3.02 | 0.76 | 0.78 | 3.40 |
-
-## Transom closure `pr3`
-
-| predictor | trained on | monohull (n=150) | catamaran (n=585) |
-|---|---|---|---|
-| thin ship | - | 0.76 / x1.42 | 0.92 / x1.36 |
-| mono-scaled | the same hull's monohull point | exact by construction | 1.19 / x1.29 |
-| flat gain | mono only | (training data) | 1.20 / x1.39 |
-| flat gain | leave one model out | 0.87 / x1.32 | 1.03 / x1.33 |
-| theta gain | mono only | (training data) | 1.06 / x1.31 |
-| theta gain | leave one model out | 1.00 / x1.25 | 0.98 / x1.29 |
-
-Leave-one-model-out theta gain, catamarans, by speed and by spacing:
-
-| | thin ship | mono-scaled | theta gain (held out) |
-|---|---|---|---|
-| Fn 0.30-0.45 | 0.84 / x1.67 | 1.04 / x1.31 | 0.98 / x1.48 |
-| Fn 0.50-0.70 | 0.96 / x1.19 | 1.23 / x1.26 | 1.00 / x1.24 |
-| Fn 0.75-1.00 | 0.91 / x1.19 | 1.22 / x1.31 | 0.98 / x1.16 |
-| S/L 0.2 | 0.94 / x1.32 | 1.23 / x1.32 | 0.96 / x1.28 |
-| S/L 0.3 | 0.98 / x1.38 | 1.26 / x1.35 | 1.00 / x1.36 |
-| S/L 0.4 | 0.91 / x1.39 | 1.19 / x1.27 | 0.98 / x1.29 |
-| S/L 0.5 | 0.86 / x1.34 | 1.13 / x1.23 | 1.00 / x1.23 |
 

@@ -62,7 +62,7 @@ COUSER_RATIO = {1.5: [8.0, 6.0, 4.0, 3.6, 6.05, 8.0, 8.0], 2.0: [8.0, 5.9, 3.8, 
 def closure_value(closure: str, fn: float, bt: float, transom_half_beam: float):
     """`auto` / `none` as in `Hull`; `c6`: a hollow six transom half-breadths long (Couser's constant
     virtual appendage); `couser`: his variation of that length with Fn and B/T."""
-    if closure in ("auto", "none"):
+    if closure in ("auto", "boatmath", "none"):
         return closure
     if closure == "couser":
         return float(np.interp(fn, COUSER_FN, COUSER_RATIO[bt])) * transom_half_beam
