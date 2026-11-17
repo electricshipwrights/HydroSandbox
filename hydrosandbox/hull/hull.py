@@ -4,6 +4,8 @@ the ``boatmath`` project (crates ``hullgeom`` and ``thinship``) ported to
 ``aerosandbox.numpy`` so that a hull's attitude can be an optimization variable.
 """
 
+import collections
+import hashlib
 from typing import Any, Literal, Sequence
 import numpy as _onp
 from aerosandbox.common import AeroSandboxObject
@@ -30,6 +32,43 @@ AUTO_WET_FN_T = 2.0
 AUTO_DRY_FN_T = 2.5
 
 
+#: The most recent expensive numeric kernels (depth exponentials, strip phases),
+#: keyed by their inputs. They depend on the offset grid and the attitude but not
+#: on the half-breadths, so hulls sharing a grid (a design family's nodes, built
+#: attitude by attitude) and repeated contractions within one evaluation reuse them.
+_KERNELS: "collections.OrderedDict[bytes, Any]" = collections.OrderedDict()
+_KERNELS_KEPT = 64
+_KERNELS_BYTES = 600e6  # per process
+
+
+def _nbytes(value) -> int:
+    if isinstance(value, _onp.ndarray):
+        return value.nbytes
+    if isinstance(value, (tuple, list)):
+        return sum(_nbytes(v) for v in value)
+    return 0
+
+
+def _kernel(tag: str, arrays, compute):
+    """``compute()``, or its cached value for the same ``tag`` and input ``arrays``."""
+    h = hashlib.blake2b(tag.encode(), digest_size=16)
+    for a in arrays:
+        a = _onp.ascontiguousarray(a, dtype=float)
+        h.update(str(a.shape).encode())
+        h.update(a.tobytes())
+    key = h.digest()
+    if key in _KERNELS:
+        _KERNELS.move_to_end(key)
+        return _KERNELS[key]
+    value = compute()
+    _KERNELS[key] = value
+    while len(_KERNELS) > 1 and (
+        len(_KERNELS) > _KERNELS_KEPT or sum(_nbytes(v) for v in _KERNELS.values()) > _KERNELS_BYTES
+    ):
+        _KERNELS.popitem(last=False)
+    return value
+
+
 def ittc57_cf(reynolds: Vectorizable) -> Vectorizable:
     """ITTC-57 model-ship correlation line, ``C_F = 0.075 / (log10(Re) - 2)^2``."""
     return 0.075 / (np.log10(reynolds) - 2.0) ** 2
@@ -52,6 +91,11 @@ class Hull(AeroSandboxObject):
     strength ``2 U df/dx``. It gives wave resistance (with any other wave-maker
     sharing the spectrum), but no dynamic lift, sinkage or trim of the hull itself.
     """
+
+    #: Factor on the wetted surface the offset table gives (and so on viscous drag):
+    #: set by constructions that know the true surface better than the table can
+    #: (``FFDLattice.hull``, whose deformed keel and stem lines fall between grid lines).
+    wetted_surface_scale: float = 1.0
 
     def __init__(
         self,
@@ -594,7 +638,7 @@ class Hull(AeroSandboxObject):
             "wetted_length": wetted_length,
             "x_cb": np.sum(d_volume * x_mid) / volume_safe,
             "z_cb": np.sum(d_volume * z_mid) / volume_safe,
-            "wetted_surface": np.sum(d_area * cells["f_sub"]),
+            "wetted_surface": self.wetted_surface_scale * np.sum(d_area * cells["f_sub"]),
         }
 
     def viscous_resistance(
@@ -938,24 +982,45 @@ class Hull(AeroSandboxObject):
         nz = _onp.flatnonzero(w != 0.0)
         if len(nz) == 0:
             return _onp.zeros((n_groups, m), dtype=float)
-        g_mat = _onp.zeros((n_groups, len(nz)), dtype=float)
-        g_mat[nz // n_per, _onp.arange(len(nz))] = w[nz]
-        zlo_nz = zlo[nz, None]
-        zhi_nz = zhi[nz, None]
-        out = _onp.empty((n_groups, m), dtype=float)
-        for s0 in range(0, m, 512):
-            kc = k[:, s0 : s0 + 512]
-            a = zlo_nz * kc
-            b = zhi_nz * kc
-            d = b - a
-            sm = _onp.abs(d) < 1e-6
-            d_safe = _onp.where(sm, 1.0, d)
-            avg = _onp.where(
-                sm,
-                _onp.exp(0.5 * (a + b)),
-                (_onp.exp(b) - _onp.exp(a)) / d_safe,
-            )
-            out[:, s0 : s0 + 512] = g_mat @ avg
+
+        def depth_average(rows):
+            out = _onp.empty((len(rows), m), dtype=float)
+            zl, zh = zlo[rows, None], zhi[rows, None]
+            for s0 in range(0, m, 512):
+                kc = k[:, s0 : s0 + 512]
+                a, b = zl * kc, zh * kc
+                d = b - a
+                sm = _onp.abs(d) < 1e-6
+                d_safe = _onp.where(sm, 1.0, d)
+                out[:, s0 : s0 + 512] = _onp.where(
+                    sm, _onp.exp(0.5 * (a + b)), (_onp.exp(b) - _onp.exp(a)) / d_safe
+                )
+            return out
+
+        # Every cell's depth average, shared by whatever weights come next.
+        rows, avg = _kernel(
+            "depth_average", (zlo, zhi, k),
+            lambda: (lambda r: (r, depth_average(r)))(_onp.arange(len(w))),
+        )
+        where = _onp.full(len(w), -1)
+        where[rows] = _onp.arange(len(rows))
+        pos = where[nz]
+        missing = pos < 0
+        # Each cell belongs to one group: a weighted sum of rows per group.
+        def grouped(cells, rows_of_cells):
+            out = _onp.zeros((n_groups, m), dtype=float)
+            if len(cells) == 0:
+                return out
+            groups = cells // n_per  # ascending: cells are numbered strip by strip
+            starts = _onp.flatnonzero(_onp.r_[True, groups[1:] != groups[:-1]])
+            out[groups[starts]] = _onp.add.reduceat(w[cells, None] * rows_of_cells, starts, axis=0)
+            return out
+
+        hit = nz[~missing]
+        out = grouped(hit, avg[pos[~missing]])
+        if missing.any():  # (cells above the water only through smoothing)
+            lost = nz[missing]
+            out = out + grouped(lost, depth_average(lost))
         return out
 
     @staticmethod
@@ -968,20 +1033,23 @@ class Hull(AeroSandboxObject):
             w_arr = _onp.asarray(weights, dtype=float)
             x_col = _onp.asarray(x_strip, dtype=float).reshape(-1, 1)
             kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
-            phase = x_col @ kx_arr
-            if _onp.ndim(dx_strip) == 0:
-                half = (0.5 * float(dx_strip)) * kx_arr
-            else:
-                half = (
-                    0.5 * _onp.asarray(dx_strip, dtype=float).reshape(-1, 1) @ kx_arr
+            dx_arr = _onp.asarray(dx_strip, dtype=float)
+
+            def kernel():
+                phase = x_col @ kx_arr
+                if dx_arr.ndim == 0:
+                    half = (0.5 * float(dx_arr)) * kx_arr
+                else:
+                    half = 0.5 * dx_arr.reshape(-1, 1) @ kx_arr
+                half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
+                smear = _onp.where(
+                    _onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
                 )
-            half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
-            smear = _onp.where(
-                _onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
-            )
-            weighted = w_arr * smear
-            re = _onp.sum(weighted * _onp.cos(phase), axis=0, keepdims=True)
-            im = sign * _onp.sum(weighted * _onp.sin(phase), axis=0, keepdims=True)
+                return smear * _onp.cos(phase), smear * _onp.sin(phase)
+
+            ker_c, ker_s = _kernel("strip_transform", (x_col, dx_arr, kx_arr), kernel)
+            re = _onp.sum(w_arr * ker_c, axis=0, keepdims=True)
+            im = sign * _onp.sum(w_arr * ker_s, axis=0, keepdims=True)
             return re, im
         x_col = np.reshape(x_strip, (-1, 1))
         phase = x_col @ kx_row
@@ -1260,40 +1328,73 @@ class Hull(AeroSandboxObject):
             kx_row = np.reshape(kx_row, (1, -1))
             if contraction is None:
                 contraction = contract(k_row)
-            g_q = tile(contraction["g_q"], repeats)
-            g_p = tile(contraction["g_p"], repeats)
+            numeric = not self._has_casadi(
+                big_x_hull, arm_hull, d_f_wl, f_wl_mid, contraction["g_q"], contraction["g_p"], kx_row
+            )
+            if numeric and repeats > 1:
+                g_q = g_p = None  # (contracted per k below, never tiled)
+            else:
+                g_q = tile(contraction["g_q"], repeats)
+                g_p = tile(contraction["g_p"], repeats)
 
-            if not self._has_casadi(
-                big_x_hull, arm_hull, d_f_wl, f_wl_mid, g_q, g_p, kx_row
-            ):
+            if numeric:
                 x_col = _onp.asarray(-big_x_hull, dtype=float).reshape(-1, 1)
                 kx_arr = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
-                phase_h = x_col @ kx_arr
-                half_h = (
-                    0.5 * _onp.asarray(strips["dx_hull"], dtype=float).reshape(-1, 1) @ kx_arr
-                )
-                half_safe = _onp.where(_onp.fabs(half_h) < 1e-6, 1.0, half_h)
-                smear_h = _onp.where(
-                    _onp.fabs(half_h) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
-                )
-                ker_re = smear_h * _onp.cos(phase_h)
-                ker_im = smear_h * _onp.sin(phase_h)
-                g_q_arr = _onp.asarray(g_q, dtype=float)
-                g_p_arr = _onp.asarray(g_p, dtype=float)
+                dx_col = _onp.asarray(strips["dx_hull"], dtype=float).reshape(-1, 1)
+
+                def strip_kernel():
+                    phase_h = x_col @ kx_arr
+                    half_h = 0.5 * dx_col @ kx_arr
+                    half_safe = _onp.where(_onp.fabs(half_h) < 1e-6, 1.0, half_h)
+                    smear_h = _onp.where(
+                        _onp.fabs(half_h) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe
+                    )
+                    return smear_h * _onp.cos(phase_h), smear_h * _onp.sin(phase_h)
+
+                ker_re, ker_im = _kernel("strip_kernel", (x_col, dx_col, kx_arr), strip_kernel)
                 arm_col = _onp.asarray(arm_hull, dtype=float).reshape(-1, 1)
-                g_q1_arr = arm_col * g_q_arr
                 df_row = _onp.asarray(d_f_wl, dtype=float).reshape(1, -1)
                 fwm_row = _onp.asarray(f_wl_mid, dtype=float).reshape(1, -1)
                 adf_row = (arm_col.ravel() * df_row.ravel()).reshape(1, -1)
-                q_re = _onp.sum(g_q_arr * ker_re, axis=0, keepdims=True)
-                q_im = _onp.sum(g_q_arr * ker_im, axis=0, keepdims=True)
-                p_re = _onp.sum(g_p_arr * ker_re, axis=0, keepdims=True)
-                p_im = _onp.sum(g_p_arr * ker_im, axis=0, keepdims=True)
-                q1_re = _onp.sum(g_q1_arr * ker_re, axis=0, keepdims=True)
-                q1_im = _onp.sum(g_q1_arr * ker_im, axis=0, keepdims=True)
-                w_re, w_im = df_row @ ker_re, df_row @ ker_im
-                pw_re, pw_im = fwm_row @ ker_re, fwm_row @ ker_im
-                q1w_re, q1w_im = adf_row @ ker_re, adf_row @ ker_im
+                # The three weightings that don't depend on k, as one product.
+                rows3 = _onp.vstack([df_row, fwm_row, adf_row])
+                r_re, r_im = rows3 @ ker_re, rows3 @ ker_im
+                w_re, pw_re, q1w_re = r_re[0:1], r_re[1:2], r_re[2:3]
+                w_im, pw_im, q1w_im = r_im[0:1], r_im[1:2], r_im[2:3]
+                if repeats > 1:
+                    # The k-row is the contraction's k repeated per theta (theta-major):
+                    # sum over strips as one batched product per k, with the kernel
+                    # laid out (k, theta, strip), instead of tiling the weights.
+                    n_s = x_col.shape[0]
+                    n_kk = kx_arr.shape[1] // repeats
+                    kt_re, kt_im = _kernel(
+                        "strip_kernel_by_k", (x_col, dx_col, kx_arr),
+                        lambda: tuple(
+                            _onp.ascontiguousarray(k.reshape(n_s, repeats, n_kk).transpose(2, 1, 0))
+                            for k in (ker_re, ker_im)
+                        ),
+                    )
+                    g0_q = _onp.asarray(contraction["g_q"], dtype=float)
+                    g0_p = _onp.asarray(contraction["g_p"], dtype=float)
+                    stacked = _onp.stack([g0_q, g0_p, arm_col * g0_q], axis=-1).transpose(1, 0, 2)  # (k, s, 3)
+                    t_re = _onp.matmul(kt_re, stacked)  # (k, theta, 3)
+                    t_im = _onp.matmul(kt_im, stacked)
+
+                    def flat(t, c):
+                        return t[:, :, c].T.reshape(1, -1)  # theta-major row
+
+                    q_re, p_re, q1_re = (flat(t_re, c) for c in range(3))
+                    q_im, p_im, q1_im = (flat(t_im, c) for c in range(3))
+                else:
+                    g_q_arr = _onp.asarray(g_q, dtype=float)
+                    g_p_arr = _onp.asarray(g_p, dtype=float)
+                    g_q1_arr = arm_col * g_q_arr
+                    q_re = _onp.sum(g_q_arr * ker_re, axis=0, keepdims=True)
+                    q_im = _onp.sum(g_q_arr * ker_im, axis=0, keepdims=True)
+                    p_re = _onp.sum(g_p_arr * ker_re, axis=0, keepdims=True)
+                    p_im = _onp.sum(g_p_arr * ker_im, axis=0, keepdims=True)
+                    q1_re = _onp.sum(g_q1_arr * ker_re, axis=0, keepdims=True)
+                    q1_im = _onp.sum(g_q1_arr * ker_im, axis=0, keepdims=True)
             else:
                 phase_h = np.reshape(-big_x_hull, (-1, 1)) @ kx_row
                 half_h = 0.5 * _onp.reshape(strips["dx_hull"], (-1, 1)) @ kx_row
@@ -1961,6 +2062,495 @@ def _dynamic_force_point(hull, velocity, density, gravity, sinkage, trim, pivot_
         float(here["moment_bow_up"]),
         float(here["moment_slope"]),
     )
+
+
+# ----------------------------------------------------------------------
+# Tables for many hulls at once (a design family's nodes)
+# ----------------------------------------------------------------------
+_REBUILT: dict = {}
+#: Hulls per batched dynamic-force evaluation.
+_BATCH_CHUNK = 8
+
+
+def _hull_spec(h) -> tuple:
+    """What a worker needs to rebuild ``h`` (much lighter to send than the hull)."""
+    return (
+        _onp.asarray(h.stations, dtype=float), _onp.asarray(h.levels, dtype=float),
+        _onp.asarray(h.half_breadths, dtype=float),
+        dict(name=h.name, form_factor=h.form_factor, roughness_delta_cf=h.roughness_delta_cf,
+             transom_closure=h.transom_closure, waterline_smoothing=h.waterline_smoothing),
+    )
+
+
+def _hulls_from_specs(specs) -> list:
+    """The hulls of ``specs``, rebuilt once per worker process."""
+    digest = hashlib.blake2b(digest_size=16)
+    for st, lv, hb, kw in specs:
+        for a in (st, lv, hb):
+            digest.update(a.tobytes())
+        digest.update(repr(sorted(kw.items())).encode())
+    key = digest.digest()
+    if key not in _REBUILT:
+        _REBUILT.clear()
+        _REBUILT[key] = [Hull(st, lv, hb, **kw) for st, lv, hb, kw in specs]
+    return _REBUILT[key]
+
+
+def _dynamic_force_point_batch(specs, velocity, density, gravity, sinkage, trim, pivots, level, spacing):
+    """One attitude for every hull (batched where they share a grid and pivot)."""
+    hulls = _hulls_from_specs(specs)
+    if len(hulls) > 1 and len({(h.stations.tobytes(), h.levels.tobytes()) for h in hulls}) == 1 \
+            and len(set(pivots)) == 1:
+        out = []
+        for c in range(0, len(hulls), _BATCH_CHUNK):  # chunks keep the temporaries in cache
+            r = dynamic_force_batch(hulls[c:c + _BATCH_CHUNK], velocity, density, gravity, sinkage, trim,
+                                    pivots[0], x_ref=pivots[0][0], level=level, demihull_spacing=spacing)
+            out += [(float(f), float(m), float(sl))
+                    for f, m, sl in zip(r["force_up"], r["moment_bow_up"], r["moment_slope"])]
+        return out
+    return [
+        _dynamic_force_point(h, velocity, density, gravity, sinkage, trim, p, level, spacing)
+        for h, p in zip(_hulls_from_specs(specs), pivots)
+    ]
+
+
+def _wave_amplitude_point_batch(specs, velocity, gravity, sinkage, trim, pivots, spacing, kx, kappa, ky):
+    """One attitude's amplitude spectrum for every hull (batched where they share a grid)."""
+    hulls = _hulls_from_specs(specs)
+    if len(hulls) > 1 and len({(h.stations.tobytes(), h.levels.tobytes()) for h in hulls}) == 1 \
+            and len(set(pivots)) == 1:
+        re, im = wave_amplitude_batch(hulls, velocity, gravity, sinkage, trim, pivots[0], spacing, kx, kappa, ky)
+        return [(re[n], im[n]) for n in range(len(hulls))]
+    out = []
+    for h, p in zip(hulls, pivots):
+        re_v, im_v = h.wave_amplitude(velocity, gravity, sinkage, trim, p, demihull_spacing=spacing)(kx, kappa, ky)
+        out.append((_onp.asarray(re_v, dtype=float).ravel(), _onp.asarray(im_v, dtype=float).ravel()))
+    return out
+
+
+def wave_amplitude_batch(hulls, velocity, gravity, sinkage, trim, pivot_xz, spacing, kx, kappa, ky):
+    """
+    ``Hull.wave_amplitude(...)(kx, kappa, ky)`` for many hulls on one offset grid
+    at one attitude (numeric), as ``(re, im)`` arrays of shape (hulls, wavenumbers).
+    The hull cells' depth exponentials are computed once and contracted for every
+    hull together, strip by strip, as dense products; the bow step and transom
+    hollow (which differ per hull) go hull by hull.
+    """
+    kx = _onp.asarray(kx, dtype=float).reshape(1, -1)
+    kappa = _onp.asarray(kappa, dtype=float).reshape(1, -1)
+    m = kx.shape[1]
+    strips = [h._strips(velocity, gravity, sinkage, trim, pivot_xz) for h in hulls]
+    s0 = strips[0]
+    n_strips = s0["n_hull"]
+    W = _onp.stack([_onp.asarray(st["slope_hull"], dtype=float).ravel() for st in strips])  # (H, cells)
+    zlo = _onp.minimum(_onp.asarray(s0["z_lo_hull"], dtype=float).ravel(), 0.0)
+    zhi = _onp.minimum(_onp.asarray(s0["z_hi_hull"], dtype=float).ravel(), 0.0)
+    n_per = W.shape[1] // n_strips
+
+    def depth_average():
+        out = _onp.empty((len(zlo), m), dtype=float)
+        for c0 in range(0, m, 512):
+            kc = kappa[:, c0 : c0 + 512]
+            a, b = zlo[:, None] * kc, zhi[:, None] * kc
+            d = b - a
+            sm = _onp.abs(d) < 1e-6
+            out[:, c0 : c0 + 512] = _onp.where(
+                sm, _onp.exp(0.5 * (a + b)), (_onp.exp(b) - _onp.exp(a)) / _onp.where(sm, 1.0, d)
+            )
+        return out
+
+    avg = _kernel("depth_average_all", (zlo, zhi, kappa), depth_average)
+    g = _onp.zeros((len(hulls), n_strips, m), dtype=float)
+    for s in range(n_strips):
+        cells = slice(s * n_per, (s + 1) * n_per)
+        w_s = W[:, cells]
+        live = _onp.flatnonzero(_onp.any(w_s != 0.0, axis=0))
+        if live.size:
+            g[:, s, :] = w_s[:, live] @ avg[cells][live]
+    ker_c, ker_s = _kernel(
+        "strip_transform",
+        (_onp.asarray(s0["x_hull"], dtype=float).reshape(-1, 1), _onp.asarray(s0["dx_hull"], dtype=float), kx),
+        lambda: _strip_kernel(s0["x_hull"], s0["dx_hull"], kx),
+    )
+    re = _onp.einsum("hsm,sm->hm", g, ker_c)
+    im = -_onp.einsum("hsm,sm->hm", g, ker_s)
+    for n, (h, st) in enumerate(zip(hulls, strips)):
+        for part in ("bow", "hollow"):
+            if st[f"n_{part}"] > 0:
+                gp = h._contract_groups(st[f"slope_{part}"], st[f"z_lo_{part}"], st[f"z_hi_{part}"], kappa, st[f"n_{part}"])
+                r, i = h._strip_transform(gp, st[f"x_{part}"], st[f"dx_{part}"], kx, sign=-1.0)
+                re[n] += _onp.ravel(r)
+                im[n] += _onp.ravel(i)
+    if spacing is not None:
+        pair = 2.0 * _onp.cos(0.5 * spacing * _onp.asarray(ky, dtype=float).reshape(1, -1))
+        re, im = pair * re, pair * im
+    return 2.0 * velocity * re, 2.0 * velocity * im
+
+
+def _depth_average_matrix(zlo, zhi, kappa):
+    """Each cell's mean ``exp(kappa z)`` over its submerged edge, (cells, wavenumbers)."""
+    kappa = _onp.asarray(kappa, dtype=float).reshape(1, -1)
+    m = kappa.shape[1]
+    out = _onp.empty((len(zlo), m), dtype=float)
+    for c0 in range(0, m, 512):
+        kc = kappa[:, c0 : c0 + 512]
+        a, b = zlo[:, None] * kc, zhi[:, None] * kc
+        d = b - a
+        sm = _onp.abs(d) < 1e-6
+        out[:, c0 : c0 + 512] = _onp.where(
+            sm, _onp.exp(0.5 * (a + b)), (_onp.exp(b) - _onp.exp(a)) / _onp.where(sm, 1.0, d)
+        )
+    return out
+
+
+def _contract_batch(W, z_lo, z_hi, k_row, n_groups):
+    """
+    ``Hull._contract_groups`` for a stack of weights ``W`` (hulls, cells) on shared
+    cell edges: (hulls, groups, wavenumbers), one dense product per group.
+    """
+    zlo = _onp.minimum(_onp.asarray(z_lo, dtype=float).ravel(), 0.0)
+    zhi = _onp.minimum(_onp.asarray(z_hi, dtype=float).ravel(), 0.0)
+    k = _onp.asarray(k_row, dtype=float).reshape(1, -1)
+    avg = _kernel("depth_average_all", (zlo, zhi, k), lambda: _depth_average_matrix(zlo, zhi, k))
+    W = _onp.asarray(W, dtype=float)
+    n_per = W.shape[1] // n_groups
+    out = _onp.zeros((W.shape[0], n_groups, k.shape[1]), dtype=float)
+    for g in range(n_groups):
+        cells = slice(g * n_per, (g + 1) * n_per)
+        w_g = W[:, cells]
+        live = _onp.flatnonzero(_onp.any(w_g != 0.0, axis=0))
+        if live.size:
+            out[:, g, :] = w_g[:, live] @ avg[cells][live]
+    return out
+
+
+def dynamic_force_batch(hulls, velocity, density, gravity, sinkage, trim, pivot_xz, x_ref=None,
+                        level: float = 1, demihull_spacing: float | None = None) -> dict[str, _onp.ndarray]:
+    """
+    ``Hull.dynamic_force`` (numeric) for many hulls on one offset grid at one
+    attitude: the same quadrature, with every hull's weights contracted against
+    kernels computed once. Returns arrays over the hulls.
+    """
+    velocity, sinkage, trim = float(velocity), float(sinkage), float(trim)
+    h0 = hulls[0]
+    for h in hulls[1:]:
+        if not (_onp.array_equal(h.stations, h0.stations) and _onp.array_equal(h.levels, h0.levels)):
+            raise ValueError("dynamic_force_batch needs hulls on one offset grid")
+    n_h = len(hulls)
+    nu = gravity / velocity**2
+    nu_ref = nu
+    if x_ref is None:
+        x_ref = pivot_xz[0]
+    strips = [h._strips(velocity, gravity, sinkage, trim, pivot_xz) for h in hulls]
+    s0 = strips[0]
+    n_hull = s0["n_hull"]
+    cos = float(_onp.cos(_onp.radians(trim)))
+    x_strip = _onp.asarray(s0["x_hull"], dtype=float).reshape(-1, 1)
+    dx_col = _onp.asarray(s0["dx_hull"], dtype=float).reshape(-1, 1)
+    arm_hull = (-x_strip + x_ref).ravel()  # (S,)
+    x_t_earth = float(_onp.ravel(s0["transom"]["x_earth"])[0])
+    arm_transom = -x_t_earth + x_ref
+    x_b_earth = float(_onp.ravel(s0["bow"]["x_earth"])[0])
+    arm_bow = -x_b_earth + x_ref
+
+    f_wl = _onp.stack([_onp.asarray(h._waterline_half_breadths(sinkage, trim, pivot_xz), dtype=float).ravel()
+                       for h in hulls])  # (H, stations)
+    d_f_wl = -(f_wl[:, 1:] - f_wl[:, :-1])
+    f_wl_mid = 0.5 * (f_wl[:, 1:] + f_wl[:, :-1]) * dx_col.ravel()[None, :]
+    f_wl_transom, f_wl_bow = f_wl[:, -1:], f_wl[:, :1]
+    transom_dz = h0._transom_z_hi - h0._transom_z_lo
+    t_sub = _onp.asarray(s0["transom"]["f_sub"], dtype=float).ravel()
+    b_sub = _onp.asarray(s0["bow"]["f_sub"], dtype=float).ravel()
+    W_q = _onp.stack([_onp.asarray(st["slope_hull"], dtype=float).ravel() for st in strips])
+    W_p = _onp.stack([_onp.asarray(st["half_volume"], dtype=float).ravel() for st in strips])
+    W_t = _onp.stack([cos * t_sub * h._transom_f * transom_dz for h in hulls])
+    W_b = _onp.stack([cos * b_sub * h._bow_f * transom_dz for h in hulls])
+
+    def contract(k_row):
+        k_row = _onp.asarray(k_row, dtype=float).reshape(1, -1)
+        out = {
+            "g_q": -_contract_batch(W_q, s0["z_lo_hull"], s0["z_hi_hull"], k_row, n_hull),
+            "g_p": _contract_batch(W_p, s0["z_lo_hull"], s0["z_hi_hull"], k_row, n_hull),
+            "z_t": _contract_batch(W_t, s0["transom"]["z_lo"], s0["transom"]["z_hi"], k_row, 1)[:, 0, :],
+            "z_b": _contract_batch(W_b, s0["bow"]["z_lo"], s0["bow"]["z_hi"], k_row, 1)[:, 0, :],
+            "g_h": [
+                -h._contract_groups(st["slope_hollow"], st["z_lo_hollow"], st["z_hi_hollow"], k_row, st["n_hollow"])
+                if st["n_hollow"] > 0 else None
+                for h, st in zip(hulls, strips)
+            ],
+        }
+        return out
+
+    def forms(kx_row, k_row, contraction=None, repeats: int = 1, part: str = "re"):
+        """
+        The bilinear forms (qq, wq, rq, rwq), real or imaginary ``part`` only (each
+        caller needs one), as (hulls, wavenumbers) arrays.
+        """
+        kx_row = _onp.asarray(kx_row, dtype=float).reshape(1, -1)
+        if contraction is None:
+            contraction = contract(k_row)
+        tile = (lambda a: _onp.tile(a, (1, repeats))) if repeats > 1 else (lambda a: a)
+        ker_re, ker_im = _kernel("strip_kernel", (x_strip, dx_col, kx_row),
+                                 lambda: _strip_kernel(x_strip, dx_col, kx_row))
+        rows = _onp.vstack([d_f_wl, f_wl_mid, arm_hull[None, :] * d_f_wl])  # (3H, S)
+        r_re, r_im = rows @ ker_re, rows @ ker_im
+        w_re, pw_re, q1w_re = r_re[:n_h], r_re[n_h:2 * n_h], r_re[2 * n_h:]
+        w_im, pw_im, q1w_im = r_im[:n_h], r_im[n_h:2 * n_h], r_im[2 * n_h:]
+        g_q, g_p = contraction["g_q"], contraction["g_p"]  # (H, S, K)
+        stacked = _onp.concatenate([g_q, g_p, arm_hull[None, :, None] * g_q], axis=0)  # (3H, S, K)
+        if repeats > 1:
+            n_s, n_kk = x_strip.shape[0], kx_row.shape[1] // repeats
+            kt_re, kt_im = _kernel(
+                "strip_kernel_by_k", (x_strip, dx_col, kx_row),
+                lambda: tuple(_onp.ascontiguousarray(k.reshape(n_s, repeats, n_kk).transpose(2, 1, 0))
+                              for k in (ker_re, ker_im)),
+            )
+            G = _onp.ascontiguousarray(stacked.transpose(2, 1, 0))  # (K, S, 3H)
+            t_re = _onp.matmul(kt_re, G).transpose(2, 1, 0).reshape(3 * n_h, -1)  # theta-major
+            t_im = _onp.matmul(kt_im, G).transpose(2, 1, 0).reshape(3 * n_h, -1)
+        else:
+            t_re = _onp.einsum("csm,sm->cm", stacked, ker_re)
+            t_im = _onp.einsum("csm,sm->cm", stacked, ker_im)
+        q_re, p_re, q1_re = t_re[:n_h], t_re[n_h:2 * n_h], t_re[2 * n_h:]
+        q_im, p_im, q1_im = t_im[:n_h], t_im[n_h:2 * n_h], t_im[2 * n_h:]
+
+        src_re, src_im = q_re.copy(), q_im.copy()
+        z_b = tile(contraction["z_b"])
+        phase_b = x_b_earth * kx_row
+        cos_b, sin_b = _onp.cos(phase_b), _onp.sin(phase_b)
+        src_re, src_im = src_re - z_b * cos_b, src_im - z_b * sin_b
+        for n, (h, st) in enumerate(zip(hulls, strips)):
+            if st["n_hollow"] > 0:
+                h_re, h_im = h._strip_transform(tile(contraction["g_h"][n]), st["x_hollow"], st["dx_hollow"],
+                                                kx_row, sign=1.0)
+                src_re[n] += _onp.ravel(h_re)
+                src_im[n] += _onp.ravel(h_im)
+
+        z_t = tile(contraction["z_t"])
+        phase_t = x_t_earth * kx_row
+        cos_t, sin_t = _onp.cos(phase_t), _onp.sin(phase_t)
+        q_re = q_re + z_t * cos_t - z_b * cos_b
+        q_im = q_im + z_t * sin_t - z_b * sin_b
+        q1_re = q1_re + arm_transom * z_t * cos_t - arm_bow * z_b * cos_b
+        q1_im = q1_im + arm_transom * z_t * sin_t - arm_bow * z_b * sin_b
+        w_re = w_re + f_wl_transom * cos_t - f_wl_bow * cos_b
+        w_im = w_im + f_wl_transom * sin_t - f_wl_bow * sin_b
+        q1w_re = q1w_re + arm_transom * f_wl_transom * cos_t - arm_bow * f_wl_bow * cos_b
+        q1w_im = q1w_im + arm_transom * f_wl_transom * sin_t - arm_bow * f_wl_bow * sin_b
+        r_re, r_im = p_re + q1_re, p_im + q1_im
+        rw_re, rw_im = pw_re + q1w_re, pw_im + q1w_im
+
+        if part == "re":
+            conj = lambda a_re, a_im: a_re * src_re + a_im * src_im
+        else:
+            conj = lambda a_re, a_im: a_re * src_im - a_im * src_re
+        out = [conj(q_re, q_im), conj(w_re, w_im), conj(r_re, r_im), conj(rw_re, rw_im)]
+        if demihull_spacing is not None:
+            k_all = _onp.asarray(k_row, dtype=float).reshape(1, -1)
+            if repeats > 1:
+                k_all = _onp.tile(k_all, (1, repeats))
+            ky = _onp.sqrt(_onp.fmax(k_all**2 - kx_row**2, 0.0))
+            pair = 2.0 * (1.0 + _onp.cos(demihull_spacing * ky))
+            for v in out:
+                v *= pair
+        return out
+
+    ### Local (principal-value) part, as in Hull.dynamic_force.
+    length = h0.length
+    draft = max(float(-h0.levels[0]), 1e-6)
+    gx, gw = _onp.polynomial.legendre.leggauss(8)
+
+    def panels(edges):
+        half = 0.5 * _onp.diff(edges)
+        mid = 0.5 * (edges[1:] + edges[:-1])
+        return (
+            (mid[:, None] + half[:, None] * gx[None, :]).reshape(-1),
+            (half[:, None] * gw[None, :]).reshape(-1),
+        )
+
+    k_lo = 0.05 / length
+    k_max = max(1.0e4 / length, 60.0 / draft)
+    n_log = max(int(round(12 * level)), 2)
+    k_nodes, k_weights = panels(
+        _onp.concatenate([[0.0], k_lo * (k_max / k_lo) ** (_onp.arange(n_log + 1) / n_log)])
+    )
+    q_cap = 400.0 / length
+    theta_c = min(_onp.arccos(min(q_cap / k_max, 1.0)), _onp.pi / 2 - 1e-7)
+    theta_nodes, theta_weights = panels(_onp.linspace(0.0, theta_c, max(int(round(24 * level)), 2) + 1))
+    theta_nodes = _onp.append(theta_nodes, theta_c)
+    theta_weights = _onp.append(theta_weights, _onp.pi / 2 - theta_c)
+
+    cos_t = _onp.cos(theta_nodes)
+    k0_all = nu / cos_t**2
+    k0_ref = nu_ref / cos_t**2
+    pole = forms((k0_all * cos_t).reshape(1, -1), k0_all.reshape(1, -1))  # qq, wq, rq, rwq
+    two_nu_sec2 = 2.0 * nu / cos_t**2
+
+    n_k, n_t = len(k_nodes), len(theta_nodes)
+    kx_grid = (cos_t[:, None] * k_nodes[None, :]).reshape(1, -1)
+    qq, wq, rq_re, rwq_re = forms(kx_grid, k_nodes, contraction=contract(k_nodes), repeats=n_t)
+    per_theta = lambda v: v.reshape(n_h, n_t, n_k).transpose(0, 2, 1)  # (H, n_k, n_t)
+    qq, wq, rq_re, rwq_re = (per_theta(v) for v in (qq, wq, rq_re, rwq_re))
+    k_mat = k_nodes[:, None] * _onp.ones((1, n_t))
+    wk = k_weights[:, None]
+    denom = k_mat - k0_all[None, :]
+    eps_d = 1e-12 * _onp.maximum(k_mat, 1.0)
+    inv_denom = denom / (denom * denom + eps_d * eps_d)
+    coef = two_nu_sec2[None, :]
+    h_f = coef * (k_mat * qq - wq)
+    h_m = coef * (k_mat * rq_re - rwq_re)
+    h0_f = two_nu_sec2[None, :] * (k0_all[None, :] * pole[0] - pole[1])  # (H, n_t)
+    h0_m = two_nu_sec2[None, :] * (k0_all[None, :] * pole[2] - pole[3])
+    inner_f = _onp.sum(wk * (k_mat * qq + (h_f - h0_f[:, None, :]) * inv_denom), axis=1)  # (H, n_t)
+    inner_m = _onp.sum(wk * (k_mat * rq_re + (h_m - h0_m[:, None, :]) * inv_denom), axis=1)
+
+    k_hi = _onp.where(k0_ref >= k_max, 4.0 * k0_ref, k_max)
+    extension_f = _onp.zeros((n_h, n_t))
+    extension_m = _onp.zeros((n_h, n_t))
+    for i in _onp.nonzero(k_hi > k_max)[0]:
+        n_ext = max(int(round(4 * level)), 1)
+        ext_nodes, ext_weights = panels(k_max * (k_hi[i] / k_max) ** (_onp.arange(n_ext + 1) / n_ext))
+        e_qq, e_wq, e_rq, e_rwq = forms(ext_nodes * cos_t[i], ext_nodes)
+        ext_k = ext_nodes.reshape(1, -1)
+        ext_w = ext_weights.reshape(1, -1)
+        e_hf = two_nu_sec2[i] * (ext_k * e_qq - e_wq)
+        e_hm = two_nu_sec2[i] * (ext_k * e_rq - e_rwq)
+        ext_d = ext_k - k0_all[i]
+        eps_ext = 1e-12 * _onp.maximum(ext_k, 1.0)
+        inv_ext_d = ext_d / (ext_d * ext_d + eps_ext * eps_ext)
+        extension_f[:, i] = _onp.sum(ext_w * (ext_k * e_qq + (e_hf - h0_f[:, i:i + 1]) * inv_ext_d), axis=1)
+        extension_m[:, i] = _onp.sum(ext_w * (ext_k * e_rq + (e_hm - h0_m[:, i:i + 1]) * inv_ext_d), axis=1)
+
+    diff_k = k_hi - k0_all
+    eps_k = 1e-12 * _onp.fmax(k_hi, k0_all)
+    log_term = 0.5 * _onp.log((diff_k * diff_k + eps_k * eps_k) / (k0_all * k0_all))
+    force_integral = _onp.sum(theta_weights[None, :] * (inner_f + extension_f + h0_f * log_term[None, :]), axis=1)
+    moment_integral = _onp.sum(theta_weights[None, :] * (inner_m + extension_m + h0_m * log_term[None, :]), axis=1)
+    prefactor = -(density * velocity**2) / (2.0 * _onp.pi**2)
+    force_up = prefactor * 4.0 * force_integral
+    moment_local = prefactor * 4.0 * moment_integral
+
+    ### Wave (residue) part of the moment.
+    kx_cap = max(400.0 / length, 2.0 * nu_ref)
+    theta_max = min(_onp.arccos(min(nu_ref / kx_cap, 1.0)), _onp.pi / 2 - 1e-7)
+    wave_nodes, wave_weights = panels(_onp.linspace(0.0, theta_max, max(int(round(48 * level)), 2) + 1))
+    lam = 1.0 / _onp.cos(wave_nodes)
+    k_wave = (nu * lam**2).reshape(1, -1)
+    qq_im, wq_im, rq_im, rwq_im = forms((nu * lam).reshape(1, -1), k_wave, part="im")
+    wave_wt = (wave_weights * lam**2).reshape(1, -1)
+    wave_integral = _onp.sum((k_wave * rq_im - rwq_im) * wave_wt, axis=1)
+    wave_slope_integral = _onp.sum((k_wave * qq_im - wq_im) * wave_wt, axis=1)
+    moment_wave = -(4.0 * density * velocity**2 * nu / _onp.pi) * wave_integral
+    moment_wave_slope = -(4.0 * density * velocity**2 * nu / _onp.pi) * wave_slope_integral
+    return {
+        "force_up": force_up,
+        "moment_bow_up": moment_local + moment_wave,
+        "moment_local": moment_local,
+        "moment_wave": moment_wave,
+        "moment_slope": force_up + moment_wave_slope,
+    }
+
+
+def _strip_kernel(x_strip, dx_strip, kx):
+    """``sinc(kx dx / 2) cos(kx x)`` and ``... sin(kx x)`` per strip and wavenumber."""
+    x_col = _onp.asarray(x_strip, dtype=float).reshape(-1, 1)
+    dx_arr = _onp.asarray(dx_strip, dtype=float)
+    phase = x_col @ kx
+    half = (0.5 * float(dx_arr)) * kx if dx_arr.ndim == 0 else 0.5 * dx_arr.reshape(-1, 1) @ kx
+    half_safe = _onp.where(_onp.fabs(half) < 1e-6, 1.0, half)
+    smear = _onp.where(_onp.fabs(half) < 1e-6, 1.0, _onp.sin(half_safe) / half_safe)
+    return smear * _onp.cos(phase), smear * _onp.sin(phase)
+
+
+def dynamic_force_tables(
+    hulls: Sequence["Hull"], velocity: float, density: float, gravity: float = 9.80665,
+    sinkage_range: tuple[float, float] = (-0.15, 0.05), trim_range: tuple[float, float] = (-2.0, 4.0),
+    n_sinkage: int = 9, n_trim: int = 13, pivot_xz: Sequence[float] | None = None,
+    demihull_spacing: float | None = None, level: float = 1, jobs: int | None = 1,
+) -> list["DynamicForceTable"]:
+    """
+    ``Hull.dynamic_force_table`` for many hulls at once: each worker takes an
+    attitude and evaluates every hull there, so hulls on the same offset grid (a
+    design family's nodes) share its expensive kernels.
+    """
+    from hydrosandbox.parallel import parallel_map
+
+    pivots = [
+        tuple(float(v) for v in pivot_xz) if pivot_xz is not None
+        else (0.5 * float(h.stations[0] + h.stations[-1]), 0.0)
+        for h in hulls
+    ]
+    specs = [_hull_spec(h) for h in hulls]
+    sinkages = _onp.linspace(sinkage_range[0], sinkage_range[1], n_sinkage)
+    trims = _onp.linspace(trim_range[0], trim_range[1], n_trim)
+    tasks = [
+        (specs, float(velocity), float(density), gravity, float(s), float(t), pivots, level, demihull_spacing)
+        for t in trims
+        for s in sinkages
+    ]
+    values = parallel_map(_dynamic_force_point_batch, tasks, jobs=jobs)
+    return [
+        DynamicForceTable(
+            sinkages=sinkages, trims=trims,
+            force=_onp.array([v[n][0] for v in values]),
+            moment=_onp.array([v[n][1] for v in values]),
+            moment_slope=_onp.array([v[n][2] for v in values]),
+            pivot_xz=pivots[n], velocity=float(velocity),
+        )
+        for n in range(len(hulls))
+    ]
+
+
+def wave_amplitude_tables(
+    hulls: Sequence["Hull"], velocity: float, gravity: float = 9.80665,
+    length_scales: tuple[float, float, float] | None = None,
+    sinkage_range: tuple[float, float] = (-0.15, 0.05), trim_range: tuple[float, float] = (-2.0, 4.0),
+    n_sinkage: int = 9, n_trim: int = 13, pivot_xz: Sequence[float] | None = None,
+    demihull_spacing: float | None = None, phase_per_panel: float = 2.0, nodes_per_panel: int = 6,
+    jobs: int | None = 1,
+) -> list["WaveAmplitudeTable"]:
+    """``Hull.wave_amplitude_table`` for many hulls at once (see ``dynamic_force_tables``)."""
+    from hydrosandbox.library.wave_resistance import wave_quadrature_nodes
+    from hydrosandbox.parallel import parallel_map
+
+    if length_scales is None:
+        length_scales = hulls[0].default_wave_length_scales(demihull_spacing)
+    min_d = max(float(length_scales[2]), 1e-3)
+    y_ext = max(float(length_scales[0]), min_d)
+    x_ext = max(float(length_scales[1]), min_d)
+    vel = float(velocity)
+    nu = gravity / vel**2
+    sigma, _ = wave_quadrature_nodes(
+        nu=nu, y_extent=y_ext, x_extent=x_ext, min_depth=min_d,
+        phase_per_panel=phase_per_panel, nodes_per_panel=nodes_per_panel,
+    )
+    kappa = (nu + sigma**2).reshape(1, -1)
+    kx = _onp.sqrt(nu * kappa)
+    ky = sigma.reshape(1, -1) * _onp.sqrt(kappa)
+    pivots = [
+        tuple(float(v) for v in pivot_xz) if pivot_xz is not None
+        else (0.5 * float(h.stations[0] + h.stations[-1]), 0.0)
+        for h in hulls
+    ]
+    specs = [_hull_spec(h) for h in hulls]
+    sinkages = _onp.linspace(sinkage_range[0], sinkage_range[1], n_sinkage)
+    trims = _onp.linspace(trim_range[0], trim_range[1], n_trim)
+    tasks = [
+        (specs, vel, gravity, float(s), float(t), pivots, demihull_spacing, kx, kappa, ky)
+        for s in sinkages
+        for t in trims
+    ]
+    values = parallel_map(_wave_amplitude_point_batch, tasks, jobs=jobs)
+    n_s, n_t, m = len(sinkages), len(trims), kx.size
+    out = []
+    for n in range(len(hulls)):
+        re = _onp.array([v[n][0] for v in values]).reshape(n_s, n_t, m)
+        im = _onp.array([v[n][1] for v in values]).reshape(n_s, n_t, m)
+        out.append(WaveAmplitudeTable(
+            sinkages=sinkages, trims=trims, re=re, im=im, kx=kx.ravel(), kappa=kappa.ravel(),
+            pivot_xz=pivots[n], velocity=vel, length_scales=tuple(float(v) for v in length_scales),
+        ))
+    return out
 
 
 class DynamicForceTable:

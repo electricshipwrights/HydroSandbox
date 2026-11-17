@@ -139,7 +139,9 @@ class BlendedHull:
     def __init__(self, family: "HullFamily", weights: Sequence[Any]):
         self.family = family
         self.weights = list(weights)
-        self.basis = lattice_basis(self.weights, family.lattice, family.degree)
+        # Any family with ``nodes``, ``name`` and a ``basis(weights)`` (the
+        # Lagrange basis of its lattice) can stand behind a ``BlendedHull``.
+        self.basis = family.basis(self.weights)
         self.name = family.name
 
     def __repr__(self) -> str:
@@ -165,6 +167,14 @@ class BlendedHull:
         def method(*args, **kwargs):
             if name in self._FROM_SECTIONS and kwargs.get("sections") is not None:
                 return first(*args, **kwargs)
+            if name in ("dynamic_force_table", "wave_amplitude_table"):
+                # Every node needs one (tables are built once and rebound to other
+                # weights): build them together, attitude by attitude, so nodes on
+                # a shared grid share the expensive kernels.
+                from hydrosandbox.hull import hull as _hull
+
+                tables = getattr(_hull, name + "s")(self.nodes, *args, **kwargs)
+                return _mix(tables, self.basis)
             # Tables are built once and rebound to other weights, so every node needs one.
             every = name.endswith("_table")
             active = [(b, n) for b, n in zip(self.basis, self.nodes) if every or not _is_zero(b)]
@@ -250,6 +260,10 @@ class HullFamily:
     @property
     def n_hulls(self) -> int:
         return len(self.members)
+
+    def basis(self, weights: Sequence[Any]) -> list[Any]:
+        """The Lagrange basis of the family's lattice at ``weights``."""
+        return lattice_basis(weights, self.lattice, self.degree)
 
     def document(self, weights: Sequence[float], name: str = "") -> CamberHull:
         """The blend itself, as a camber document (camber's ``blendState``)."""

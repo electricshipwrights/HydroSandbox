@@ -242,3 +242,62 @@ def test_surface_patches_follow_the_sweep():
             worst = max(worst, float(onp.linalg.norm(surf - fine[:, 2 * a : 2 * b + 1], axis=-1).max()))
     assert k == len(patches) - 1
     assert worst < 0.002 * load("skiff").loa * load("skiff").unit_m
+
+
+def test_generated_demihull():
+    """A hull from numbers alone: valid, few points, square-sterned, at the asked displacement."""
+    from hydrosandbox.hull.camber.generate import DemihullParameters, demihull, with_displacement
+
+    for p in (
+        DemihullParameters(),
+        DemihullParameters(station_u=(0.0, 0.3, 0.7, 1.0), side=(300.0, 380.0, 450.0, 480.0),
+                           bottom=(150.0, 220.0, 230.0, 200.0), fullness=(0.9, 0.6, 0.4, 0.2)),
+    ):
+        doc = with_displacement(demihull(p), 0.25, n_stations=41, n_levels=25)
+        assert doc.topology == (5, 3, 4, p.n_stations)
+        again = parse_document(json.loads(doc.to_json()))  # a valid version-2 document
+        hull = Hull.from_camber(again, n_stations=41, n_levels=25)
+        assert float(hull.hydrostatics()["volume"]) == pytest.approx(0.25, rel=2e-3)
+        assert hull.length == pytest.approx(p.length / 1000.0, rel=1e-3)
+        assert hull.has_transom
+        # Narrower stations are cut nearer the sheer: the keel rises to the stem.
+        assert float(hull.keel_height(hull.stations[1])) > float(hull.keel_height(hull.stations[20]))
+        # The bow closes: nothing at the stem swings outboard of the centreline.
+        stem = SweptHull(doc).swept_section(1.0, 8)["pts"]
+        assert stem is None or onp.abs(stem[:, 1]).max() < 0.5
+
+
+def test_generated_bow_closes_with_a_smooth_foot():
+    """A section whose smooth topsides would bulge outboard gets just enough knuckle."""
+    from hydrosandbox.hull.camber.generate import inboard, outboard_bulge, section_points
+
+    pts = section_points(side=500.0, bottom=100.0, fullness=0.2, flare=38.0, reach=298.0)
+    assert outboard_bulge(pts) > 5.0
+    fixed = inboard(pts)
+    assert outboard_bulge(fixed) <= 0.05 and 0.0 < fixed[1].k <= 1.0
+
+
+def test_generated_family():
+    """A blend family around a generated hull: its centroid is the hull, its weights move the numbers."""
+    from hydrosandbox.hull.camber.generate import DemihullParameters, GeneratedFamily, demihull, with_displacement
+
+    base = DemihullParameters()
+    steps = {"side.1": 40.0, "transom_half_beam": 15.0}
+    g = GeneratedFamily(base, steps, volume=0.25, n_stations=31, n_levels=21)
+    assert g.n_hulls == 3 and len(g.family.nodes) == 10
+    centroid = g.weights()
+    assert centroid == pytest.approx([1 / 3] * 3)
+    assert g.parameters(centroid) == base
+    # One step along one number, the other held.
+    w = g.weights({"side.1": 40.0})
+    assert min(w) >= -1e-12
+    p = g.parameters(w)
+    assert p.side[1] == pytest.approx(base.side[1] + 40.0) and p.transom_half_beam == pytest.approx(base.transom_half_beam)
+    # The centroid blend is close to the base hull at its displacement: blending is linear in the
+    # control points, but the generator clamps the forward plan point (here at the widest beam).
+    doc = with_displacement(demihull(base), 0.25, n_stations=31, n_levels=21)
+    blend = g.document(centroid)
+    assert blend.waterline == pytest.approx(doc.waterline)
+    for a, b in zip(blend.stations, doc.stations):
+        assert [c for q in a.points for c in (q.n, q.z)] == pytest.approx([c for q in b.points for c in (q.n, q.z)], abs=1e-6)
+    assert float(g.family.at(centroid).hydrostatics()["volume"]) == pytest.approx(0.25, rel=1e-2)

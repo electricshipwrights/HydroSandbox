@@ -522,6 +522,8 @@ def optimize(
     pod_start: tuple[float, float] | None = None,
     propeller_interaction: bool = True,
     blend_start: list[float] | None = None,
+    transform_start: dict | None = None,
+    hull_constraints=None,
     cg_level_at_rest: bool = False,
 ) -> dict | None:
     """
@@ -574,14 +576,33 @@ def optimize(
     blend, swept from camber's blended control points, which is returned as
     ``"hull"`` with the weights as ``"blend_weights"``.
 
+    ``hull`` may likewise be a ``DesignFamily`` (``hydrosandbox.hull.transformed``:
+    e.g. a ``TransformedFamily`` of one hull's beam, draft, Lackenby prismatic and
+    LCB, bow rake, or an ``FFDFamily``). Each of its variables becomes a variable
+    ``hull_<name>`` within the family's range, starting from ``transform_start``
+    (default: the family's ``start``).
+    The solution is re-evaluated on the exact transformed hull, returned as
+    ``"hull"`` with the values as ``"transform"``.
+
+    ``hull_constraints(hull)`` (optional) returns further constraints on the hull
+    inside the solve (e.g. draft or freeboard limits on a family's interpolant).
+
     ``cg_level_at_rest=True`` puts the centre of gravity (fore and aft) wherever the
     hull floats level at rest under ``mass``: at its centre of buoyancy at the
     level sinkage that displaces it. The CG then follows the hull when the hull is a
     variable (a blend), which ``xyz_cg[0]`` and ``cg_range`` are ignored for.
     """
     from hydrosandbox.hull.camber import HullFamily
+    from hydrosandbox.hull.transformed import DesignFamily
 
     family = hull if isinstance(hull, HullFamily) else None
+    transform = hull if isinstance(hull, DesignFamily) else None
+    if transform is not None:
+        transform_start = {
+            k: float(onp.clip((transform_start or {}).get(k, transform.start[k]), *transform.ranges[k]))
+            for k in transform.names
+        }
+        hull = transform.at(transform_start)
     if family is not None:
         blend_start = list(blend_start) if blend_start is not None else [1.0 / family.n_hulls] * family.n_hulls
         hull = family.at(blend_start)
@@ -744,6 +765,21 @@ def optimize(
             if key in common:
                 common[key] = hull.rebind(common[key])
         layout_options["hull"] = hull
+    if transform is not None:
+        # The transformations: each a variable within its range; the hull inside the
+        # solve becomes the family's interpolant there.
+        transform_values = {}
+        for k in transform.names:
+            lo, hi = transform.ranges[k]
+            design[f"hull_{k}"] = transform_values[k] = opti.variable(
+                init_guess=transform_start[k], lower_bound=lo, upper_bound=hi, scale=0.5 * (hi - lo)
+            )
+        hull = transform.at(transform_values)
+        common["hull"] = hull
+        for key in ("hull_dynamics", "hull_wave_amplitude"):
+            if key in common:
+                common[key] = hull.rebind(common[key])
+        layout_options["hull"] = hull
     interacting = pods is not None and propeller_interaction
     wake_fraction = inflow_angle = 0.0
     if interacting:
@@ -865,6 +901,8 @@ def optimize(
         res["F_z_net"] / weight == 0,
         res["M_y_net"] / (weight * hull.length) == 0,
     ] + blend_constraints + rest_constraints
+    if hull_constraints is not None:
+        constraints += list(hull_constraints(hull))
     if pods is not None:
         shaft_power_limit = pods["max_input_power"] * pods["motor_efficiency"]
         constraints += [
@@ -970,6 +1008,17 @@ def optimize(
         if cg_level_at_rest:
             solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
         layout_options["hull"] = hull
+    solved_transform = None
+    if transform is not None:
+        # Re-evaluate on the exact transformed hull, not the interpolant.
+        solved_transform = {
+            k: float(onp.clip(solved[f"hull_{k}"], *transform.ranges[k])) for k in transform.names
+        }
+        hull = transform.exact(solved_transform)
+        exact_common = dict(exact_common, hull=hull)
+        if cg_level_at_rest:
+            solved_loading["x_cg"] = level_at_rest(hull, solved_loading["mass"])[1]
+        layout_options["hull"] = hull
     # Re-evaluate numerically at the solution, with the exact direct integrals and
     # interference breakdown.
     final = CraftBuildup(
@@ -1031,8 +1080,15 @@ def optimize(
                 propeller_inflow_angle=angle_solved,
             )
     outcome = {"design": solved, "loading": solved_loading, "results": final}
+    # What the solve itself predicted (on a family's interpolant, before the exact
+    # re-evaluation above), for trust-region steps.
+    outcome["predicted"] = {
+        key: float(sol(res[key])) for key in ("D", "GM_L") if key in res and res[key] is not None
+    }
     if family is not None:
         outcome.update(blend_weights=solved_weights, hull=hull)
+    if transform is not None:
+        outcome.update(transform=solved_transform, hull=hull)
     return outcome
 
 

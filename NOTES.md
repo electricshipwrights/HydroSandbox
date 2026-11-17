@@ -78,6 +78,71 @@ solves, 3 starting layouts, free blend from t=0.4 plus fixed exact blends t =
   from the foil (unloading plus wave interference: wave 109 -> 49 N). Thin-ship
   at 4 deg trim on a 6 m hull is a stretch; treat the trim gain as optimistic.
 
+Generated hulls (branch `camber-generator`): `hydrosandbox/hull/camber/generate.py`
+draws a camber document the way hand-drawn ones are: a five-point sheer plan
+(transom half-beam, a point square to it, a mid point and its position, a point
+setting the entry angle, the stem), flat sheer, vertical transom, and 3 or 4
+stations of four points each (sheer knuckle, topsides' foot, bilge point, keel
+knuckle past the centreline). Per station: `side`, `bottom`, `fullness`; shared:
+`flare`, `keel_reach`. The foot gets the least knuckle that keeps the topsides
+inboard of the sheer (`inboard`), else Catmull-Rom overshoot leaves the bow open
+(seen on the first 3-station result: 37 mm stem face). `with_displacement` sets
+the waterline. `examples/design_camber_demihull.py`: differential evolution
+(`--stations 3|4`, workers via `hsb.parallel_map`) then pattern search, on drag
+at speed + penalties, each candidate an exact evaluation.
+- NACRA target (500 kg cat, 2.2 m spacing, 6 m/s, transom drag on): NACRA itself
+  401 N, GM_L 15.1 / 11.8 m (6 / 1 m/s). Limits: D <= 400 N (4 kW at 60%),
+  GM_L >= NACRA's, draft <= 0.30, freeboard >= 0.35, reserve >= 3.0x and
+  >= 0.25 m^3 above water forward, transom <= 0.08 m immersed.
+- Earlier generators: one superellipse section stalled at 455 N; topsides +
+  superellipse (13 numbers, 2 stations) 405.6 N, 1.4% over power.
+- Four-point generator, 30 DE generations + 30 pattern rounds, 10 jobs each,
+  ~4 h (`local/gen/search4_s3.*`, `search4_s4.*`, plots `search4_s*.png`). All
+  limits met by both:
+
+  | drag [N]       | 3 m/s | 4.5 m/s | 6 m/s | GM_L 6 m/s | L/B_wl | S [m^2] |
+  |----------------|-------|---------|-------|------------|--------|---------|
+  | NACRA          | 134.3 | 281.6   | 400.6 | 15.1       | 14.8   | 3.00    |
+  | 3 stations     | 118.9 | 261.7   | 375.5 | 17.9       | 13.8   | 2.88    |
+  | 4 stations     | 121.7 | 263.2   | 376.2 | 18.6       | 13.8   | 2.89    |
+
+  6% under the NACRA at 6 m/s, 11% at 3 m/s (only 6 m/s was optimized). Less
+  wave drag (78 vs 103 N) and wetted area, slightly more transom drag. Draft
+  0.21, freeboard 0.42-0.47. Bounds active: mid_half_beam at 120 mm and x_mid at
+  0.25 (lower bounds) with the forward plan point at the transom's half-beam:
+  the search wants a plan widest at the transom and forward, with a slight
+  hollow between; 3-station: forward station side 600 (max), bottom 40 (min).
+  4-station result has a cut-away forefoot (keel rises in the last 0.15 m).
+  4 stations gave nothing over 3.
+- Ideas: re-parameterize the plan (beam at transom / max beam position) since
+  the mid point is now pinned to its bound; a multi-speed objective; finite-
+  difference SQP from these points; a HullFamily of generated hulls around them
+  for joint hull + foil optimization.
+- `GeneratedFamily` (generate.py): a blend family on a simplex of generator
+  variants around a base. Joint hull + foil at 6 m/s (`local/gen/joint.py`,
+  family on side.1/bottom.1/transom_half_beam): with transom drag the foil
+  (3.0 m aft of bow, span 0.9, chord 0.12, 20% lift) takes the base hull from
+  375.8 to 352.3 N; the family alone moved only 1 N, and family + foil found
+  no solution from start 1. These results came from the uncalibrated closure.
+- Transom closure validation (2026-11-16): NPL 4b/5b/6b rebuilt from Report 71
+  (`local/npl/`, data in `../HydroSandbox/local/refs/data/`, gitignored). The
+  old closure overpredicted wave drag 2-7x at low Fn. Recalibrated (no closure
+  while wet, 0.3 lambda hollow once dry, Fn_T 2.0-2.5) on branch
+  `transom-closure-calibration`, PR #3. With 0.3 lambda the 3-station hull is
+  still 6% under NACRA at 6 m/s, 7% at 3 m/s.
+- `TransformedFamily` (hydrosandbox/hull/transformed.py, branch `hull-transforms`,
+  closure branch merged in): beam, draft, length, Lackenby Cp/LCB and bow rake of
+  any `Hull` as variables, on a minimal quadratic design ((n+1)(n+2)/2 nodes; 21
+  for 5). `optimize()` takes it like a `HullFamily` (variables `hull_<name>`).
+  3-station hull at 6 m/s, no foil, calibrated closure (`local/gen/transform.py`):
+  base 379.6 N -> 371.9 N (wave 83.5->82.8, visc 271.2->270.4, transom 24.9->18.8);
+  cp +0.03, lcb -0.02 (forward) and bow_rake -0.3 all at their bounds; beam and
+  draft ~neutral. Most of the gain is transom drag. Not yet run with a foil
+  (21-node tables: watch memory, ~13 GB at 10 nodes).
+- Next: once PR #3 is merged, rebase, then rerun the generator search and the
+  families on the new closure. Consider capping transom aspect: generated
+  transoms are ~7 beam/immersion vs ~3 on the NPL hulls (extrapolation).
+
 Left:
 - The CasADi version of the sweep was not needed: the solver sees the family
   through the node interpolant. Freeing individual control points (beyond blend
@@ -86,6 +151,67 @@ Left:
 - keelK is not read (camber's own sweep doesn't read it yet).
 - Blending hulls where some have an immersed transom and some not raises an error
   (their section structures differ).
+
+## FFD hull optimization (branch `ffd`, worktree `~/projects/HydroSandbox-ffd`)
+
+Off `hull-transforms` (TransformedFamily + calibrated transom closure merged in).
+
+- `hydrosandbox/hull/ffd.py`: `FFDLattice` (Bernstein FFD, Sederberg & Parry 1986,
+  nx x 2 x nz control points around any `Hull`; moves named `p<i><i|o><k><x|y|z>`),
+  `hull(moves)` resamples the deformed surface into an offset table (own extent,
+  or a given one); `FFDFamily` = moves as variables (a `DesignFamily`, usually
+  "linear": n + 1 hulls), `recentred()` for trust-region steps, `no_fold()`
+  linear constraints that keep columns/levels ordered (else a tunnel/hollow
+  section the offset table can't represent; the first solve went there).
+- `DesignFamily` (transformed.py): any `make_hull(values)` + box design
+  ("linear", "diagonal", "quadratic"); `optimize()` takes one (variables
+  `hull_<name>`), plus `hull_constraints(hull)` and returns `predicted`.
+- Wetted surface: resampling moves the keel/stem outline off grid lines, which
+  inflated S by 1-3% (optimizer could exploit it). FFD hulls carry
+  `Hull.wetted_surface_scale` from the deformed surface's own area change.
+- Linearization check (`local/linear_check.py`, NACRA, 4x2x3 = 60 moves): linear
+  family vs exact deformed hull within 0.2% of drag at +-3 cm corners, 0.5-0.75%
+  at +-6 cm (wave, transom, trim, sinkage all track).
+- Table speed (61-hull family, 11x11 tables, 6 workers): 522 s -> 97 s. Kernel
+  cache (`_kernel` in hull.py: depth exponentials and strip phases depend on
+  grid + attitude only), batched builders `dynamic_force_tables` /
+  `wave_amplitude_tables` (BlendedHull uses them), shared-grid FFD families,
+  per-k batched products in `dynamic_force.forms`, `wave_amplitude_batch`
+  (dense per-strip products across hulls), `dynamic_force_batch` (the whole
+  near-field quadrature with a hull axis: shared kernels, stacked contractions,
+  only the real or imaginary part each caller uses, chunks of 8 hulls to stay in
+  cache). Results match per-hull to ~1e-14 (tests: 83 pass). Per attitude for 61
+  hulls, single-threaded: dynamic force ~14 s originally -> 1.0 s (cache) -> 0.45 s
+  quiet / 1.5 s under load (batched; per-hull path 4.5 s under the same load).
+  The batched element-wise work is memory-bandwidth-bound: other jobs on the box
+  slow it 3x. A GPU (FP64-capable) would suit what's left.
+- Driver `local/ffd_optimize.py` (trust region, linear family per step, 7x7
+  narrow attitude tables, CG at LCB, GM_L >= 15.1, draft <= 0.30, freeboard >=
+  0.35, transom equivalent depth <= 0.065, moves within +-0.12). First attempt:
+  step 1 at +-6 cm gave exact 387.8 N vs base 403.4 but broke the transom limit
+  (the keel-based transom measure steps level to level: not usable in a
+  gradient solve; replaced by the smooth `transom()["depth"]`).
+
+- Result (`local/ffd_optimize_run5.*`, moves in `local/ffd_best_moves.json`,
+  lines `local/ffd_best_lines.png`): on one fixed grid for the whole run, NACRA
+  402.4 N -> 377.5 N (-6.2%) at 6 m/s (wave 106.3 -> 76.6, viscous 277.5 ->
+  280.8, transom 18.6 -> 20.1), GM_L 13.3 -> 18.9 (floor = NACRA's on the same
+  grid; it is 15.1 on the original grid: GM_L is sensitive to level spacing at
+  the waterline), draft 0.240, freeboard 0.350 (at its limit), transom depth
+  0.042. Cp 0.643 -> 0.749: fuller ends, narrower amidships, wider aft, flared
+  aft topsides, sheer lowered forward. Most moves at the +-0.12 m LIMIT.
+  Caveat: with the transom plane fixed, forward stern moves become a parallel
+  extension of the transom section aft (the optimizer used it: all stern x moves
+  at -0.12).
+- Lessons: (1) a family's model and the exact check must cut onto the same grid
+  (otherwise ~1% grid-sensitive drag, mostly transom, swamps late steps): use
+  `FFDFamily(extent=...)`; (2) ratio/max quantities (transom depth) must not be
+  interpolated between nodes: compute them from the lattice's linear surface map
+  (`FFDFamily.transom_depth`), as `no_fold` does; (3) the IPOPT solve (3-25 min
+  per step) is now the cost, not the tables (~18 s).
+- Next: free the transom plane (or forbid stern x moves); higher LIMIT with a
+  fairness measure; finer levels near the waterline for GM_L; profile the solve;
+  try the 3-station camber hull and a foil.
 
 ## hydrosandbox (branch `hydrosandbox`)
 
